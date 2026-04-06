@@ -11,6 +11,7 @@ option(GPU_BUILD_TESTS "Build test targets" ON)
 add_library(gpu_runtime
     src/device.cpp
     src/execution.cpp
+    src/executor.cpp
     src/planner.cpp
     src/runtime.cpp
     src/c_api.cpp

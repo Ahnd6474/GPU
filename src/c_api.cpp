@@ -2,6 +2,7 @@
 
 #include "gpu/runtime.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
 #include <new>
@@ -18,8 +19,9 @@ void copy_string(const std::string& source, char* destination, const std::size_t
         return;
     }
 
-    std::strncpy(destination, source.c_str(), capacity - 1);
-    destination[capacity - 1] = '\0';
+    const auto length = std::min(source.size(), capacity - 1);
+    std::memcpy(destination, source.data(), length);
+    destination[length] = '\0';
 }
 
 void fill_device_info(const gpu::HardwareGraph& graph, gpu_device_info* out_device) {

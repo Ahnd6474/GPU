@@ -531,18 +531,9 @@ std::vector<ExecutionConfig> build_candidate_configs(
         return candidates;
     }
 
-    const auto& primary = placement.allocations.front();
-    const auto* primary_graph = find_graph(graph_lookup, primary.device.uid);
-    if (primary_graph == nullptr) {
-        return candidates;
-    }
-
-    const auto primary_summary = summarize_graph(*primary_graph);
-
     auto add_candidate = [&](ExecutionConfig config) {
         config.operation_name = operation.name;
         config.target_error_tolerance = operation.max_relative_error;
-        configure_tiles(operation, primary_summary, config);
         if (const auto* graph = find_graph(graph_lookup, config.primary_device_uid)) {
             const auto summary = summarize_graph(*graph);
             if (config.tile_x == 0 || config.tile_y == 0 || config.tile_k == 0) {
@@ -567,49 +558,64 @@ std::vector<ExecutionConfig> build_candidate_configs(
         }
     };
 
-    ExecutionConfig base;
-    base.strategy = ExecutionStrategy::single_device;
-    base.primary_device_uid = primary.device.uid;
-    base.participating_devices = {primary.device.uid};
-    base.queue_depth = choose_queue_depth(primary_summary);
-    base.stages = primary_summary.supports_asynchronous_dispatch ? 2u : 1u;
-    if (system.low_spec_mode) {
-        base.queue_depth = std::min(base.queue_depth, 2u);
-        base.stages = 1u;
-    }
-    add_candidate(base);
+    const auto* primary_graph = find_graph(graph_lookup, placement.allocations.front().device.uid);
+    const auto primary_summary =
+        primary_graph == nullptr ? HardwareGraphSummary{} : summarize_graph(*primary_graph);
 
-    if (operation.streaming_friendly &&
-        (primary_summary.supports_asynchronous_dispatch || system.low_spec_mode)) {
-        ExecutionConfig streaming = base;
-        streaming.strategy = ExecutionStrategy::streaming;
-        streaming.stages = system.low_spec_mode ? 2u : std::max(3u, streaming.stages);
-        streaming.overlap_transfers = true;
-        add_candidate(streaming);
-    }
+    for (const auto& allocation : placement.allocations) {
+        const auto* graph = find_graph(graph_lookup, allocation.device.uid);
+        if (graph == nullptr) {
+            continue;
+        }
 
-    if (supports_low_precision(primary_summary) && operation.max_relative_error >= 4.0e-4) {
-        ExecutionConfig low_precision = base;
-        low_precision.use_low_precision = true;
-        low_precision.overlap_transfers = primary_summary.supports_asynchronous_dispatch;
-        low_precision.strategy = operation.parallelizable && primary_summary.supports_asynchronous_dispatch
-                                     ? ExecutionStrategy::overlapped
-                                     : ExecutionStrategy::single_device;
-        add_candidate(low_precision);
+        const auto summary = summarize_graph(*graph);
+        ExecutionConfig base;
+        base.strategy = ExecutionStrategy::single_device;
+        base.primary_device_uid = allocation.device.uid;
+        base.participating_devices = {allocation.device.uid};
+        base.queue_depth = choose_queue_depth(summary);
+        base.stages = summary.supports_asynchronous_dispatch ? 2u : 1u;
+        if (system.low_spec_mode) {
+            base.queue_depth = std::min(base.queue_depth, 2u);
+            base.stages = 1u;
+        }
+        add_candidate(base);
+
+        if (operation.streaming_friendly &&
+            (summary.supports_asynchronous_dispatch || system.low_spec_mode)) {
+            ExecutionConfig streaming = base;
+            streaming.strategy = ExecutionStrategy::streaming;
+            streaming.stages = system.low_spec_mode ? 2u : std::max(3u, streaming.stages);
+            streaming.overlap_transfers = true;
+            add_candidate(streaming);
+        }
+
+        if (supports_low_precision(summary) && operation.max_relative_error >= 4.0e-4) {
+            ExecutionConfig low_precision = base;
+            low_precision.use_low_precision = true;
+            low_precision.overlap_transfers = summary.supports_asynchronous_dispatch;
+            low_precision.strategy = operation.parallelizable && summary.supports_asynchronous_dispatch
+                                         ? ExecutionStrategy::overlapped
+                                         : ExecutionStrategy::single_device;
+            add_candidate(low_precision);
+        }
     }
 
     if (operation.parallelizable &&
         placement.allocations.size() > 1 &&
         !workload.latency_sensitive &&
         !(system.low_spec_mode && system.paging_risk > 0.25)) {
-        ExecutionConfig sharded = base;
+        ExecutionConfig sharded;
         sharded.strategy = ExecutionStrategy::sharded;
+        sharded.primary_device_uid = placement.allocations.front().device.uid;
         sharded.participating_devices.clear();
         for (const auto& allocation : placement.allocations) {
             sharded.participating_devices.push_back(allocation.device.uid);
         }
         sharded.overlap_transfers = true;
-        sharded.stages = system.low_spec_mode ? 2u : std::max(2u, sharded.stages);
+        sharded.queue_depth = choose_queue_depth(primary_summary);
+        sharded.stages =
+            system.low_spec_mode ? 2u : std::max(2u, primary_summary.supports_asynchronous_dispatch ? 2u : 1u);
         add_candidate(sharded);
     }
 
@@ -1303,6 +1309,52 @@ OperationOptimizationResult optimize_operation(
     return best;
 }
 
+void update_performance_summary(
+    std::unordered_map<std::string, ExecutionOptimizer::PerformanceSummary>& performance_cache,
+    const std::string& key,
+    const std::string& shape_bucket,
+    const ExecutionConfig& config,
+    const double effective_latency_us,
+    const double relative_error,
+    const double predicted_latency_us,
+    const double system_penalty_us) {
+    auto& summary = performance_cache[key];
+    summary.shape_bucket = shape_bucket;
+    summary.config = config;
+    ++summary.observations;
+    const double sample_count = static_cast<double>(summary.observations);
+    summary.average_effective_latency_us +=
+        (effective_latency_us - summary.average_effective_latency_us) / sample_count;
+    summary.average_relative_error +=
+        (relative_error - summary.average_relative_error) / sample_count;
+    const double prediction_scale =
+        predicted_latency_us > 0.0 ? (effective_latency_us / predicted_latency_us) : 1.0;
+    summary.average_prediction_scale +=
+        (prediction_scale - summary.average_prediction_scale) / sample_count;
+    summary.average_system_penalty_us +=
+        (system_penalty_us - summary.average_system_penalty_us) / sample_count;
+}
+
+void update_device_learning_state(
+    std::unordered_map<std::string, bool>& warmed_devices,
+    std::unordered_map<std::string, double>& device_sustained_slowdown,
+    const ExecutionConfig& config,
+    const double effective_latency_us,
+    const double predicted_latency_us) {
+    for (const auto& device_uid : config.participating_devices) {
+        warmed_devices[device_uid] = true;
+        auto& slowdown = device_sustained_slowdown[device_uid];
+        if (slowdown <= 0.0) {
+            slowdown = 1.0;
+        }
+        const double observed_slowdown =
+            predicted_latency_us > 0.0
+                ? std::clamp(effective_latency_us / std::max(predicted_latency_us, 1.0), 0.5, 8.0)
+                : 1.0;
+        slowdown = (slowdown * 0.8) + (observed_slowdown * 0.2);
+    }
+}
+
 }  // namespace
 
 std::string to_string(const OperationClass op_class) {
@@ -1563,40 +1615,21 @@ OptimizationReport ExecutionOptimizer::optimize(
             report.system_profile,
             result.benchmark.shape_bucket,
             result.config);
-        auto& summary = performance_cache_[perf_key];
-        summary.shape_bucket = result.benchmark.shape_bucket;
-        summary.config = result.config;
-        ++summary.observations;
-        const double sample_count = static_cast<double>(summary.observations);
-        summary.average_effective_latency_us +=
-            (result.benchmark.effective_latency_us - summary.average_effective_latency_us) / sample_count;
-        summary.average_relative_error +=
-            (result.benchmark.relative_error - summary.average_relative_error) / sample_count;
-        const double prediction_scale =
-            result.graph.predicted_latency_us > 0.0
-                ? (result.benchmark.effective_latency_us / result.graph.predicted_latency_us)
-                : 1.0;
-        summary.average_prediction_scale +=
-            (prediction_scale - summary.average_prediction_scale) / sample_count;
-        summary.average_system_penalty_us +=
-            (result.benchmark.system_penalty_us - summary.average_system_penalty_us) / sample_count;
-
-        for (const auto& device_uid : result.config.participating_devices) {
-            warmed_devices_[device_uid] = true;
-            auto& slowdown = device_sustained_slowdown_[device_uid];
-            if (slowdown <= 0.0) {
-                slowdown = 1.0;
-            }
-            const double observed_slowdown =
-                result.benchmark.predicted_latency_us > 0.0
-                    ? std::clamp(
-                          result.benchmark.effective_latency_us /
-                              std::max(result.benchmark.predicted_latency_us, 1.0),
-                          0.5,
-                          3.0)
-                    : 1.0;
-            slowdown = (slowdown * 0.8) + (observed_slowdown * 0.2);
-        }
+        update_performance_summary(
+            performance_cache_,
+            perf_key,
+            result.benchmark.shape_bucket,
+            result.config,
+            result.benchmark.effective_latency_us,
+            result.benchmark.relative_error,
+            result.graph.predicted_latency_us,
+            result.benchmark.system_penalty_us);
+        update_device_learning_state(
+            warmed_devices_,
+            device_sustained_slowdown_,
+            result.config,
+            result.benchmark.effective_latency_us,
+            result.graph.predicted_latency_us);
 
         persisted_configs.push_back(CachedConfig{
             operation.name,
@@ -1608,6 +1641,58 @@ OptimizationReport ExecutionOptimizer::optimize(
     persist_cache();
     report.loaded_from_cache = fully_cached;
     return report;
+}
+
+void ExecutionOptimizer::ingest_execution_feedback(
+    const OptimizationReport& report,
+    const std::vector<ExecutionFeedbackRecord>& feedback,
+    const std::vector<HardwareGraph>& graphs) {
+    if (feedback.empty() || report.operations.empty()) {
+        return;
+    }
+
+    load_cache();
+
+    std::unordered_map<std::string, const ExecutionFeedbackRecord*> feedback_by_operation;
+    feedback_by_operation.reserve(feedback.size());
+    for (const auto& record : feedback) {
+        feedback_by_operation.emplace(record.operation_name, &record);
+    }
+
+    const auto graph_set_signature = summarize_graph_set(graphs);
+    for (const auto& optimized : report.operations) {
+        const auto feedback_it = feedback_by_operation.find(optimized.operation.name);
+        if (feedback_it == feedback_by_operation.end()) {
+            continue;
+        }
+
+        const auto& record = *feedback_it->second;
+        const double effective_latency_us = std::max(0.01, record.runtime_us);
+        const double observed_penalty_us =
+            std::max(0.0, effective_latency_us - std::max(optimized.graph.predicted_latency_us, 0.0));
+        const auto perf_key = performance_key(
+            graph_set_signature,
+            report.system_profile,
+            optimized.benchmark.shape_bucket,
+            optimized.config);
+        update_performance_summary(
+            performance_cache_,
+            perf_key,
+            optimized.benchmark.shape_bucket,
+            optimized.config,
+            effective_latency_us,
+            record.relative_error,
+            optimized.graph.predicted_latency_us,
+            observed_penalty_us);
+        update_device_learning_state(
+            warmed_devices_,
+            device_sustained_slowdown_,
+            optimized.config,
+            effective_latency_us,
+            optimized.graph.predicted_latency_us);
+    }
+
+    persist_cache();
 }
 
 void ExecutionOptimizer::load_cache() {

@@ -88,5 +88,17 @@ int main() {
             << '\n';
     }
 
+    const auto executed = runtime.execute(workload);
+    std::cout << "\nDirect execution: " << (executed.all_succeeded ? "ok" : "failed") << '\n';
+    for (const auto& operation : executed.operations) {
+        std::cout
+            << "  op=" << std::setw(20) << std::left << operation.operation_name
+            << " backend=" << std::setw(14) << operation.backend_name
+            << " runtime=" << std::fixed << std::setprecision(3) << operation.runtime_us << "us"
+            << " ref=" << operation.reference_runtime_us << "us"
+            << " error=" << operation.relative_error
+            << '\n';
+    }
+
     return 0;
 }

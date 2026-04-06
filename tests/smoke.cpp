@@ -44,9 +44,16 @@ int main() {
         return 1;
     }
 
+    const auto executed = runtime.execute(workload);
+    if (executed.operations.empty() || !executed.all_succeeded) {
+        std::cerr << "Direct execution failed.\n";
+        return 1;
+    }
+
     std::cout << "Graphs=" << runtime.devices().size()
               << " allocations=" << plan.allocations.size()
               << " operations=" << report.operations.size()
+              << " executed=" << executed.operations.size()
               << " cache=" << (plan.loaded_from_cache ? "hit" : "miss")
               << '\n';
 

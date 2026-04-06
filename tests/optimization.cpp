@@ -5,6 +5,7 @@
 #include <iostream>
 #include <string>
 #include <chrono>
+#include <algorithm>
 
 namespace {
 
@@ -131,9 +132,30 @@ int main() {
         return 1;
     }
 
+    const auto executed = runtime.execute(workload);
+    if (!executed.all_succeeded || executed.operations.empty()) {
+        std::cerr << "Direct executor did not complete successfully.\n";
+        return 1;
+    }
+
+    bool saw_backend = false;
+    for (const auto& operation : executed.operations) {
+        if (!operation.verified || operation.runtime_us <= 0.0) {
+            std::cerr << "Direct execution verification failed for " << operation.operation_name << ".\n";
+            return 1;
+        }
+        saw_backend = saw_backend || operation.used_host || operation.used_opencl;
+    }
+
+    if (!saw_backend) {
+        std::cerr << "Expected direct execution to use at least one backend.\n";
+        return 1;
+    }
+
     std::cout << "operations=" << first.operations.size()
               << " cached=" << (second.loaded_from_cache ? "yes" : "no")
               << " graphs=" << runtime.devices().size()
+              << " executed=" << executed.operations.size()
               << '\n';
 
     std::error_code ec;

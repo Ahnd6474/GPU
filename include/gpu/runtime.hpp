@@ -2,6 +2,7 @@
 
 #include "gpu/backend.hpp"
 #include "gpu/execution.hpp"
+#include "gpu/executor.hpp"
 #include "gpu/planner.hpp"
 
 #include <filesystem>
@@ -26,6 +27,7 @@ public:
     [[nodiscard]] const std::vector<HardwareGraph>& devices() const;
     [[nodiscard]] ExecutionPlan plan(const WorkloadSpec& workload);
     [[nodiscard]] OptimizationReport optimize(const WorkloadSpec& workload);
+    [[nodiscard]] DirectExecutionReport execute(const WorkloadSpec& workload);
 
 private:
     [[nodiscard]] bool should_include_descriptor(const HardwareGraph& candidate) const;
@@ -33,6 +35,7 @@ private:
     RuntimeOptions options_;
     Planner planner_;
     ExecutionOptimizer execution_optimizer_;
+    DirectExecutor direct_executor_;
     std::vector<std::unique_ptr<IDeviceProbe>> probes_;
     std::vector<HardwareGraph> devices_;
 };

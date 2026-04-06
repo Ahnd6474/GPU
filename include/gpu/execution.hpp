@@ -151,6 +151,14 @@ struct OptimizationReport {
     bool loaded_from_cache = false;
 };
 
+struct ExecutionFeedbackRecord {
+    std::string operation_name;
+    double runtime_us = 0.0;
+    double reference_runtime_us = 0.0;
+    double relative_error = 0.0;
+    bool verified = false;
+};
+
 [[nodiscard]] std::string to_string(OperationClass op_class);
 [[nodiscard]] std::string to_string(ExecutionNodeKind kind);
 [[nodiscard]] std::string to_string(ExecutionEdgeKind kind);
@@ -175,6 +183,10 @@ public:
     [[nodiscard]] OptimizationReport optimize(
         const WorkloadSpec& workload,
         const ExecutionPlan& placement,
+        const std::vector<HardwareGraph>& graphs);
+    void ingest_execution_feedback(
+        const OptimizationReport& report,
+        const std::vector<ExecutionFeedbackRecord>& feedback,
         const std::vector<HardwareGraph>& graphs);
 
 private:
