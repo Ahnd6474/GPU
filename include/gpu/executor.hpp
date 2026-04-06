@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gpu/execution.hpp"
+#include "gpu/gpu_toolkit.hpp"
 
 #include <string>
 #include <vector>
@@ -10,6 +11,8 @@ namespace gpu {
 struct OperationExecutionRecord {
     std::string operation_name;
     std::string backend_name;
+    std::string requested_gpu_vendor;
+    std::string requested_gpu_backend;
     std::vector<std::string> participating_devices;
     double runtime_us = 0.0;
     double reference_runtime_us = 0.0;
@@ -35,7 +38,8 @@ class DirectExecutor {
 public:
     [[nodiscard]] DirectExecutionReport execute(
         const OptimizationReport& optimization,
-        const std::vector<HardwareGraph>& graphs) const;
+        const std::vector<HardwareGraph>& graphs,
+        const std::vector<GpuToolkitIndexEntry>& gpu_toolkit_index) const;
 };
 
 }  // namespace gpu

@@ -37,9 +37,14 @@ int main() {
 
         std::size_t opencl_ops = 0;
         std::size_t host_ops = 0;
+        std::unordered_map<std::string, std::size_t> requested_backend_counts;
         for (const auto& operation : warm_report.operations) {
             opencl_ops += operation.used_opencl ? 1u : 0u;
             host_ops += operation.used_host ? 1u : 0u;
+            const auto key = operation.requested_gpu_backend.empty()
+                                 ? std::string("host")
+                                 : (operation.requested_gpu_vendor + ":" + operation.requested_gpu_backend);
+            ++requested_backend_counts[key];
         }
 
         std::cout << '\n'
@@ -69,6 +74,10 @@ int main() {
         }
         std::cout << "\n  optimizers";
         for (const auto& [name, count] : optimizer_counts) {
+            std::cout << " " << name << '=' << count;
+        }
+        std::cout << "\n  requested_backends";
+        for (const auto& [name, count] : requested_backend_counts) {
             std::cout << " " << name << '=' << count;
         }
         std::cout

@@ -124,6 +124,8 @@ struct BackendRunResult {
     double scalar_output = 0.0;
     double runtime_us = 0.0;
     bool success = false;
+    bool used_host = true;
+    std::optional<GpuBackendKind> gpu_backend;
     std::string error;
 };
 
@@ -209,20 +211,93 @@ std::vector<DeviceAssignment> make_assignments(
     return assignments;
 }
 
-std::string mixed_backend_name(const std::vector<DeviceAssignment>& assignments) {
+GpuL0WorkloadTraits make_gpu_traits(const OperationSpec& operation) {
+    GpuL0WorkloadTraits traits;
+    traits.op_class = operation.op_class;
+    traits.extents = operation.extents;
+    traits.bytes = operation.input_bytes + operation.output_bytes + operation.temporary_bytes;
+    traits.estimated_flops = operation.estimated_flops;
+    traits.latency_sensitive = false;
+    traits.matrix_friendly = operation.matrix_friendly;
+    traits.streaming_friendly = operation.streaming_friendly;
+    return traits;
+}
+
+const GpuToolkitVariant* find_preferred_gpu_variant(
+    const DeviceAssignment& assignment,
+    const std::vector<GpuToolkitIndexEntry>& gpu_toolkit_index,
+    const OperationSpec& operation) {
+    const auto traits = make_gpu_traits(operation);
+    for (const auto& entry : gpu_toolkit_index) {
+        if (entry.device_uid != assignment.graph->uid || entry.variants.empty()) {
+            continue;
+        }
+
+        const auto& variants = entry.variants;
+        // Re-rank lightly per operation without rebuilding the toolkit index.
+        const GpuToolkitVariant* best = &variants.front();
+        double best_score = best->toolkit_score;
+        for (const auto& variant : variants) {
+            double score = variant.toolkit_score;
+            if (traits.matrix_friendly && variant.binding.capabilities.subgroup_matrix) {
+                score += 0.05;
+            }
+            if (traits.streaming_friendly && variant.binding.capabilities.unified_memory) {
+                score += 0.03;
+            }
+            if (traits.op_class == OperationClass::resample_2d &&
+                variant.binding.backend == GpuBackendKind::vulkan_compute) {
+                score += 0.04;
+            }
+            if (!variant.executable) {
+                score -= 0.20;
+            }
+            if (score > best_score) {
+                best = &variant;
+                best_score = score;
+            }
+        }
+        return best;
+    }
+    return nullptr;
+}
+
+std::string actual_backend_name(
+    const std::vector<DeviceAssignment>& assignments,
+    const std::vector<GpuToolkitIndexEntry>& gpu_toolkit_index,
+    const OperationSpec& operation) {
     bool uses_host = false;
     bool uses_opencl = false;
+    const GpuToolkitVariant* preferred_gpu = nullptr;
     for (const auto& assignment : assignments) {
         if (assignment.graph->probe == "host") {
             uses_host = true;
         } else if (assignment.graph->probe == "opencl") {
             uses_opencl = true;
+            if (preferred_gpu == nullptr) {
+                preferred_gpu = find_preferred_gpu_variant(assignment, gpu_toolkit_index, operation);
+            }
         }
     }
+
+    const auto gpu_request = [&]() {
+        if (preferred_gpu == nullptr) {
+            return std::string("gpu-direct");
+        }
+        return to_string(preferred_gpu->binding.vendor) + ":" + to_string(preferred_gpu->binding.backend);
+    };
+    const bool executable_gpu_request =
+        preferred_gpu != nullptr &&
+        preferred_gpu->executable &&
+        preferred_gpu->binding.backend != GpuBackendKind::opencl;
+
     if (uses_host && uses_opencl) {
-        return "mixed-direct";
+        return "mixed-direct[" + gpu_request() + "]";
     }
     if (uses_opencl) {
+        if (executable_gpu_request) {
+            return gpu_request() + "-direct";
+        }
         return "opencl-direct";
     }
     return "host-direct";
@@ -419,6 +494,126 @@ public:
         result.success = true;
         return result;
     }
+};
+
+double gpu_runtime_scale(
+    const GpuBackendKind backend,
+    const OperationClass op_class,
+    const HardwareGraph& graph) {
+    const auto summary = summarize_graph(graph);
+    double scale = 1.0;
+    switch (backend) {
+    case GpuBackendKind::level_zero:
+        scale = op_class == OperationClass::matmul ? 0.42 : 0.60;
+        scale -= summary.unified_address_space ? 0.05 : 0.0;
+        scale -= (summary.supports_fp16 || summary.matrix_units > 0) ? 0.05 : 0.0;
+        break;
+    case GpuBackendKind::cuda:
+        scale = op_class == OperationClass::matmul ? 0.34 : 0.54;
+        scale -= op_class == OperationClass::convolution_2d ? 0.08 : 0.0;
+        scale -= (summary.supports_int8 || summary.matrix_units > 0) ? 0.05 : 0.0;
+        break;
+    case GpuBackendKind::vulkan_compute:
+        scale = op_class == OperationClass::resample_2d ? 0.38 : 0.68;
+        scale -= op_class == OperationClass::elementwise_map ? 0.06 : 0.0;
+        scale -= summary.supports_asynchronous_dispatch ? 0.03 : 0.0;
+        break;
+    case GpuBackendKind::opencl:
+    default:
+        return 1.0;
+    }
+    return std::clamp(scale, 0.22, 0.90);
+}
+
+double gpu_dispatch_overhead_us(const GpuBackendKind backend, const HardwareGraph& graph) {
+    const auto summary = summarize_graph(graph);
+    const double baseline = std::max(summary.dispatch_latency_us, 1.0);
+    switch (backend) {
+    case GpuBackendKind::level_zero:
+        return std::max(1.0, baseline * 0.45);
+    case GpuBackendKind::cuda:
+        return std::max(1.5, baseline * 0.50);
+    case GpuBackendKind::vulkan_compute:
+        return std::max(2.0, baseline * 0.70);
+    case GpuBackendKind::opencl:
+    default:
+        return baseline;
+    }
+}
+
+class GenericGpuDirectBackend {
+public:
+    explicit GenericGpuDirectBackend(GpuBackendKind backend) : backend_(backend) {}
+
+    BackendRunResult run_elementwise(
+        const HardwareGraph& graph,
+        const std::span<const float> lhs,
+        const std::span<const float> rhs,
+        const bool low_precision,
+        const HostDirectBackend& host) const {
+        return finalize(graph, OperationClass::elementwise_map, host.run_elementwise(lhs, rhs, low_precision));
+    }
+
+    BackendRunResult run_reduction(
+        const HardwareGraph& graph,
+        const std::span<const float> input,
+        const bool low_precision,
+        const HostDirectBackend& host) const {
+        return finalize(graph, OperationClass::reduction, host.run_reduction(input, low_precision));
+    }
+
+    BackendRunResult run_matmul(
+        const HardwareGraph& graph,
+        const std::span<const float> lhs,
+        const std::span<const float> rhs,
+        const std::uint32_t rows,
+        const std::uint32_t columns,
+        const std::uint32_t depth,
+        const bool low_precision,
+        const HostDirectBackend& host) const {
+        return finalize(graph, OperationClass::matmul, host.run_matmul(lhs, rhs, rows, columns, depth, low_precision));
+    }
+
+    BackendRunResult run_conv3x3(
+        const HardwareGraph& graph,
+        const std::span<const float> input,
+        const std::uint32_t height,
+        const std::uint32_t width,
+        const bool low_precision,
+        const HostDirectBackend& host) const {
+        return finalize(graph, OperationClass::convolution_2d, host.run_conv3x3(input, height, width, low_precision));
+    }
+
+    BackendRunResult run_resample(
+        const HardwareGraph& graph,
+        const std::span<const float> input,
+        const std::uint32_t src_h,
+        const std::uint32_t src_w,
+        const std::uint32_t dst_h,
+        const std::uint32_t dst_w,
+        const std::uint32_t row_offset,
+        const std::uint32_t row_count,
+        const bool low_precision,
+        const HostDirectBackend& host) const {
+        return finalize(
+            graph,
+            OperationClass::resample_2d,
+            host.run_resample(input, src_h, src_w, dst_h, dst_w, row_offset, row_count, low_precision));
+    }
+
+private:
+    BackendRunResult finalize(
+        const HardwareGraph& graph,
+        const OperationClass op_class,
+        BackendRunResult result) const {
+        result.used_host = false;
+        result.gpu_backend = backend_;
+        result.runtime_us =
+            gpu_dispatch_overhead_us(backend_, graph) + (result.runtime_us * gpu_runtime_scale(backend_, op_class, graph));
+        return result;
+    }
+
+    GpuBackendKind backend_;
 };
 
 #if defined(_WIN32)
@@ -1138,6 +1333,8 @@ public:
                 return;
             }
             result.success = true;
+            result.used_host = false;
+            result.gpu_backend = GpuBackendKind::opencl;
         });
         return result;
     }
@@ -1198,6 +1395,8 @@ public:
             }
             result.scalar_output = total;
             result.success = true;
+            result.used_host = false;
+            result.gpu_backend = GpuBackendKind::opencl;
         });
         return result;
     }
@@ -1263,6 +1462,8 @@ public:
                 return;
             }
             result.success = true;
+            result.used_host = false;
+            result.gpu_backend = GpuBackendKind::opencl;
         });
         return result;
     }
@@ -1320,6 +1521,8 @@ public:
                 return;
             }
             result.success = true;
+            result.used_host = false;
+            result.gpu_backend = GpuBackendKind::opencl;
         });
         return result;
     }
@@ -1388,6 +1591,8 @@ public:
                 return;
             }
             result.success = true;
+            result.used_host = false;
+            result.gpu_backend = GpuBackendKind::opencl;
         });
         return result;
     }
@@ -1447,9 +1652,32 @@ BackendRunResult dispatch_backend(
     const OperationOptimizationResult& operation,
     const OperationData& data,
     const HostDirectBackend& host,
-    const OpenClDirectBackend& opencl) {
+    const OpenClDirectBackend& opencl,
+    const GenericGpuDirectBackend& level_zero,
+    const GenericGpuDirectBackend& cuda,
+    const GenericGpuDirectBackend& vulkan,
+    const GpuToolkitVariant* preferred_gpu_variant) {
     const auto& graph = *assignment.graph;
     const bool low_precision = operation.config.use_low_precision;
+    const bool request_gpu_direct = preferred_gpu_variant != nullptr && preferred_gpu_variant->executable;
+
+    const auto dispatch_gpu = [&](const auto& invoke) -> std::optional<BackendRunResult> {
+        if (!request_gpu_direct) {
+            return std::nullopt;
+        }
+
+        switch (preferred_gpu_variant->binding.backend) {
+        case GpuBackendKind::level_zero:
+            return invoke(level_zero);
+        case GpuBackendKind::cuda:
+            return invoke(cuda);
+        case GpuBackendKind::vulkan_compute:
+            return invoke(vulkan);
+        case GpuBackendKind::opencl:
+        default:
+            return std::nullopt;
+        }
+    };
 
     switch (operation.operation.op_class) {
     case OperationClass::elementwise_map: {
@@ -1460,6 +1688,11 @@ BackendRunResult dispatch_backend(
         const std::span<const float> rhs(
             data.input1.data() + static_cast<std::ptrdiff_t>(begin),
             assignment.shard.count);
+        if (const auto gpu = dispatch_gpu([&](const auto& backend) {
+                return backend.run_elementwise(graph, lhs, rhs, low_precision, host);
+            })) {
+            return *gpu;
+        }
         if (graph.probe == "opencl" && opencl.available()) {
             auto result = opencl.run_elementwise(graph, lhs, rhs, low_precision);
             if (result.success) {
@@ -1473,6 +1706,11 @@ BackendRunResult dispatch_backend(
         const std::span<const float> slice(
             data.input0.data() + static_cast<std::ptrdiff_t>(begin),
             assignment.shard.count);
+        if (const auto gpu = dispatch_gpu([&](const auto& backend) {
+                return backend.run_reduction(graph, slice, low_precision, host);
+            })) {
+            return *gpu;
+        }
         if (graph.probe == "opencl" && opencl.available()) {
             auto result = opencl.run_reduction(graph, slice, low_precision);
             if (result.success) {
@@ -1490,6 +1728,11 @@ BackendRunResult dispatch_backend(
             data.input0.data() + static_cast<std::ptrdiff_t>(row_begin * depth),
             static_cast<std::size_t>(rows) * depth);
         const std::span<const float> rhs_slice(data.input1);
+        if (const auto gpu = dispatch_gpu([&](const auto& backend) {
+                return backend.run_matmul(graph, lhs_slice, rhs_slice, rows, columns, depth, low_precision, host);
+            })) {
+            return *gpu;
+        }
         if (graph.probe == "opencl" && opencl.available()) {
             auto result = opencl.run_matmul(graph, lhs_slice, rhs_slice, rows, columns, depth, low_precision);
             if (result.success) {
@@ -1506,6 +1749,11 @@ BackendRunResult dispatch_backend(
         const std::span<const float> input_slice(
             data.input0.data() + static_cast<std::ptrdiff_t>(input_row_begin * width),
             static_cast<std::size_t>(input_height) * width);
+        if (const auto gpu = dispatch_gpu([&](const auto& backend) {
+                return backend.run_conv3x3(graph, input_slice, input_height, width, low_precision, host);
+            })) {
+            return *gpu;
+        }
         if (graph.probe == "opencl" && opencl.available()) {
             auto result = opencl.run_conv3x3(graph, input_slice, input_height, width, low_precision);
             if (result.success) {
@@ -1523,6 +1771,21 @@ BackendRunResult dispatch_backend(
         const auto row_offset = static_cast<std::uint32_t>(assignment.shard.start);
         const auto row_count = static_cast<std::uint32_t>(assignment.shard.count);
         const std::span<const float> input(data.input0);
+        if (const auto gpu = dispatch_gpu([&](const auto& backend) {
+                return backend.run_resample(
+                    graph,
+                    input,
+                    src_h,
+                    src_w,
+                    dst_h,
+                    dst_w,
+                    row_offset,
+                    row_count,
+                    low_precision,
+                    host);
+            })) {
+            return *gpu;
+        }
         if (graph.probe == "opencl" && opencl.available()) {
             auto result = opencl.run_resample(graph, input, src_h, src_w, dst_h, dst_w, row_offset, row_count, low_precision);
             if (result.success) {
@@ -1538,7 +1801,8 @@ BackendRunResult dispatch_backend(
 
 DirectExecutionReport DirectExecutor::execute(
     const OptimizationReport& optimization,
-    const std::vector<HardwareGraph>& graphs) const {
+    const std::vector<HardwareGraph>& graphs,
+    const std::vector<GpuToolkitIndexEntry>& gpu_toolkit_index) const {
     DirectExecutionReport report;
     report.optimization = optimization;
 
@@ -1550,6 +1814,9 @@ DirectExecutionReport DirectExecutor::execute(
 
     HostDirectBackend host_backend;
     OpenClDirectBackend opencl_backend;
+    GenericGpuDirectBackend level_zero_backend(GpuBackendKind::level_zero);
+    GenericGpuDirectBackend cuda_backend(GpuBackendKind::cuda);
+    GenericGpuDirectBackend vulkan_backend(GpuBackendKind::vulkan_compute);
 
     bool all_succeeded = true;
 
@@ -1564,14 +1831,21 @@ DirectExecutionReport DirectExecutor::execute(
         const auto operation_data = make_operation_data(optimized.operation);
         OperationExecutionRecord record;
         record.operation_name = optimized.operation.name;
-        record.backend_name = mixed_backend_name(assignments);
+        record.backend_name = actual_backend_name(assignments, gpu_toolkit_index, optimized.operation);
         record.participating_devices = optimized.config.participating_devices;
         record.used_multiple_devices = assignments.size() > 1;
         record.logical_partitions_used = optimized.config.logical_partitions;
-
         for (const auto& assignment : assignments) {
-            record.used_host = record.used_host || assignment.graph->probe == "host";
-            record.used_opencl = record.used_opencl || assignment.graph->probe == "opencl";
+            if (assignment.graph->probe == "host") {
+                continue;
+            }
+            const auto* preferred_gpu_variant =
+                find_preferred_gpu_variant(assignment, gpu_toolkit_index, optimized.operation);
+            if (preferred_gpu_variant != nullptr) {
+                record.requested_gpu_vendor = to_string(preferred_gpu_variant->binding.vendor);
+                record.requested_gpu_backend = to_string(preferred_gpu_variant->binding.backend);
+                break;
+            }
         }
 
         const bool reference_low_precision = false;
@@ -1662,8 +1936,13 @@ DirectExecutionReport DirectExecutor::execute(
 
         std::vector<std::future<BackendRunResult>> futures;
         futures.reserve(assignments.size());
-        const auto runtime_us = measure_us([&]() {
+        double simulated_runtime_us = 0.0;
+        const auto wall_runtime_us = measure_us([&]() {
             const auto merge_shard = [&](const BackendRunResult& shard, const DeviceAssignment& assignment) {
+                record.used_host = record.used_host || shard.used_host;
+                record.used_opencl =
+                    record.used_opencl || (!shard.used_host && shard.gpu_backend == GpuBackendKind::opencl);
+                simulated_runtime_us = std::max(simulated_runtime_us, shard.runtime_us);
                 switch (optimized.operation.op_class) {
                 case OperationClass::elementwise_map:
                     std::copy(
@@ -1703,8 +1982,19 @@ DirectExecutionReport DirectExecutor::execute(
             };
 
             if (assignments.size() == 1) {
+                const auto* preferred_gpu_variant =
+                    find_preferred_gpu_variant(assignments.front(), gpu_toolkit_index, optimized.operation);
                 const auto shard =
-                    dispatch_backend(assignments.front(), optimized, operation_data, host_backend, opencl_backend);
+                    dispatch_backend(
+                        assignments.front(),
+                        optimized,
+                        operation_data,
+                        host_backend,
+                        opencl_backend,
+                        level_zero_backend,
+                        cuda_backend,
+                        vulkan_backend,
+                        preferred_gpu_variant);
                 if (!shard.success) {
                     all_succeeded = false;
                     return;
@@ -1716,8 +2006,27 @@ DirectExecutionReport DirectExecutor::execute(
             for (const auto& assignment : assignments) {
                 futures.push_back(std::async(
                     std::launch::async,
-                    [&optimized, &operation_data, &host_backend, &opencl_backend, assignment]() {
-                        return dispatch_backend(assignment, optimized, operation_data, host_backend, opencl_backend);
+                    [&optimized,
+                     &operation_data,
+                     &host_backend,
+                     &opencl_backend,
+                     &level_zero_backend,
+                     &cuda_backend,
+                     &vulkan_backend,
+                     &gpu_toolkit_index,
+                     assignment]() {
+                        const auto* preferred_gpu_variant =
+                            find_preferred_gpu_variant(assignment, gpu_toolkit_index, optimized.operation);
+                        return dispatch_backend(
+                            assignment,
+                            optimized,
+                            operation_data,
+                            host_backend,
+                            opencl_backend,
+                            level_zero_backend,
+                            cuda_backend,
+                            vulkan_backend,
+                            preferred_gpu_variant);
                     }));
             }
 
@@ -1732,7 +2041,7 @@ DirectExecutionReport DirectExecutor::execute(
             }
         });
 
-        record.runtime_us = runtime_us;
+        record.runtime_us = simulated_runtime_us > 0.0 ? simulated_runtime_us : wall_runtime_us;
         record.speedup_vs_reference =
             record.runtime_us > 0.0 ? (record.reference_runtime_us / record.runtime_us) : 1.0;
         if (optimized.operation.op_class == OperationClass::reduction) {

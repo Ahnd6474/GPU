@@ -155,7 +155,7 @@ DirectExecutionReport Runtime::execute(const WorkloadSpec& workload) {
     }
 
     const auto initial_optimization = optimize(workload);
-    auto initial_report = direct_executor_.execute(initial_optimization, devices_);
+    auto initial_report = direct_executor_.execute(initial_optimization, devices_, gpu_toolkit_index_);
     execution_optimizer_.ingest_execution_feedback(
         initial_report.optimization,
         make_feedback_records(initial_report),
@@ -170,7 +170,7 @@ DirectExecutionReport Runtime::execute(const WorkloadSpec& workload) {
         return initial_report;
     }
 
-    auto refined_report = direct_executor_.execute(refined_optimization, devices_);
+    auto refined_report = direct_executor_.execute(refined_optimization, devices_, gpu_toolkit_index_);
     execution_optimizer_.ingest_execution_feedback(
         refined_report.optimization,
         make_feedback_records(refined_report),

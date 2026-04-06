@@ -125,6 +125,13 @@ int main() {
         std::cout
             << "  op=" << std::setw(20) << std::left << operation.operation_name
             << " backend=" << std::setw(14) << operation.backend_name
+            << " requested=";
+        if (!operation.requested_gpu_backend.empty()) {
+            std::cout << operation.requested_gpu_vendor << ':' << operation.requested_gpu_backend;
+        } else {
+            std::cout << "host";
+        }
+        std::cout
             << " partitions=" << operation.logical_partitions_used
             << " runtime=" << std::fixed << std::setprecision(3) << operation.runtime_us << "us"
             << " ref=" << operation.reference_runtime_us << "us"

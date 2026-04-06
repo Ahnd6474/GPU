@@ -1,4 +1,5 @@
 #include "gpu/device.hpp"
+#include "gpu/executor.hpp"
 #include "gpu/gpu_toolkit.hpp"
 #include "gpu/runtime.hpp"
 #include "gpu/workloads.hpp"
@@ -107,6 +108,154 @@ bool verify_gpu_toolkit_index() {
             best->binding.backend == gpu::GpuBackendKind::opencl);
 }
 
+gpu::HardwareGraph make_manual_gpu_graph(
+    const std::string& uid,
+    const std::string& presentation_name,
+    const bool fp16,
+    const bool int8,
+    const bool unified_memory) {
+    gpu::HardwareGraph graph;
+    graph.uid = uid;
+    graph.probe = "opencl";
+    graph.presentation_name = presentation_name;
+
+    graph.nodes.push_back({"root", "root", "", gpu::HardwareObjectDomain::control, gpu::HardwareObjectRole::root});
+    graph.nodes.push_back({"queue", "queue", "root", gpu::HardwareObjectDomain::control, gpu::HardwareObjectRole::queue});
+    graph.nodes.back().control.supports_asynchronous_dispatch = true;
+    graph.nodes.push_back({"cluster", "cluster", "root", gpu::HardwareObjectDomain::compute, gpu::HardwareObjectRole::cluster});
+    graph.nodes.back().compute.execution_width = 128;
+    graph.nodes.back().compute.clock_mhz = 1800;
+    graph.nodes.back().compute.matrix_engines = 16;
+    graph.nodes.back().compute.supports_fp16 = fp16;
+    graph.nodes.back().compute.supports_int8 = int8;
+    graph.nodes.push_back({"memory", "memory", "root", gpu::HardwareObjectDomain::storage, gpu::HardwareObjectRole::global_memory});
+    graph.nodes.back().storage.capacity_bytes = 8ull * 1024ull * 1024ull * 1024ull;
+    graph.nodes.back().storage.unified_address_space = unified_memory;
+    graph.nodes.back().storage.coherent_with_host = unified_memory;
+    graph.nodes.back().storage.shared_host_bytes = unified_memory ? graph.nodes.back().storage.capacity_bytes : 0ull;
+    graph.nodes.push_back({"host-link", "host-link", "root", gpu::HardwareObjectDomain::transfer, gpu::HardwareObjectRole::transfer_link});
+    graph.nodes.back().transfer.read_bandwidth_gbps = 128.0;
+    graph.nodes.back().transfer.write_bandwidth_gbps = 128.0;
+    graph.nodes.back().transfer.dispatch_latency_us = 6.0;
+    graph.nodes.back().transfer.synchronization_latency_us = 5.0;
+
+    graph.edges.push_back({"root", "queue", gpu::GraphEdgeSemantics::contains, true});
+    graph.edges.push_back({"root", "cluster", gpu::GraphEdgeSemantics::contains, true});
+    graph.edges.push_back({"root", "memory", gpu::GraphEdgeSemantics::contains, true});
+    graph.edges.push_back({"root", "host-link", gpu::GraphEdgeSemantics::contains, true});
+    graph.edges.push_back({"queue", "cluster", gpu::GraphEdgeSemantics::dispatches, true, 1.0, 0.0, 6.0});
+    graph.edges.push_back({"host-link", "memory", gpu::GraphEdgeSemantics::transfers_to, true, 1.0, 128.0, 5.0});
+    gpu::materialize_graph_costs(graph);
+    return graph;
+}
+
+bool verify_gpu_direct_variants() {
+    const struct VariantCase {
+        std::string name;
+        std::string presentation_name;
+        gpu::GpuVendorFamily vendor;
+        gpu::GpuBackendKind backend;
+        gpu::OperationClass op_class;
+        std::vector<std::uint64_t> extents;
+        bool fp16;
+        bool int8;
+        bool unified_memory;
+    } cases[] = {
+        {"level-zero", "Intel Arc A770", gpu::GpuVendorFamily::intel, gpu::GpuBackendKind::level_zero, gpu::OperationClass::matmul, {64, 64, 64}, true, false, true},
+        {"cuda", "NVIDIA RTX 4090", gpu::GpuVendorFamily::nvidia, gpu::GpuBackendKind::cuda, gpu::OperationClass::matmul, {64, 64, 64}, true, true, false},
+        {"vulkan", "AMD Radeon RX 7900", gpu::GpuVendorFamily::amd, gpu::GpuBackendKind::vulkan_compute, gpu::OperationClass::resample_2d, {128, 128, 256, 256}, true, false, false},
+    };
+
+    gpu::DirectExecutor executor;
+    for (const auto& test_case : cases) {
+        auto graph = make_manual_gpu_graph(
+            "graph:" + test_case.name,
+            test_case.presentation_name,
+            test_case.fp16,
+            test_case.int8,
+            test_case.unified_memory);
+
+        gpu::OperationSpec operation;
+        operation.name = "op-" + test_case.name;
+        operation.op_class = test_case.op_class;
+        operation.extents = test_case.extents;
+        operation.input_bytes = 1ull << 20;
+        operation.output_bytes = 1ull << 20;
+        operation.temporary_bytes = 1ull << 18;
+        operation.estimated_flops = 1.0e9;
+        operation.max_relative_error = 1.0e-4;
+        operation.parallelizable = true;
+        operation.reduction_like = test_case.op_class == gpu::OperationClass::reduction;
+        operation.streaming_friendly = test_case.op_class == gpu::OperationClass::resample_2d;
+        operation.matrix_friendly = test_case.op_class == gpu::OperationClass::matmul;
+
+        gpu::ExecutionConfig config;
+        config.signature = "cfg-" + test_case.name;
+        config.operation_name = operation.name;
+        config.primary_device_uid = graph.uid;
+        config.participating_devices = {graph.uid};
+        config.mapped_structural_nodes = {"cluster"};
+        config.logical_partitions = 1;
+        config.target_error_tolerance = operation.max_relative_error;
+
+        gpu::ExecutionGraph execution_graph;
+        execution_graph.signature = "exec-" + test_case.name;
+        execution_graph.workload_signature = "manual";
+        execution_graph.operation = operation;
+        execution_graph.participating_devices = {graph.uid};
+
+        gpu::OperationOptimizationResult optimized;
+        optimized.operation = operation;
+        optimized.config = config;
+        optimized.graph = execution_graph;
+
+        gpu::OptimizationReport report;
+        report.signature = "report-" + test_case.name;
+        report.placement.signature = "plan-" + test_case.name;
+        report.placement.allocations.push_back({graph, 1.0, 1.0});
+        report.operations.push_back(optimized);
+
+        gpu::GpuToolkitVariant variant;
+        variant.binding.device_uid = graph.uid;
+        variant.binding.graph_fingerprint = gpu::structural_fingerprint(graph);
+        variant.binding.adapter_id = "adapter-" + test_case.name;
+        variant.binding.presentation_name = graph.presentation_name;
+        variant.binding.vendor = test_case.vendor;
+        variant.binding.backend = test_case.backend;
+        variant.binding.capabilities.adapter_available = true;
+        variant.binding.capabilities.kernel_specialization = true;
+        variant.binding.capabilities.asynchronous_dispatch = true;
+        variant.executable = true;
+        variant.toolkit_score = 2.0;
+
+        gpu::GpuToolkitIndexEntry index_entry;
+        index_entry.device_uid = graph.uid;
+        index_entry.graph_fingerprint = gpu::structural_fingerprint(graph);
+        index_entry.variants.push_back(variant);
+
+        const auto execution = executor.execute(report, {graph}, {index_entry});
+        if (!execution.all_succeeded || execution.operations.size() != 1) {
+            return false;
+        }
+
+        const auto& record = execution.operations.front();
+        if (record.requested_gpu_backend != gpu::to_string(test_case.backend)) {
+            return false;
+        }
+        if (record.backend_name.find(gpu::to_string(test_case.backend)) == std::string::npos) {
+            return false;
+        }
+        if (record.used_host || record.used_opencl) {
+            return false;
+        }
+        if (!record.verified) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -207,6 +356,10 @@ int main() {
     }
     if (!verify_gpu_toolkit_index()) {
         std::cerr << "GPU L0 toolkit ranking check failed.\n";
+        return 1;
+    }
+    if (!verify_gpu_direct_variants()) {
+        std::cerr << "GPU direct variant execution check failed.\n";
         return 1;
     }
 
