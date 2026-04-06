@@ -1,151 +1,93 @@
 # GPU
 
-This repository is an early runtime skeleton for heterogeneous compute that models hardware as an execution graph rather than as a vendor label or a fixed device class.
+Graph-first heterogeneous compute runtime skeleton for C++20.
 
-The target is a global optimizer for AI training, inference, and general compute workloads that can use whatever resources are present on the machine:
+This repository is a small CMake library with examples and tests. It discovers host and OpenCL devices, turns them into structural graphs, builds placement plans from those graphs, and runs a compact set of direct kernels to validate the planner.
 
-- multiple vendors at the same time
-- CPU as a first-class execution domain
-- graph-based placement, scheduling, memory mapping, and dataflow optimization
-- framework integration points for Torch, TensorFlow, and similar systems
+It is still an early runtime skeleton, not a production execution stack.
 
-## Current status
+## installation
 
-This is still an early runtime skeleton, not a finished execution platform.
+### requirements
 
-Implemented now:
+- CMake 3.20 or newer
+- A C++20 compiler
+- An OpenCL runtime or driver if you want OpenCL device discovery and direct OpenCL execution
 
-- C++20 runtime core
-- host hardware probe
-- OpenCL-based graph probe as one discovery path
-- hierarchical hardware graph model
-- directed, weighted execution and transfer edges
-- planner that partitions work from graph-derived summaries
-- execution-graph builder that maps global placements into signal-flow graphs
-- operation-family optimization across the discovered device set
-- direct host and OpenCL execution backends
-- canonical gaming and AI workload presets for optimization and validation
-- latency and accuracy recording for optimized execution runs
-- execution-setting cache persistence
-- plan cache persistence
-- minimal C ABI with graph node and edge inspection
-- example and test targets
+The project does not need CUDA, Level Zero, or Vulkan SDKs to build. Those backends appear in the toolkit-ranking layer, but native execution for them is not wired up in this tree yet.
 
-Not implemented yet:
+### build the project
 
-- tensor memory model
-- CUDA probe / execution path
-- Level Zero / OpenVINO / oneDNN probe and execution path
-- inter-device transfer scheduler
-- direct Torch / TensorFlow bridge
+```powershell
+# if you have not cloned the repository yet
+# git clone <repo-url>
+# cd GPU
 
-## Core idea
-
-The runtime should not optimize from strings like "CPU", "GPU", "TPU", "NVIDIA", or "Intel".
-
-Instead, each discovered hardware target is normalized into a graph:
-
-- node = one hardware object
-- edge = one structural or execution relation
-- direction = explicit when execution or transfer is directional
-- weight = available when bandwidth, latency, or control cost is known
-
-The graph is built from hardware-readable information first. If a detail is not directly readable, it should not be invented casually.
-
-Edge `weight` is treated as an estimated execution cost in microseconds for a small canonical operation on that relation. Bandwidth and latency remain explicit on the edge, and `weight` is materialized from them with lightweight hierarchy propagation.
-
-## Graph model
-
-### Medium resolution
-
-The default graph separates:
-
-- `ComputeDomain`
-- `StorageDomain`
-- `TransferDomain`
-- `ControlDomain`
-
-It also expresses repeated structure hierarchically:
-
-- root
-- cluster
-- tile
-
-This is the main level for:
-
-- placement
-- scheduling
-- memory mapping
-- dataflow optimization
-
-### Aggressive resolution
-
-The graph model also supports finer objects:
-
-- lane
-- pipeline
-- scratchpad
-
-These are only instantiated when the probe can read enough hardware information to justify them. The current implementation mixes medium resolution with selective aggressive nodes so the graph stays useful without exploding the search space.
-
-Bank, router, and deeper pipeline decomposition are intentionally left as future selective refinements. They should only be expanded where measured bottlenecks justify the extra complexity.
-
-When aggressive nodes are present, their edge costs are propagated upward so parent `contains`, `controls`, and `dispatches` relations change as the lower-level graph changes.
-
-## Architecture
-
-```text
-include/gpu/
-  backend.hpp      hardware probe interface
-  c_api.h          C ABI
-  device.hpp       graph nodes, edges, summaries
-  planner.hpp      global partition planner
-  runtime.hpp      runtime entry point
-
-src/
-  backends/
-    cpu_backend.cpp
-    opencl_backend.cpp
+cmake -S . -B build
+cmake --build build
 ```
 
-## Planner model
+The default build creates:
 
-The planner now works on graph-derived summaries, not on flat device labels.
+- `gpu_runtime` as a static library
+- `gpu_inspect` and `gpu_profile_workloads` example executables
+- `gpu_smoke` and `gpu_optimization` test executables
 
-Current scoring uses:
+Optional CMake switches:
 
-- execution object count
-- lanes per execution object
-- resident contexts
-- matrix capability
-- memory hierarchy capacity
-- host exchange cost
-- dispatch and synchronization latency
-- unified/coherent memory affinity
-- graph richness bonus for mapping-visible structure
+```powershell
+cmake -S . -B build -DGPU_BUILD_EXAMPLES=OFF -DGPU_BUILD_TESTS=OFF
+```
 
-Inputs from the workload side:
+## quick start
 
-- working set size
-- host exchange size
-- estimated flops
-- batch size
-- latency sensitivity
-- unified memory preference
-- matrix-friendly flag
+If you want to use the library from another CMake project, add this repository as a subdirectory and link `gpu::runtime`.
 
-This is still heuristic, but it is aligned with the intended architecture: the optimizer reasons from graph structure and measured-readable hardware properties.
+```cmake
+add_subdirectory(path/to/GPU)
+target_link_libraries(my_app PRIVATE gpu::runtime)
+```
 
-## Execution graph and optimization
+Minimal C++ example:
 
-The runtime now has two graph layers:
+```cpp
+#include "gpu/runtime.hpp"
 
-- structural graph: what hardware objects exist and how they relate
-- execution graph: how data, dispatch, compute, aggregation, and synchronization flow across the placed hardware set
+#include <iostream>
 
-The execution graph is built from the structural graph plus the global placement plan. It is not device-class-specific: one optimization pass can pick one device, shard across several, or overlap stages when the graph suggests it is useful.
+int main() {
+    gpu::Runtime runtime;
 
-Current operation families:
+    for (const auto& graph : runtime.devices()) {
+        std::cout << graph.presentation_name << '\n';
+    }
+
+    return 0;
+}
+```
+
+`gpu::Runtime` refreshes hardware during construction, so `devices()` is ready immediately unless you disable all probes.
+
+To inspect the discovered graph and a sample plan from this repository directly:
+
+```powershell
+.\build\gpu_inspect.exe
+```
+
+On Unix-like shells, run `./build/gpu_inspect` instead.
+
+## what is this repository?
+
+The runtime tries to reason about hardware from structure instead of from labels like "CPU", "GPU", or vendor names. Each discovered device becomes a graph of compute, storage, transfer, and control objects. The planner and execution layers work from that graph and from a workload description.
+
+Right now the library covers four main pieces:
+
+- hardware discovery for the host and OpenCL devices
+- graph summarization and cost materialization
+- workload planning and execution-graph generation
+- direct execution and lightweight validation for a small operation set
+
+The operation set in the current tree includes:
 
 - elementwise map
 - reduction
@@ -153,79 +95,184 @@ Current operation families:
 - 3x3 convolution
 - bilinear resample
 
-Canonical workload presets now compose these operations into larger domain-shaped suites instead of relying only on isolated microbenchmarks:
+Canonical workload presets are also built in for:
 
 - gaming upscaling and post-processing
-- AI vision inference
-- AI training-step surrogate
+- vision-style inference
+- compact training-step surrogates
 
-For each operation family, the optimizer:
+## why graph-first planning?
 
-1. generates a small candidate set of execution settings
-2. builds an execution graph for each candidate
-3. predicts latency from graph structure and edge costs
-4. runs a lightweight validation benchmark
-5. records latency and relative error
-6. keeps the fastest candidate that stays inside tolerance
+Flat device labels lose the details that actually matter for placement. The planner in this repository scores things like execution width, memory capacity, host-link bandwidth, dispatch cost, synchronization cost, and exposed hierarchy. That makes it possible to talk about:
 
-The chosen execution settings are persisted so later runs can rebuild the same execution graph without re-searching from scratch.
+- how much work should stay on the host
+- when unified or coherent memory should matter
+- whether sharding is worth the transfer cost
+- which structural nodes should be mapped for a given workload
 
-The current validation path runs the direct executor and records aggregate runtime against a single-path reference implementation. This is still an early execution engine, but it is no longer limited to shape-only microbenchmarks.
+That is the idea being tested here. The code is more useful as an executable model of the architecture than as a finished runtime.
 
-## Low-spec track and learning cache
+## current status
 
-The optimizer now always captures a lightweight system profile and can switch into a low-spec track automatically.
+Implemented today:
 
-Inputs reflected in the surrogate cost:
+- C++20 runtime core in [`include/gpu`](./include/gpu) and [`src`](./src)
+- host probe and OpenCL probe
+- structural hardware graph with weighted edges
+- planner cache and execution cache persistence
+- workload graph generation with tensors, dependencies, and lifetimes
+- execution-graph construction with residency and transfer schedules
+- system-profile-aware optimization policies
+- direct host execution
+- direct OpenCL execution for the current operation set
+- C ABI for device, node, edge, and planning inspection
+- examples and tests
 
-- numeric readiness and stability state
-- battery and battery-saver state
-- available memory and paging risk
-- sustained slowdown estimated from prior runs
-- one-time device initialization amortization
+Not finished yet:
 
-When the machine is constrained, the candidate generator becomes more conservative:
+- real tensor residency and allocator management
+- native Level Zero, CUDA, and Vulkan execution backends
+- framework bridges for Torch, TensorFlow, or similar runtimes
+- full inter-device transfer scheduling backed by native transports
+- packaging and install rules for downstream consumption
 
-- shallower queue depth
-- fewer pipeline stages
-- stronger bias toward streaming
-- reduced bias toward multi-device sharding when paging risk is high
+One detail worth calling out: the toolkit-ranking layer can score OpenCL, Level Zero, CUDA, and Vulkan variants. The runtime probes in this repository still come from the host and OpenCL, and the non-OpenCL GPU backends are currently model-driven rather than native integrations.
 
-The optimizer also keeps a lightweight shape-bucket performance cache:
+## api
 
-- key = graph set, environment bucket, operation family, shape bucket, execution config
-- value = running averages for latency, prediction scale, error, and system penalty
+### C++ entry points
 
-This cache is used by default and grows only with the distinct shapes and environment buckets actually observed. It is meant to stay lightweight while making repeated runs better over time.
+The main public headers are:
 
-The candidate search now supports multiple lightweight optimization policies:
+- [`include/gpu/runtime.hpp`](./include/gpu/runtime.hpp)
+- [`include/gpu/planner.hpp`](./include/gpu/planner.hpp)
+- [`include/gpu/execution.hpp`](./include/gpu/execution.hpp)
+- [`include/gpu/workloads.hpp`](./include/gpu/workloads.hpp)
+- [`include/gpu/c_api.h`](./include/gpu/c_api.h)
 
-- `heuristic_greedy`: static graph-cost objective
-- `learned_greedy`: graph-cost objective corrected by accumulated measurements
-- `trace_replay`: stronger reuse of preset-specific historical traces
-- `ucb_explore`: bounded exploration when a workload shape has not been seen yet
-- `reinforce_softmax`: reward-weighted ranking inspired by policy-gradient updates
-- `spsa_local_search`: one-step simultaneous perturbation refinement of execution knobs
+`gpu::Runtime` is the main entry point:
 
-The runtime starts with exploration when a preset is unseen, then shifts toward learned or trace-driven ranking as observations accumulate.
+| Method | What it does |
+| --- | --- |
+| `devices()` | Returns the discovered hardware graphs |
+| `gpu_toolkit_index()` | Returns ranked backend variants per discovered device |
+| `plan(workload)` | Builds or loads a cached placement plan |
+| `optimize(workload)` | Builds workload and execution graphs, then picks execution settings |
+| `execute(workload)` | Runs the optimized configuration and records validation feedback |
 
-## Build
+`gpu::RuntimeOptions` lets you:
 
-```powershell
-cmake -S . -B build
-cmake --build build
-```
+- disable the host probe or OpenCL probe
+- override the plan cache path
+- override the execution cache path
 
-Example:
+`gpu::WorkloadSpec` is the main planning input. It includes:
+
+- workload kind
+- working-set size
+- host exchange size
+- estimated flops
+- batch size
+- latency sensitivity
+- unified-memory preference
+- matrix-friendly hint
+
+If you do not want to invent workloads by hand, [`include/gpu/workloads.hpp`](./include/gpu/workloads.hpp) exposes `canonical_workload_presets()`.
+
+### C API
+
+The C API in [`include/gpu/c_api.h`](./include/gpu/c_api.h) exposes a smaller surface:
+
+- `gpu_runtime_create` and `gpu_runtime_destroy`
+- `gpu_runtime_refresh`
+- `gpu_runtime_device_count` and `gpu_runtime_get_device`
+- `gpu_runtime_graph_node_count` and `gpu_runtime_get_graph_node`
+- `gpu_runtime_graph_edge_count` and `gpu_runtime_get_graph_edge`
+- `gpu_runtime_plan`
+
+`gpu_runtime_plan` is currently a planning API, not a full execution API.
+
+For `gpu_workload_spec.kind`, the C layer currently recognizes these strings:
+
+- `custom`
+- `inference`
+- `image`
+- `tensor`
+
+Other values fall back to `custom`.
+
+### cache files
+
+By default the runtime writes lightweight TSV caches to the system temp directory:
+
+- `gpu_runtime_plan_cache.tsv`
+- `gpu_runtime_execution_cache.tsv`
+- `gpu_runtime_execution_cache.tsv.perf`
+
+You can redirect those files through `gpu::RuntimeOptions`.
+
+## examples
+
+### inspect discovered hardware and a sample workload
 
 ```powershell
 .\build\gpu_inspect.exe
 ```
 
-## Next priorities
+This prints:
 
-1. Add more graph probes that do not leak vendor-specific concepts into the runtime core.
-2. Add at least one real execution path.
-3. Add explicit memory residency and transfer planning on top of the graph.
-4. Replace more heuristic estimates with measured calibration.
-5. Add direct framework bridges.
+- discovered hardware graphs
+- graph nodes and edges
+- ranked toolkit variants
+- a sample plan
+- optimization and direct-execution summaries
+
+The output can get large on machines with detailed OpenCL graphs.
+
+### run canonical workload presets
+
+```powershell
+.\build\gpu_profile_workloads.exe
+```
+
+This example runs the built-in gaming, inference, and training-style presets and prints warm-versus-cold execution summaries. It is the slowest example in the repository because it executes each preset more than once to exercise the learning cache.
+
+### run the tests
+
+If `ctest` is available in your shell:
+
+```powershell
+ctest --test-dir build --output-on-failure
+```
+
+Or run the test executables directly:
+
+```powershell
+.\build\gpu_smoke.exe
+.\build\gpu_optimization.exe
+```
+
+A recent `gpu_smoke` run ended with:
+
+```text
+Graphs=1 allocations=1 operations=5 executed=5 cache=hit
+```
+
+A recent `gpu_optimization` run ended with:
+
+```text
+operations=5 cached=yes graphs=1 graph_passes=6
+```
+
+Treat those numbers as sanity checks, not fixed golden values across every machine.
+
+## further reading
+
+- [`examples/inspect_runtime.cpp`](./examples/inspect_runtime.cpp) for a fuller C++ walkthrough
+- [`examples/profile_workloads.cpp`](./examples/profile_workloads.cpp) for preset profiling
+- [`tests/smoke.cpp`](./tests/smoke.cpp) for the smallest end-to-end path
+- [`tests/optimization.cpp`](./tests/optimization.cpp) for cache, optimization, and execution assertions
+
+## license
+
+MIT. See [`LICENSE`](./LICENSE).

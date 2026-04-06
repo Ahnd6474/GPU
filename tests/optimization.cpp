@@ -291,6 +291,13 @@ int main() {
         std::cerr << "No operation optimizations created.\n";
         return 1;
     }
+    if (first.workload_graph.operations.empty() ||
+        first.workload_graph.tensors.empty() ||
+        first.workload_graph.lifetimes.empty() ||
+        first.workload_graph.dependencies.empty()) {
+        std::cerr << "Expected workload DAG, tensors, and lifetimes.\n";
+        return 1;
+    }
     if (first.graph_optimization.optimizer_name.empty() || first.graph_optimization.passes.empty()) {
         std::cerr << "Expected graph-level optimization passes.\n";
         return 1;
@@ -300,9 +307,18 @@ int main() {
         return 1;
     }
 
+    bool saw_transfer_schedule = false;
     for (const auto& result : first.operations) {
         if (result.graph.nodes.empty() || result.graph.edges.empty()) {
             std::cerr << "Execution graph missing structure for " << result.operation.name << ".\n";
+            return 1;
+        }
+        if (result.graph.residency_plan.empty()) {
+            std::cerr << "Execution graph missing residency plan for " << result.operation.name << ".\n";
+            return 1;
+        }
+        if (result.graph.peak_resident_bytes == 0) {
+            std::cerr << "Execution graph missing peak residency estimate for " << result.operation.name << ".\n";
             return 1;
         }
         if (result.config.signature.empty() || result.config.participating_devices.empty()) {
@@ -325,6 +341,12 @@ int main() {
             std::cerr << "Benchmark missing surrogate metadata for " << result.operation.name << ".\n";
             return 1;
         }
+        if (result.benchmark.calibrated_prediction_us <= 0.0 ||
+            result.benchmark.calibration_ratio <= 0.0 ||
+            result.benchmark.validation_samples < 1u) {
+            std::cerr << "Benchmark missing calibration metadata for " << result.operation.name << ".\n";
+            return 1;
+        }
         if (result.benchmark.optimizer_name.empty() || result.benchmark.objective_score <= 0.0) {
             std::cerr << "Benchmark missing optimizer metadata for " << result.operation.name << ".\n";
             return 1;
@@ -333,6 +355,11 @@ int main() {
             std::cerr << "Accuracy drift exceeded tolerance for " << result.operation.name << ".\n";
             return 1;
         }
+        saw_transfer_schedule = saw_transfer_schedule || !result.graph.transfer_schedule.empty();
+    }
+    if (!saw_transfer_schedule) {
+        std::cerr << "Expected at least one scheduled transfer in optimized workload.\n";
+        return 1;
     }
 
     if (first.system_profile.sustained_slowdown < 1.0) {
@@ -367,6 +394,10 @@ int main() {
         const auto macro_report = runtime.optimize(preset.workload);
         if (macro_report.operations.empty()) {
             std::cerr << "Canonical workload optimization failed: " << preset.workload.name << ".\n";
+            return 1;
+        }
+        if (macro_report.workload_graph.dependencies.empty() || macro_report.workload_graph.lifetimes.empty()) {
+            std::cerr << "Canonical workload DAG metadata missing: " << preset.workload.name << ".\n";
             return 1;
         }
         if (macro_report.system_profile.readiness_score < 0.0 ||

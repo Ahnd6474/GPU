@@ -96,6 +96,68 @@ struct OperationSpec {
     bool reduction_like = false;
     bool streaming_friendly = false;
     bool matrix_friendly = false;
+    std::vector<std::string> input_tensor_ids;
+    std::vector<std::string> output_tensor_ids;
+    std::vector<std::string> temporary_tensor_ids;
+    std::vector<std::string> dependency_operation_names;
+};
+
+struct WorkloadTensor {
+    std::string id;
+    std::string alias_group;
+    std::string producer_operation;
+    std::vector<std::string> consumer_operations;
+    std::uint64_t bytes = 0;
+    bool persistent = false;
+    bool temporary = false;
+    bool host_visible = false;
+};
+
+struct TensorLifetime {
+    std::string tensor_id;
+    std::uint32_t first_operation_index = 0;
+    std::uint32_t last_operation_index = 0;
+    std::uint64_t bytes = 0;
+    bool persistent = false;
+};
+
+struct WorkloadDependency {
+    std::string source_operation_name;
+    std::string target_operation_name;
+    std::string tensor_id;
+    bool requires_residency = true;
+};
+
+struct WorkloadGraph {
+    std::string signature;
+    std::vector<WorkloadTensor> tensors;
+    std::vector<TensorLifetime> lifetimes;
+    std::vector<WorkloadDependency> dependencies;
+    std::vector<OperationSpec> operations;
+};
+
+struct TensorResidencyPlanEntry {
+    std::string tensor_id;
+    std::string device_uid;
+    std::string structural_node_id;
+    std::uint64_t bytes = 0;
+    bool persistent = false;
+    bool live_in = false;
+    bool live_out = false;
+    bool requires_transfer = false;
+    double pressure_ratio = 0.0;
+};
+
+struct TransferScheduleEntry {
+    std::string tensor_id;
+    std::string source_device_uid;
+    std::string target_device_uid;
+    std::string source_operation_name;
+    std::string target_operation_name;
+    std::uint64_t bytes = 0;
+    double predicted_latency_us = 0.0;
+    double overlap_ratio = 0.0;
+    bool cross_device = false;
 };
 
 struct ExecutionNode {
@@ -124,11 +186,16 @@ struct ExecutionGraph {
     std::string workload_signature;
     OperationSpec operation;
     std::vector<std::string> participating_devices;
+    std::vector<TensorResidencyPlanEntry> residency_plan;
+    std::vector<TransferScheduleEntry> transfer_schedule;
     std::vector<ExecutionNode> nodes;
     std::vector<ExecutionEdge> edges;
     double predicted_latency_us = 0.0;
     double predicted_speedup_vs_reference = 1.0;
     double expected_relative_error = 0.0;
+    double predicted_transfer_latency_us = 0.0;
+    double predicted_memory_pressure = 0.0;
+    std::uint64_t peak_resident_bytes = 0;
 };
 
 struct ExecutionConfig {
@@ -185,6 +252,12 @@ struct BenchmarkRecord {
     double trace_weight = 1.0;
     double speedup_vs_reference = 1.0;
     double relative_error = 0.0;
+    double calibrated_prediction_us = 0.0;
+    double calibration_ratio = 1.0;
+    double calibration_confidence = 0.0;
+    double reference_spread_us = 0.0;
+    double candidate_spread_us = 0.0;
+    std::uint32_t validation_samples = 0;
     bool accuracy_within_tolerance = true;
     bool simulated = false;
 };
@@ -200,6 +273,7 @@ struct OptimizationReport {
     std::string signature;
     WorkloadKind workload_kind = WorkloadKind::custom;
     std::string dataset_tag;
+    WorkloadGraph workload_graph;
     ExecutionPlan placement;
     std::vector<OperationOptimizationResult> operations;
     SystemProfile system_profile;
@@ -236,7 +310,9 @@ public:
         double average_effective_latency_us = 0.0;
         double average_relative_error = 0.0;
         double average_prediction_scale = 1.0;
+        double average_calibration_ratio = 1.0;
         double average_system_penalty_us = 0.0;
+        double average_validation_spread_us = 0.0;
         double average_reward = 0.0;
     };
 
@@ -273,5 +349,6 @@ private:
 };
 
 [[nodiscard]] std::vector<OperationSpec> default_operation_suite(const WorkloadSpec& workload);
+[[nodiscard]] WorkloadGraph default_workload_graph(const WorkloadSpec& workload);
 
 }  // namespace gpu

@@ -46,6 +46,18 @@ int main() {
         std::cerr << "No execution optimizations created.\n";
         return 1;
     }
+    if (report.workload_graph.operations.empty() ||
+        report.workload_graph.tensors.empty() ||
+        report.workload_graph.lifetimes.empty()) {
+        std::cerr << "Workload graph metadata missing.\n";
+        return 1;
+    }
+    for (const auto& operation : report.operations) {
+        if (operation.graph.residency_plan.empty() || operation.graph.peak_resident_bytes == 0) {
+            std::cerr << "Execution residency metadata missing.\n";
+            return 1;
+        }
+    }
 
     const auto executed = runtime.execute(workload);
     if (executed.operations.empty() || !executed.all_succeeded) {
