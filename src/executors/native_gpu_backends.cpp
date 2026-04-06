@@ -815,12 +815,14 @@ private:
 
     std::shared_ptr<Context> acquire_context(const HardwareGraph& graph) const {
         std::scoped_lock lock(mutex_);
-        if (!api().ready || api().ze_init(0u) != 0) return {};
+        last_error_.clear();
+        if (!api().ready) { last_error_ = "level-zero-loader"; return {}; }
+        if (api().ze_init(0u) != 0) { last_error_ = "level-zero-init"; return {}; }
         if (const auto existing = contexts_.find(graph.uid); existing != contexts_.end()) return existing->second;
         std::uint32_t driver_count = 0;
-        if (api().ze_driver_get(&driver_count, nullptr) != 0 || driver_count == 0) return {};
+        if (api().ze_driver_get(&driver_count, nullptr) != 0 || driver_count == 0) { last_error_ = "level-zero-driver-enum"; return {}; }
         std::vector<ze_driver_handle_t> drivers(driver_count, nullptr);
-        if (api().ze_driver_get(&driver_count, drivers.data()) != 0) return {};
+        if (api().ze_driver_get(&driver_count, drivers.data()) != 0) { last_error_ = "level-zero-driver-list"; return {}; }
         std::uint32_t ordinal = 0;
         for (const auto driver : drivers) {
             std::uint32_t device_count = 0;
@@ -830,18 +832,21 @@ private:
             for (const auto device : devices) {
                 if (ordinal++ != graph.ordinal) continue;
                 auto blob = compile_binary();
-                if (blob.bytes.empty()) return {};
+                if (blob.bytes.empty()) { last_error_ = "level-zero-binary"; return {}; }
                 auto context = std::make_shared<Context>();
                 context->device = device;
                 ze_context_desc_t context_desc{ZE_STRUCTURE_TYPE_CONTEXT_DESC, nullptr, 0u};
                 ze_command_queue_desc_t queue_desc{ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC, nullptr, 0u, 0u, 0u, ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS, 0u};
                 ze_module_desc_t module_desc{ZE_STRUCTURE_TYPE_MODULE_DESC, nullptr, blob.format, blob.bytes.size(), blob.bytes.data(), "", nullptr};
                 ze_module_build_log_handle_t build_log = nullptr;
-                if (api().ze_context_create(driver, &context_desc, &context->context) != 0 || api().ze_command_queue_create(context->context, device, &queue_desc, &context->queue) != 0 || api().ze_module_create(context->context, device, &module_desc, &context->module, &build_log) != 0) return {};
+                if (api().ze_context_create(driver, &context_desc, &context->context) != 0) { last_error_ = "level-zero-context-create"; return {}; }
+                if (api().ze_command_queue_create(context->context, device, &queue_desc, &context->queue) != 0) { last_error_ = "level-zero-queue-create"; return {}; }
+                if (api().ze_module_create(context->context, device, &module_desc, &context->module, &build_log) != 0) { last_error_ = "level-zero-module-create"; return {}; }
                 contexts_.emplace(graph.uid, context);
                 return context;
             }
         }
+        last_error_ = "level-zero-device-match";
         return {};
     }
 
@@ -874,7 +879,7 @@ private:
 
     BackendRunResult run_elementwise_native(const HardwareGraph& graph, const std::span<const float> lhs, const std::span<const float> rhs, const bool low_precision) const override {
         auto context = acquire_context(graph);
-        if (context == nullptr) return failure("level-zero-context");
+        if (context == nullptr) return failure(last_error_.empty() ? "level-zero-context" : last_error_);
         BackendRunResult result;
         result.output.resize(lhs.size(), 0.0f);
         result.runtime_us = measure_us([&]() {
@@ -892,7 +897,7 @@ private:
 
     BackendRunResult run_reduction_native(const HardwareGraph& graph, const std::span<const float> input, const bool low_precision) const override {
         auto context = acquire_context(graph);
-        if (context == nullptr) return failure("level-zero-context");
+        if (context == nullptr) return failure(last_error_.empty() ? "level-zero-context" : last_error_);
         BackendRunResult result;
         result.runtime_us = measure_us([&]() {
             std::scoped_lock lock(context->execution_mutex);
@@ -913,7 +918,7 @@ private:
 
     BackendRunResult run_matmul_native(const HardwareGraph& graph, const std::span<const float> lhs, const std::span<const float> rhs, const std::uint32_t rows, const std::uint32_t columns, const std::uint32_t depth, const bool low_precision) const override {
         auto context = acquire_context(graph);
-        if (context == nullptr) return failure("level-zero-context");
+        if (context == nullptr) return failure(last_error_.empty() ? "level-zero-context" : last_error_);
         BackendRunResult result;
         result.output.resize(static_cast<std::size_t>(rows) * columns, 0.0f);
         result.runtime_us = measure_us([&]() {
@@ -936,6 +941,7 @@ private:
     mutable std::unordered_map<std::string, std::shared_ptr<Context>> contexts_;
     mutable std::mutex binary_mutex_;
     mutable BinaryBlob cached_binary_;
+    mutable std::string last_error_;
 };
 
 class RocmNativeBackend final : public NativeKernelBackendBase {
@@ -1065,6 +1071,55 @@ private:
 
     void free_device(void* ptr) const { if (ptr != nullptr) (void)api().hip_free(ptr); }
 
+    BackendRunResult launch_unary_2d(const HardwareGraph& graph, const char* kernel_name, const std::span<const float> input, const std::size_t output_count, const std::uint32_t grid_items_x, const std::uint32_t grid_items_y, std::vector<void*> args) const {
+        auto context = acquire_context(graph);
+        if (context == nullptr) return failure("rocm-context");
+        BackendRunResult result;
+        result.output.resize(output_count, 0.0f);
+        result.runtime_us = measure_us([&]() {
+            std::scoped_lock lock(context->execution_mutex);
+            auto kernel = get_kernel(*context, kernel_name);
+            if (kernel == nullptr) { result.error = "rocm-kernel"; return; }
+            void* d_in = nullptr; void* d_out = nullptr;
+            if (!alloc_and_copy_input(d_in, input) || api().hip_malloc(&d_out, result.output.size() * sizeof(float)) != 0) { free_device(d_in); free_device(d_out); result.error = "rocm-memory"; return; }
+            args[0] = &d_in;
+            args[1] = &d_out;
+            const unsigned int block_x = kNativeTileSize;
+            const unsigned int block_y = kNativeTileSize;
+            const unsigned int grid_x = grid_items_x == 0 ? 1u : (grid_items_x + block_x - 1u) / block_x;
+            const unsigned int grid_y = grid_items_y == 0 ? 1u : (grid_items_y + block_y - 1u) / block_y;
+            if (api().hip_module_launch_kernel(kernel, grid_x, grid_y, 1, block_x, block_y, 1, 0u, context->stream, args.data(), nullptr) != 0 || api().hip_stream_synchronize(context->stream) != 0 || api().hip_memcpy_dtoh(result.output.data(), d_out, result.output.size() * sizeof(float)) != 0) result.error = "rocm-launch";
+            else { result.success = true; result.used_host = false; result.used_opencl = false; }
+            free_device(d_in); free_device(d_out);
+        });
+        return result;
+    }
+
+    BackendRunResult launch_binary_2d(const HardwareGraph& graph, const char* kernel_name, const std::span<const float> lhs, const std::span<const float> rhs, const std::size_t output_count, const std::uint32_t grid_items_x, const std::uint32_t grid_items_y, std::vector<void*> args) const {
+        auto context = acquire_context(graph);
+        if (context == nullptr) return failure("rocm-context");
+        BackendRunResult result;
+        result.output.resize(output_count, 0.0f);
+        result.runtime_us = measure_us([&]() {
+            std::scoped_lock lock(context->execution_mutex);
+            auto kernel = get_kernel(*context, kernel_name);
+            if (kernel == nullptr) { result.error = "rocm-kernel"; return; }
+            void* d_lhs = nullptr; void* d_rhs = nullptr; void* d_out = nullptr;
+            if (!alloc_and_copy_input(d_lhs, lhs) || !alloc_and_copy_input(d_rhs, rhs) || api().hip_malloc(&d_out, result.output.size() * sizeof(float)) != 0) { free_device(d_lhs); free_device(d_rhs); free_device(d_out); result.error = "rocm-memory"; return; }
+            args[0] = &d_lhs;
+            args[1] = &d_rhs;
+            args[2] = &d_out;
+            const unsigned int block_x = kNativeTileSize;
+            const unsigned int block_y = kNativeTileSize;
+            const unsigned int grid_x = grid_items_x == 0 ? 1u : (grid_items_x + block_x - 1u) / block_x;
+            const unsigned int grid_y = grid_items_y == 0 ? 1u : (grid_items_y + block_y - 1u) / block_y;
+            if (api().hip_module_launch_kernel(kernel, grid_x, grid_y, 1, block_x, block_y, 1, 0u, context->stream, args.data(), nullptr) != 0 || api().hip_stream_synchronize(context->stream) != 0 || api().hip_memcpy_dtoh(result.output.data(), d_out, result.output.size() * sizeof(float)) != 0) result.error = "rocm-launch";
+            else { result.success = true; result.used_host = false; result.used_opencl = false; }
+            free_device(d_lhs); free_device(d_rhs); free_device(d_out);
+        });
+        return result;
+    }
+
     BackendRunResult run_elementwise_native(const HardwareGraph& graph, const std::span<const float> lhs, const std::span<const float> rhs, const bool low_precision) const override {
         auto context = acquire_context(graph);
         if (context == nullptr) return failure("rocm-context");
@@ -1085,10 +1140,42 @@ private:
         return result;
     }
 
-    BackendRunResult run_reduction_native(const HardwareGraph& graph, const std::span<const float> input, const bool low_precision) const override { return failure("rocm-kernel-missing"); }
-    BackendRunResult run_matmul_native(const HardwareGraph& graph, const std::span<const float> lhs, const std::span<const float> rhs, const std::uint32_t rows, const std::uint32_t columns, const std::uint32_t depth, const bool low_precision) const override { return failure("rocm-kernel-missing"); }
-    BackendRunResult run_conv3x3_native(const HardwareGraph&, const std::span<const float>, const std::uint32_t, const std::uint32_t, const bool) const override { return failure("rocm-kernel-missing"); }
-    BackendRunResult run_resample_native(const HardwareGraph&, const std::span<const float>, const std::uint32_t, const std::uint32_t, const std::uint32_t, const std::uint32_t, const std::uint32_t, const std::uint32_t, const bool) const override { return failure("rocm-kernel-missing"); }
+    BackendRunResult run_reduction_native(const HardwareGraph& graph, const std::span<const float> input, const bool low_precision) const override {
+        auto context = acquire_context(graph);
+        if (context == nullptr) return failure("rocm-context");
+        BackendRunResult result;
+        result.runtime_us = measure_us([&]() {
+            std::scoped_lock lock(context->execution_mutex);
+            auto kernel = get_kernel(*context, "reduce_sum");
+            if (kernel == nullptr) { result.error = "rocm-kernel"; return; }
+            const auto local = kNativeReductionGroupSize;
+            const auto global = std::min<std::size_t>(std::max<std::size_t>(local, round_up<std::size_t>(input.size(), local)), local * 64u);
+            const auto groups = global / local;
+            std::vector<float> partials(groups, 0.0f);
+            void* d_in = nullptr; void* d_partial = nullptr;
+            if (!alloc_and_copy_input(d_in, input) || api().hip_malloc(&d_partial, partials.size() * sizeof(float)) != 0) { free_device(d_in); free_device(d_partial); result.error = "rocm-memory"; return; }
+            unsigned int count = static_cast<unsigned int>(input.size()); int low = low_precision ? 1 : 0; void* args[] = {&d_in, &d_partial, &count, &low};
+            if (api().hip_module_launch_kernel(kernel, static_cast<unsigned int>(groups), 1, 1, local, 1, 1, static_cast<unsigned int>(local * sizeof(float)), context->stream, args, nullptr) != 0 || api().hip_stream_synchronize(context->stream) != 0 || api().hip_memcpy_dtoh(partials.data(), d_partial, partials.size() * sizeof(float)) != 0) result.error = "rocm-launch";
+            else { for (const auto value : partials) result.scalar_output += value; result.success = true; result.used_host = false; result.used_opencl = false; }
+            free_device(d_in); free_device(d_partial);
+        });
+        return result;
+    }
+
+    BackendRunResult run_matmul_native(const HardwareGraph& graph, const std::span<const float> lhs, const std::span<const float> rhs, const std::uint32_t rows, const std::uint32_t columns, const std::uint32_t depth, const bool low_precision) const override {
+        unsigned int row_count = rows, column_count = columns, depth_count = depth; int low = low_precision ? 1 : 0;
+        return launch_binary_2d(graph, "matmul_tiled", lhs, rhs, static_cast<std::size_t>(rows) * columns, columns, rows, {nullptr, nullptr, nullptr, &row_count, &column_count, &depth_count, &low});
+    }
+
+    BackendRunResult run_conv3x3_native(const HardwareGraph& graph, const std::span<const float> input, const std::uint32_t height, const std::uint32_t width, const bool low_precision) const override {
+        unsigned int h = height, w = width; int low = low_precision ? 1 : 0;
+        return launch_unary_2d(graph, "conv3x3_valid", input, static_cast<std::size_t>(height - 2u) * (width - 2u), width - 2u, height - 2u, {nullptr, nullptr, &h, &w, &low});
+    }
+
+    BackendRunResult run_resample_native(const HardwareGraph& graph, const std::span<const float> input, const std::uint32_t src_h, const std::uint32_t src_w, const std::uint32_t dst_h, const std::uint32_t dst_w, const std::uint32_t row_offset, const std::uint32_t row_count, const bool low_precision) const override {
+        unsigned int src_height = src_h, src_width = src_w, dst_height = dst_h, dst_width = dst_w, offset = row_offset, rows = row_count; int low = low_precision ? 1 : 0;
+        return launch_unary_2d(graph, "bilinear_resample", input, static_cast<std::size_t>(row_count) * dst_w, dst_w, row_count, {nullptr, nullptr, &src_height, &src_width, &dst_height, &dst_width, &offset, &rows, &low});
+    }
 
     mutable std::mutex mutex_;
     mutable std::unordered_map<std::string, std::shared_ptr<Context>> contexts_;
