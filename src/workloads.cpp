@@ -2,7 +2,11 @@
 #include "jakal/workloads.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
 #include <unordered_map>
 #include <utility>
 
@@ -185,8 +189,142 @@ void add_tensor(
         host_visible});
 }
 
+std::string trim_copy(const std::string& input) {
+    std::size_t first = 0u;
+    while (first < input.size() && std::isspace(static_cast<unsigned char>(input[first])) != 0) {
+        ++first;
+    }
+    std::size_t last = input.size();
+    while (last > first && std::isspace(static_cast<unsigned char>(input[last - 1u])) != 0) {
+        --last;
+    }
+    return input.substr(first, last - first);
+}
+
+std::string lowercase_copy(const std::string& input) {
+    auto lowered = input;
+    std::transform(
+        lowered.begin(),
+        lowered.end(),
+        lowered.begin(),
+        [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+    return lowered;
+}
+
+std::vector<std::string> split_csv_strings(const std::string& input) {
+    std::vector<std::string> values;
+    std::stringstream stream(input);
+    std::string item;
+    while (std::getline(stream, item, ',')) {
+        const auto trimmed = trim_copy(item);
+        if (!trimmed.empty()) {
+            values.push_back(trimmed);
+        }
+    }
+    return values;
+}
+
+std::vector<std::uint64_t> split_csv_u64(const std::string& input) {
+    std::vector<std::uint64_t> values;
+    for (const auto& item : split_csv_strings(input)) {
+        values.push_back(static_cast<std::uint64_t>(std::stoull(item)));
+    }
+    return values;
+}
+
+bool parse_bool_string(const std::string& input, const bool fallback = false) {
+    const auto lowered = lowercase_copy(trim_copy(input));
+    if (lowered == "1" || lowered == "true" || lowered == "yes" || lowered == "on") {
+        return true;
+    }
+    if (lowered == "0" || lowered == "false" || lowered == "no" || lowered == "off") {
+        return false;
+    }
+    return fallback;
+}
+
+WorkloadKind parse_workload_kind_string(const std::string& input) {
+    const auto lowered = lowercase_copy(input);
+    if (lowered == "inference") {
+        return WorkloadKind::inference;
+    }
+    if (lowered == "image") {
+        return WorkloadKind::image;
+    }
+    if (lowered == "tensor") {
+        return WorkloadKind::tensor;
+    }
+    if (lowered == "gaming") {
+        return WorkloadKind::gaming;
+    }
+    if (lowered == "training") {
+        return WorkloadKind::training;
+    }
+    return WorkloadKind::custom;
+}
+
+WorkloadPhase parse_workload_phase_string(const std::string& input) {
+    const auto lowered = lowercase_copy(input);
+    if (lowered == "prefill") {
+        return WorkloadPhase::prefill;
+    }
+    if (lowered == "decode") {
+        return WorkloadPhase::decode;
+    }
+    if (lowered == "cache_update" || lowered == "cache-update" || lowered == "cacheupdate") {
+        return WorkloadPhase::cache_update;
+    }
+    if (lowered == "dequantize" || lowered == "dequant" || lowered == "quantize") {
+        return WorkloadPhase::dequantize;
+    }
+    if (lowered == "training_step" || lowered == "training-step" || lowered == "train") {
+        return WorkloadPhase::training_step;
+    }
+    return WorkloadPhase::unknown;
+}
+
+PartitionStrategy parse_partition_strategy_string(const std::string& input) {
+    const auto lowered = lowercase_copy(input);
+    if (lowered == "blind_sharded" || lowered == "blind-sharded") {
+        return PartitionStrategy::blind_sharded;
+    }
+    if (lowered == "role_split" || lowered == "role-split") {
+        return PartitionStrategy::role_split;
+    }
+    if (lowered == "reduce_on_gpu" || lowered == "reduce-on-gpu") {
+        return PartitionStrategy::reduce_on_gpu;
+    }
+    if (lowered == "projection_sharded" || lowered == "projection-sharded") {
+        return PartitionStrategy::projection_sharded;
+    }
+    if (lowered == "tpu_like" || lowered == "tpu-like") {
+        return PartitionStrategy::tpu_like;
+    }
+    return PartitionStrategy::auto_balanced;
+}
+
+OperationClass parse_operation_class_string(const std::string& input) {
+    const auto lowered = lowercase_copy(input);
+    if (lowered == "reduction") {
+        return OperationClass::reduction;
+    }
+    if (lowered == "matmul") {
+        return OperationClass::matmul;
+    }
+    if (lowered == "convolution_2d" || lowered == "convolution-2d" || lowered == "conv2d") {
+        return OperationClass::convolution_2d;
+    }
+    if (lowered == "resample_2d" || lowered == "resample-2d" || lowered == "resample") {
+        return OperationClass::resample_2d;
+    }
+    return OperationClass::elementwise_map;
+}
+
 void finalize_workload_graph(WorkloadGraph& graph) {
     const auto indices = operation_indices(graph);
+    const auto explicit_dependencies = graph.dependencies;
     graph.dependencies.clear();
     graph.lifetimes.clear();
     for (auto& operation : graph.operations) {
@@ -221,6 +359,20 @@ void finalize_workload_graph(WorkloadGraph& graph) {
             tensor.persistent});
     }
 
+    for (const auto& dependency : explicit_dependencies) {
+        const auto duplicate = std::find_if(
+            graph.dependencies.begin(),
+            graph.dependencies.end(),
+            [&](const WorkloadDependency& existing) {
+                return existing.source_operation_name == dependency.source_operation_name &&
+                       existing.target_operation_name == dependency.target_operation_name &&
+                       existing.tensor_id == dependency.tensor_id;
+            });
+        if (duplicate == graph.dependencies.end()) {
+            graph.dependencies.push_back(dependency);
+        }
+    }
+
     for (auto& operation : graph.operations) {
         for (const auto& dependency : graph.dependencies) {
             if (dependency.target_operation_name == operation.name &&
@@ -235,6 +387,208 @@ void finalize_workload_graph(WorkloadGraph& graph) {
 }
 
 }  // namespace
+
+void normalize_workload_graph(WorkloadGraph& graph) {
+    finalize_workload_graph(graph);
+}
+
+WorkloadManifest load_workload_manifest(const std::filesystem::path& path) {
+    std::ifstream input(path);
+    if (!input.is_open()) {
+        throw std::runtime_error("unable to open workload manifest: " + path.string());
+    }
+
+    WorkloadManifest manifest;
+    manifest.source_path = path;
+
+    enum class Section {
+        none,
+        workload,
+        tensor,
+        operation,
+        dependency
+    };
+
+    Section current_section = Section::none;
+    std::unordered_map<std::string, std::string> fields;
+
+    const auto flush_section = [&]() {
+        if (fields.empty()) {
+            return;
+        }
+
+        switch (current_section) {
+        case Section::workload: {
+            if (const auto it = fields.find("name"); it != fields.end()) {
+                manifest.workload.name = it->second;
+            }
+            if (const auto it = fields.find("kind"); it != fields.end()) {
+                manifest.workload.kind = parse_workload_kind_string(it->second);
+            }
+            if (const auto it = fields.find("dataset_tag"); it != fields.end()) {
+                manifest.workload.dataset_tag = it->second;
+            }
+            if (const auto it = fields.find("working_set_bytes"); it != fields.end()) {
+                manifest.workload.working_set_bytes = static_cast<std::uint64_t>(std::stoull(it->second));
+            }
+            if (const auto it = fields.find("host_exchange_bytes"); it != fields.end()) {
+                manifest.workload.host_exchange_bytes = static_cast<std::uint64_t>(std::stoull(it->second));
+            }
+            if (const auto it = fields.find("estimated_flops"); it != fields.end()) {
+                manifest.workload.estimated_flops = std::stod(it->second);
+            }
+            if (const auto it = fields.find("batch_size"); it != fields.end()) {
+                manifest.workload.batch_size = static_cast<std::uint32_t>(std::stoul(it->second));
+            }
+            if (const auto it = fields.find("latency_sensitive"); it != fields.end()) {
+                manifest.workload.latency_sensitive = parse_bool_string(it->second);
+            }
+            if (const auto it = fields.find("prefer_unified_memory"); it != fields.end()) {
+                manifest.workload.prefer_unified_memory = parse_bool_string(it->second);
+            }
+            if (const auto it = fields.find("matrix_friendly"); it != fields.end()) {
+                manifest.workload.matrix_friendly = parse_bool_string(it->second);
+            }
+            if (const auto it = fields.find("partition_strategy"); it != fields.end()) {
+                manifest.workload.partition_strategy = parse_partition_strategy_string(it->second);
+            }
+            if (const auto it = fields.find("phase"); it != fields.end()) {
+                manifest.workload.phase = parse_workload_phase_string(it->second);
+            }
+            if (const auto it = fields.find("shape_bucket"); it != fields.end()) {
+                manifest.workload.shape_bucket = it->second;
+            }
+            break;
+        }
+        case Section::tensor: {
+            WorkloadTensor tensor;
+            tensor.id = fields.at("id");
+            if (const auto it = fields.find("alias_group"); it != fields.end()) {
+                tensor.alias_group = it->second;
+            }
+            if (const auto it = fields.find("producer"); it != fields.end()) {
+                tensor.producer_operation = it->second;
+            }
+            if (const auto it = fields.find("consumers"); it != fields.end()) {
+                tensor.consumer_operations = split_csv_strings(it->second);
+            }
+            if (const auto it = fields.find("bytes"); it != fields.end()) {
+                tensor.bytes = static_cast<std::uint64_t>(std::stoull(it->second));
+            }
+            tensor.persistent = parse_bool_string(fields["persistent"], false);
+            tensor.temporary = parse_bool_string(fields["temporary"], false);
+            tensor.host_visible = parse_bool_string(fields["host_visible"], false);
+            manifest.graph.tensors.push_back(std::move(tensor));
+            manifest.has_graph = true;
+            break;
+        }
+        case Section::operation: {
+            OperationSpec operation;
+            operation.name = fields.at("name");
+            if (const auto it = fields.find("class"); it != fields.end()) {
+                operation.op_class = parse_operation_class_string(it->second);
+            }
+            if (const auto it = fields.find("extents"); it != fields.end()) {
+                operation.extents = split_csv_u64(it->second);
+            }
+            if (const auto it = fields.find("input_bytes"); it != fields.end()) {
+                operation.input_bytes = static_cast<std::uint64_t>(std::stoull(it->second));
+            }
+            if (const auto it = fields.find("output_bytes"); it != fields.end()) {
+                operation.output_bytes = static_cast<std::uint64_t>(std::stoull(it->second));
+            }
+            if (const auto it = fields.find("temporary_bytes"); it != fields.end()) {
+                operation.temporary_bytes = static_cast<std::uint64_t>(std::stoull(it->second));
+            }
+            if (const auto it = fields.find("estimated_flops"); it != fields.end()) {
+                operation.estimated_flops = std::stod(it->second);
+            }
+            if (const auto it = fields.find("max_relative_error"); it != fields.end()) {
+                operation.max_relative_error = std::stod(it->second);
+            }
+            operation.parallelizable = parse_bool_string(fields["parallelizable"], true);
+            operation.reduction_like = parse_bool_string(fields["reduction_like"], false);
+            operation.streaming_friendly = parse_bool_string(fields["streaming_friendly"], false);
+            operation.matrix_friendly = parse_bool_string(fields["matrix_friendly"], false);
+            if (const auto it = fields.find("inputs"); it != fields.end()) {
+                operation.input_tensor_ids = split_csv_strings(it->second);
+            }
+            if (const auto it = fields.find("outputs"); it != fields.end()) {
+                operation.output_tensor_ids = split_csv_strings(it->second);
+            }
+            if (const auto it = fields.find("temporaries"); it != fields.end()) {
+                operation.temporary_tensor_ids = split_csv_strings(it->second);
+            }
+            if (const auto it = fields.find("dependencies"); it != fields.end()) {
+                operation.dependency_operation_names = split_csv_strings(it->second);
+            }
+            manifest.graph.operations.push_back(std::move(operation));
+            manifest.has_graph = true;
+            break;
+        }
+        case Section::dependency: {
+            WorkloadDependency dependency;
+            dependency.source_operation_name = fields.at("source");
+            dependency.target_operation_name = fields.at("target");
+            if (const auto it = fields.find("tensor_id"); it != fields.end()) {
+                dependency.tensor_id = it->second;
+            }
+            dependency.requires_residency = parse_bool_string(fields["requires_residency"], true);
+            manifest.graph.dependencies.push_back(std::move(dependency));
+            manifest.has_graph = true;
+            break;
+        }
+        case Section::none:
+        default:
+            break;
+        }
+
+        fields.clear();
+    };
+
+    std::string line;
+    while (std::getline(input, line)) {
+        const auto trimmed = trim_copy(line);
+        if (trimmed.empty() || trimmed[0] == '#' || trimmed[0] == ';') {
+            continue;
+        }
+        if (trimmed.front() == '[' && trimmed.back() == ']') {
+            flush_section();
+            const auto section_name = lowercase_copy(trimmed.substr(1u, trimmed.size() - 2u));
+            if (section_name == "workload") {
+                current_section = Section::workload;
+            } else if (section_name == "tensor") {
+                current_section = Section::tensor;
+            } else if (section_name == "operation") {
+                current_section = Section::operation;
+            } else if (section_name == "dependency") {
+                current_section = Section::dependency;
+            } else {
+                current_section = Section::none;
+            }
+            continue;
+        }
+
+        const auto delimiter = trimmed.find('=');
+        if (delimiter == std::string::npos) {
+            continue;
+        }
+        const auto key = lowercase_copy(trim_copy(trimmed.substr(0u, delimiter)));
+        const auto value = trim_copy(trimmed.substr(delimiter + 1u));
+        fields[key] = value;
+    }
+    flush_section();
+
+    if (manifest.workload.name.empty()) {
+        manifest.workload.name = path.stem().string();
+    }
+    if (manifest.has_graph) {
+        manifest.graph.signature = manifest.workload.name + "|" + to_string(manifest.workload.kind) + "|" +
+                                   manifest.workload.dataset_tag + "|manifest";
+        normalize_workload_graph(manifest.graph);
+    }
+    return manifest;
+}
 
 std::vector<CanonicalWorkloadPreset> canonical_workload_presets() {
     return {

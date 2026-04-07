@@ -3681,7 +3681,8 @@ std::filesystem::path ExecutionOptimizer::default_cache_path() {
 OptimizationReport ExecutionOptimizer::optimize(
     const WorkloadSpec& workload,
     const ExecutionPlan& placement,
-    const std::vector<HardwareGraph>& graphs) {
+    const std::vector<HardwareGraph>& graphs,
+    const WorkloadGraph* workload_graph_override) {
     const auto effective_workload = effective_workload_for_placement(workload, placement);
     bootstrap_optimizer_.load_cache();
     adaptive_optimizer_.load_cache();
@@ -3691,12 +3692,15 @@ OptimizationReport ExecutionOptimizer::optimize(
     report.workload_phase = canonical_workload_phase(effective_workload);
     report.workload_shape_bucket = canonical_workload_shape_bucket(effective_workload);
     report.dataset_tag = effective_workload.dataset_tag;
+    report.workload_working_set_bytes = effective_workload.working_set_bytes;
+    report.workload_host_exchange_bytes = effective_workload.host_exchange_bytes;
     report.partition_strategy = effective_workload.partition_strategy;
     report.placement = placement;
     report.system_profile = capture_system_profile(effective_workload, graphs);
     adaptive_optimizer_.apply_runtime_state(report.system_profile, graphs);
 
-    report.workload_graph = default_workload_graph(effective_workload);
+    report.workload_graph =
+        workload_graph_override == nullptr ? default_workload_graph(effective_workload) : *workload_graph_override;
     const auto& operations = report.workload_graph.operations;
     report.signature = build_report_signature(effective_workload, placement, operations);
     const auto graph_set_signature = summarize_graph_set(graphs);

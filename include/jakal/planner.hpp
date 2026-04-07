@@ -109,6 +109,7 @@ private:
         double average_head_runtime_us = 0.0;
         double average_speedup_vs_reference = 1.0;
         double average_successful_operation_ratio = 1.0;
+        std::uint64_t last_update_epoch = 0;
     };
 
     [[nodiscard]] PartitionStrategy resolve_partition_strategy(
@@ -120,6 +121,7 @@ private:
 
     std::filesystem::path cache_path_;
     bool cache_loaded_ = false;
+    std::uint64_t feedback_epoch_ = 0;
     std::unordered_map<std::string, std::vector<CachedAllocation>> cache_;
     std::unordered_map<std::string, std::unordered_map<std::string, StrategyStats>> strategy_stats_;
     std::unordered_map<std::string, std::unordered_map<std::string, StrategyStats>> family_strategy_stats_;

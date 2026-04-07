@@ -21,9 +21,11 @@ constexpr double kMiB = 1024.0 * 1024.0;
 constexpr double kKiB = 1024.0;
 constexpr double kLearnedStrategyMargin = 0.03;
 constexpr double kLearnedFamilyStrategyMargin = 0.05;
+constexpr double kFamilyFreshnessHalfLifeEpochs = 10.0;
 constexpr std::uint32_t kMinimumAutoBaselineObservations = 1u;
 constexpr std::uint32_t kMinimumFamilyAutoBaselineObservations = 2u;
 constexpr std::uint32_t kStrategyExplorationTargetObservations = 1u;
+constexpr std::uint64_t kMaximumFamilyStalenessEpochs = 32u;
 
 struct PartitionAllocationBias {
     double host_ratio = 0.0;
@@ -295,15 +297,17 @@ double strategy_selection_score(
     const double average_speedup_vs_reference,
     const double average_successful_operation_ratio,
     const double baseline_runtime_us,
-    const double baseline_head_runtime_us) {
+    const double baseline_head_runtime_us,
+    const double freshness_weight = 1.0) {
     if (observations == 0u) {
         return 0.0;
     }
     const double success_rate =
         static_cast<double>(successful_observations) / static_cast<double>(observations);
     const double operation_success = std::clamp(average_successful_operation_ratio, 0.0, 1.0);
-    const double reliability = std::clamp((success_rate * 0.70) + (operation_success * 0.30), 0.0, 1.0);
-    const double confidence = std::min(1.0, static_cast<double>(observations) / 3.0);
+    const double freshness = std::clamp(freshness_weight, 0.20, 1.0);
+    const double reliability = std::clamp((success_rate * 0.70) + (operation_success * 0.30), 0.0, 1.0) * freshness;
+    const double confidence = std::min(1.0, static_cast<double>(observations) / 3.0) * freshness;
     const double runtime_gain =
         std::clamp((std::max(baseline_runtime_us, 1.0) / std::max(average_runtime_us, 1.0)) - 1.0, -0.40, 0.60);
     const double head_gain = std::clamp(
@@ -559,6 +563,15 @@ std::string canonical_workload_shape_bucket(const WorkloadSpec& workload) {
     return stream.str();
 }
 
+double family_freshness_weight(const std::uint64_t current_epoch, const std::uint64_t last_update_epoch) {
+    if (last_update_epoch == 0u || current_epoch <= last_update_epoch) {
+        return 1.0;
+    }
+    const double age = static_cast<double>(current_epoch - last_update_epoch);
+    const double freshness = std::exp(-age / kFamilyFreshnessHalfLifeEpochs);
+    return std::clamp(freshness, 0.20, 1.0);
+}
+
 Planner::Planner(std::filesystem::path cache_path)
     : cache_path_(std::move(cache_path)) {}
 
@@ -581,7 +594,8 @@ PartitionStrategy Planner::resolve_partition_strategy(
         [&](const auto* bucket,
             const bool allow_exploration,
             const std::uint32_t minimum_auto_baseline_observations,
-            const double margin) -> StrategyResolution {
+            const double margin,
+            const bool apply_family_aging) -> StrategyResolution {
         if (bucket == nullptr) {
             return {};
         }
@@ -589,6 +603,12 @@ PartitionStrategy Planner::resolve_partition_strategy(
         const auto auto_it = bucket->find(to_string(PartitionStrategy::auto_balanced));
         const std::uint32_t auto_observations = auto_it == bucket->end() ? 0u : auto_it->second.observations;
         if (auto_observations < minimum_auto_baseline_observations) {
+            return {};
+        }
+        if (apply_family_aging &&
+            auto_it != bucket->end() &&
+            feedback_epoch_ > auto_it->second.last_update_epoch &&
+            (feedback_epoch_ - auto_it->second.last_update_epoch) > kMaximumFamilyStalenessEpochs) {
             return {};
         }
 
@@ -615,7 +635,10 @@ PartitionStrategy Planner::resolve_partition_strategy(
                       auto_it->second.average_speedup_vs_reference,
                       auto_it->second.average_successful_operation_ratio,
                       auto_it->second.average_runtime_us,
-                      auto_it->second.average_head_runtime_us);
+                      auto_it->second.average_head_runtime_us,
+                      apply_family_aging
+                          ? family_freshness_weight(feedback_epoch_, auto_it->second.last_update_epoch)
+                          : 1.0);
 
         PartitionStrategy best_strategy = PartitionStrategy::auto_balanced;
         double best_score = auto_score;
@@ -647,7 +670,8 @@ PartitionStrategy Planner::resolve_partition_strategy(
                 stats.average_speedup_vs_reference,
                 stats.average_successful_operation_ratio,
                 baseline_runtime_us,
-                baseline_head_runtime_us);
+                baseline_head_runtime_us,
+                apply_family_aging ? family_freshness_weight(feedback_epoch_, stats.last_update_epoch) : 1.0);
             if (score > best_score ||
                 (score == best_score && stats.average_speedup_vs_reference > best_speedup)) {
                 best_strategy = strategy;
@@ -673,7 +697,8 @@ PartitionStrategy Planner::resolve_partition_strategy(
         exact_it == strategy_stats_.end() ? nullptr : &exact_it->second,
         true,
         kMinimumAutoBaselineObservations,
-        kLearnedStrategyMargin);
+        kLearnedStrategyMargin,
+        false);
     if (exact_resolution.strategy != PartitionStrategy::auto_balanced) {
         return exact_resolution.strategy;
     }
@@ -682,7 +707,8 @@ PartitionStrategy Planner::resolve_partition_strategy(
         family_it == family_strategy_stats_.end() ? nullptr : &family_it->second,
         false,
         kMinimumFamilyAutoBaselineObservations,
-        kLearnedFamilyStrategyMargin);
+        kLearnedFamilyStrategyMargin,
+        true);
     if (family_resolution.strategy != PartitionStrategy::auto_balanced) {
         return family_resolution.strategy;
     }
@@ -915,6 +941,7 @@ void Planner::ingest_strategy_feedback(
     const std::vector<HardwareGraph>& graphs,
     const StrategyFeedbackSample& feedback) {
     load_cache();
+    ++feedback_epoch_;
 
     const auto ingest_into = [&](auto& store, const std::string& key) {
         auto& stats = store[key][to_string(feedback.strategy)];
@@ -922,6 +949,7 @@ void Planner::ingest_strategy_feedback(
         if (feedback.all_succeeded) {
             ++stats.successful_observations;
         }
+        stats.last_update_epoch = feedback_epoch_;
 
         const double sample_count = static_cast<double>(stats.observations);
         const double runtime_sample = std::max(feedback.total_runtime_us, 0.0);
@@ -949,28 +977,26 @@ void Planner::load_cache() {
     cache_loaded_ = true;
 
     std::ifstream input(cache_path_);
-    if (!input.is_open()) {
-        return;
-    }
-
     std::string line;
-    while (std::getline(input, line)) {
-        if (line.empty() || line[0] == '#') {
-            continue;
-        }
+    if (input.is_open()) {
+        while (std::getline(input, line)) {
+            if (line.empty() || line[0] == '#') {
+                continue;
+            }
 
-        const auto fields = split_tab(line);
-        if (fields.size() != 4) {
-            continue;
-        }
+            const auto fields = split_tab(line);
+            if (fields.size() != 4) {
+                continue;
+            }
 
-        try {
-            cache_[fields[0]].push_back(CachedAllocation{
-                fields[1],
-                std::stod(fields[2]),
-                std::stod(fields[3])});
-        } catch (const std::exception&) {
-            continue;
+            try {
+                cache_[fields[0]].push_back(CachedAllocation{
+                    fields[1],
+                    std::stod(fields[2]),
+                    std::stod(fields[3])});
+            } catch (const std::exception&) {
+                continue;
+            }
         }
     }
 
@@ -987,7 +1013,7 @@ void Planner::load_cache() {
             }
 
             const auto fields = split_tab(strategy_line);
-            if (fields.size() != 6 && fields.size() != 8) {
+            if (fields.size() != 6 && fields.size() != 8 && fields.size() != 9) {
                 continue;
             }
 
@@ -996,10 +1022,16 @@ void Planner::load_cache() {
                 stats.observations = static_cast<std::uint32_t>(std::stoul(fields[2]));
                 stats.successful_observations = static_cast<std::uint32_t>(std::stoul(fields[3]));
                 stats.average_runtime_us = std::stod(fields[4]);
-                if (fields.size() == 8) {
+                if (fields.size() == 9) {
                     stats.average_head_runtime_us = std::stod(fields[5]);
                     stats.average_speedup_vs_reference = std::stod(fields[6]);
                     stats.average_successful_operation_ratio = std::stod(fields[7]);
+                    stats.last_update_epoch = static_cast<std::uint64_t>(std::stoull(fields[8]));
+                } else if (fields.size() == 8) {
+                    stats.average_head_runtime_us = std::stod(fields[5]);
+                    stats.average_speedup_vs_reference = std::stod(fields[6]);
+                    stats.average_successful_operation_ratio = std::stod(fields[7]);
+                    stats.last_update_epoch = stats.observations;
                 } else {
                     stats.average_head_runtime_us = stats.average_runtime_us;
                     stats.average_speedup_vs_reference = std::stod(fields[5]);
@@ -1007,8 +1039,10 @@ void Planner::load_cache() {
                         stats.observations == 0u
                             ? 1.0
                             : static_cast<double>(stats.successful_observations) / static_cast<double>(stats.observations);
+                    stats.last_update_epoch = stats.observations;
                 }
                 store[fields[0]][fields[1]] = stats;
+                feedback_epoch_ = std::max(feedback_epoch_, stats.last_update_epoch);
             } catch (const std::exception&) {
                 continue;
             }
@@ -1054,7 +1088,7 @@ void Planner::persist_cache() const {
 
     const auto persist_strategy_store = [](std::ofstream& output, const auto& store) {
         output
-            << "# learning_key\tstrategy\tobservations\tsuccesses\tavg_runtime_us\tavg_head_runtime_us\tavg_speedup\tavg_operation_success\n";
+            << "# learning_key\tstrategy\tobservations\tsuccesses\tavg_runtime_us\tavg_head_runtime_us\tavg_speedup\tavg_operation_success\tlast_update_epoch\n";
         for (const auto& [learning_key, strategies] : store) {
             for (const auto& [strategy, stats] : strategies) {
                 output << learning_key << '\t'
@@ -1064,7 +1098,8 @@ void Planner::persist_cache() const {
                        << stats.average_runtime_us << '\t'
                        << stats.average_head_runtime_us << '\t'
                        << stats.average_speedup_vs_reference << '\t'
-                       << stats.average_successful_operation_ratio << '\n';
+                       << stats.average_successful_operation_ratio << '\t'
+                       << stats.last_update_epoch << '\n';
             }
         }
     };

@@ -113,5 +113,10 @@ if(JAKAL_CORE_BUILD_TESTS)
     target_link_libraries(jakal_partition_strategies PRIVATE jakal::core)
 
     add_test(NAME jakal_partition_strategies COMMAND jakal_partition_strategies)
+
+    add_executable(jakal_runtime_product tests/runtime_product.cpp)
+    target_link_libraries(jakal_runtime_product PRIVATE jakal::core)
+
+    add_test(NAME jakal_runtime_product COMMAND jakal_runtime_product)
 endif()
 

@@ -580,6 +580,79 @@ bool test_hardware_family_transfer_learning() {
     return true;
 }
 
+bool test_hardware_family_freshness_aging() {
+    const auto cache_path = unique_temp_file("planner-family-aging");
+    jakal::Planner planner(cache_path);
+    const std::vector<jakal::HardwareGraph> source_graphs{make_host_graph(), make_gpu_graph()};
+    const std::vector<jakal::HardwareGraph> family_graphs{make_host_graph(), make_gpu_graph_family_variant()};
+
+    const jakal::WorkloadSpec workload{
+        "decode-family-aging",
+        jakal::WorkloadKind::inference,
+        "llm-decode-token-lite",
+        640ull * 1024ull * 1024ull,
+        12ull * 1024ull * 1024ull,
+        3.8e10,
+        1,
+        true,
+        true,
+        true,
+        jakal::PartitionStrategy::auto_balanced,
+        jakal::WorkloadPhase::decode};
+
+    planner.ingest_strategy_feedback(
+        workload,
+        source_graphs,
+        {jakal::PartitionStrategy::auto_balanced, 1180.0, 405.0, 1.00, 1.0, true});
+    planner.ingest_strategy_feedback(
+        workload,
+        source_graphs,
+        {jakal::PartitionStrategy::auto_balanced, 1210.0, 415.0, 0.98, 1.0, true});
+    planner.ingest_strategy_feedback(
+        workload,
+        source_graphs,
+        {jakal::PartitionStrategy::role_split, 910.0, 290.0, 1.22, 1.0, true});
+    planner.ingest_strategy_feedback(
+        workload,
+        source_graphs,
+        {jakal::PartitionStrategy::role_split, 890.0, 275.0, 1.25, 1.0, true});
+
+    const auto initial_family_plan = planner.build_plan(workload, family_graphs);
+    if (!expect_strategy("initial hardware family aging plan", initial_family_plan, jakal::PartitionStrategy::role_split)) {
+        return false;
+    }
+
+    for (int index = 0; index < 40; ++index) {
+        auto unrelated = workload;
+        unrelated.name = "aging-bump-" + std::to_string(index);
+        unrelated.shape_bucket = "aging-bucket-" + std::to_string(index);
+        unrelated.batch_size = 8u;
+        unrelated.latency_sensitive = false;
+        unrelated.prefer_unified_memory = false;
+        unrelated.phase = jakal::WorkloadPhase::training_step;
+        unrelated.working_set_bytes = 2ull * 1024ull * 1024ull * 1024ull;
+        unrelated.host_exchange_bytes = 256ull * 1024ull * 1024ull;
+        unrelated.estimated_flops = 1.5e12;
+        planner.ingest_strategy_feedback(
+            unrelated,
+            source_graphs,
+            {jakal::PartitionStrategy::auto_balanced, 2100.0, 2100.0, 1.00, 1.0, true});
+    }
+
+    const auto aged_family_plan = planner.build_plan(workload, family_graphs);
+    if (!expect_strategy("aged hardware family plan", aged_family_plan, jakal::PartitionStrategy::auto_balanced)) {
+        return false;
+    }
+
+    const auto strategy_cache = cache_path.string() + ".strategy";
+    const auto family_strategy_cache = cache_path.string() + ".strategy_family";
+    std::error_code ec;
+    std::filesystem::remove(cache_path, ec);
+    std::filesystem::remove(strategy_cache, ec);
+    std::filesystem::remove(family_strategy_cache, ec);
+    return true;
+}
+
 int main() {
     if (!test_strategy_exploration()) {
         return 1;
@@ -600,6 +673,9 @@ int main() {
         return 1;
     }
     if (!test_hardware_family_transfer_learning()) {
+        return 1;
+    }
+    if (!test_hardware_family_freshness_aging()) {
         return 1;
     }
     std::cout << "planner strategy learning ok\n";

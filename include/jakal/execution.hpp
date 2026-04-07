@@ -289,6 +289,8 @@ struct OptimizationReport {
     WorkloadPhase workload_phase = WorkloadPhase::unknown;
     std::string workload_shape_bucket;
     std::string dataset_tag;
+    std::uint64_t workload_working_set_bytes = 0;
+    std::uint64_t workload_host_exchange_bytes = 0;
     PartitionStrategy partition_strategy = PartitionStrategy::auto_balanced;
     WorkloadGraph workload_graph;
     ExecutionPlan placement;
@@ -384,7 +386,8 @@ public:
     [[nodiscard]] OptimizationReport optimize(
         const WorkloadSpec& workload,
         const ExecutionPlan& placement,
-        const std::vector<HardwareGraph>& graphs);
+        const std::vector<HardwareGraph>& graphs,
+        const WorkloadGraph* workload_graph_override = nullptr);
     void ingest_execution_feedback(
         const OptimizationReport& report,
         const std::vector<ExecutionFeedbackRecord>& feedback,
