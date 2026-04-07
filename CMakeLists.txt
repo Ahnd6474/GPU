@@ -123,5 +123,18 @@ if(JAKAL_CORE_BUILD_TESTS)
     target_link_libraries(jakal_workload_import_adapters PRIVATE jakal::core)
 
     add_test(NAME jakal_workload_import_adapters COMMAND jakal_workload_import_adapters)
+
+    add_executable(jakal_backend_contracts tests/backend_contracts.cpp)
+    target_link_libraries(jakal_backend_contracts PRIVATE jakal::core)
+
+    add_test(NAME jakal_backend_contracts COMMAND jakal_backend_contracts)
+
+    add_executable(jakal_live_backend_smoke tests/live_backend_smoke.cpp)
+    target_link_libraries(jakal_live_backend_smoke PRIVATE jakal::core)
+
+    add_test(NAME jakal_live_backend_smoke COMMAND jakal_live_backend_smoke --host-only)
+
+    add_executable(jakal_preset_execution_diag tests/preset_execution_diag.cpp)
+    target_link_libraries(jakal_preset_execution_diag PRIVATE jakal::core)
 endif()
 

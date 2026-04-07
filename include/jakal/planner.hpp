@@ -37,6 +37,14 @@ enum class PartitionStrategy {
     tpu_like
 };
 
+enum class PlanStrategySource {
+    heuristic_auto,
+    explicit_request,
+    exact_learning,
+    family_learning,
+    exploration
+};
+
 struct WorkloadSpec {
     std::string name;
     WorkloadKind kind = WorkloadKind::custom;
@@ -63,6 +71,9 @@ struct ExecutionPlan {
     std::string signature;
     std::vector<PlanAllocation> allocations;
     PartitionStrategy resolved_partition_strategy = PartitionStrategy::auto_balanced;
+    PlanStrategySource strategy_source = PlanStrategySource::heuristic_auto;
+    double strategy_confidence = 0.0;
+    std::string strategy_reason;
     bool loaded_from_cache = false;
 };
 
@@ -73,11 +84,24 @@ struct StrategyFeedbackSample {
     double speedup_vs_reference = 1.0;
     double successful_operation_ratio = 1.0;
     bool all_succeeded = false;
+    PlanStrategySource strategy_source = PlanStrategySource::heuristic_auto;
+    double planned_confidence = 0.0;
+    bool rolled_back_to_auto = false;
+    bool runtime_regressed = false;
+};
+
+struct ConfidenceCalibrationStats {
+    std::uint32_t observations = 0;
+    std::uint32_t successful_observations = 0;
+    std::uint32_t rollback_observations = 0;
+    double average_successful_operation_ratio = 1.0;
+    double average_runtime_regression = 1.0;
 };
 
 std::string to_string(WorkloadKind kind);
 std::string to_string(WorkloadPhase phase);
 std::string to_string(PartitionStrategy strategy);
+std::string to_string(PlanStrategySource source);
 [[nodiscard]] WorkloadPhase canonical_workload_phase(const WorkloadSpec& workload);
 [[nodiscard]] std::string canonical_workload_shape_bucket(const WorkloadSpec& workload);
 
@@ -112,7 +136,14 @@ private:
         std::uint64_t last_update_epoch = 0;
     };
 
-    [[nodiscard]] PartitionStrategy resolve_partition_strategy(
+    struct ResolvedStrategyDecision {
+        PartitionStrategy strategy = PartitionStrategy::auto_balanced;
+        PlanStrategySource source = PlanStrategySource::heuristic_auto;
+        double confidence = 0.0;
+        std::string reason;
+    };
+
+    [[nodiscard]] ResolvedStrategyDecision resolve_partition_strategy(
         const WorkloadSpec& workload,
         const std::vector<HardwareGraph>& graphs) const;
 
@@ -125,6 +156,7 @@ private:
     std::unordered_map<std::string, std::vector<CachedAllocation>> cache_;
     std::unordered_map<std::string, std::unordered_map<std::string, StrategyStats>> strategy_stats_;
     std::unordered_map<std::string, std::unordered_map<std::string, StrategyStats>> family_strategy_stats_;
+    std::unordered_map<std::string, ConfidenceCalibrationStats> confidence_calibration_stats_;
 };
 
 }  // namespace jakal

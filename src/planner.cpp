@@ -191,6 +191,28 @@ std::filesystem::path family_strategy_cache_path_for(const std::filesystem::path
     return path;
 }
 
+std::filesystem::path confidence_calibration_cache_path_for(const std::filesystem::path& cache_path) {
+    auto path = cache_path;
+    path += ".confidence";
+    return path;
+}
+
+std::uint32_t confidence_bucket_index(const double confidence) {
+    return static_cast<std::uint32_t>(std::clamp(std::floor(std::clamp(confidence, 0.0, 0.999) * 10.0), 0.0, 9.0));
+}
+
+std::string build_confidence_calibration_key(
+    const WorkloadSpec& workload,
+    const PlanStrategySource source,
+    const double confidence) {
+    std::ostringstream key;
+    key << to_string(workload.kind) << '|'
+        << to_string(canonical_workload_phase(workload)) << '|'
+        << to_string(source) << '|'
+        << confidence_bucket_index(confidence);
+    return key.str();
+}
+
 bool is_host_graph(const HardwareGraph& graph) {
     return graph.probe == "host";
 }
@@ -518,6 +540,22 @@ std::string to_string(const PartitionStrategy strategy) {
     }
 }
 
+std::string to_string(const PlanStrategySource source) {
+    switch (source) {
+    case PlanStrategySource::explicit_request:
+        return "explicit_request";
+    case PlanStrategySource::exact_learning:
+        return "exact_learning";
+    case PlanStrategySource::family_learning:
+        return "family_learning";
+    case PlanStrategySource::exploration:
+        return "exploration";
+    case PlanStrategySource::heuristic_auto:
+    default:
+        return "heuristic_auto";
+    }
+}
+
 WorkloadPhase canonical_workload_phase(const WorkloadSpec& workload) {
     if (workload.phase != WorkloadPhase::unknown) {
         return workload.phase;
@@ -572,18 +610,84 @@ double family_freshness_weight(const std::uint64_t current_epoch, const std::uin
     return std::clamp(freshness, 0.20, 1.0);
 }
 
+double strategy_decision_confidence(
+    const std::uint32_t observations,
+    const std::uint32_t successful_observations,
+    const double average_successful_operation_ratio,
+    const double score_delta,
+    const bool family,
+    const double freshness_weight) {
+    if (observations == 0u) {
+        return family ? 0.20 : 0.25;
+    }
+
+    const double observation_confidence = std::min(1.0, static_cast<double>(observations) / 4.0);
+    const double success_rate =
+        static_cast<double>(successful_observations) / static_cast<double>(observations);
+    const double success_confidence =
+        std::clamp((success_rate * 0.65) + (average_successful_operation_ratio * 0.35), 0.0, 1.0);
+    const double margin_confidence = std::clamp(score_delta / 0.15, 0.0, 1.0);
+    double confidence =
+        (observation_confidence * 0.45) + (success_confidence * 0.35) + (margin_confidence * 0.20);
+    confidence *= std::clamp(freshness_weight, 0.20, 1.0);
+    if (family) {
+        confidence *= 0.85;
+    }
+    return std::clamp(confidence, family ? 0.20 : 0.25, family ? 0.90 : 0.98);
+}
+
+double apply_confidence_calibration(
+    const std::unordered_map<std::string, ConfidenceCalibrationStats>& calibration_store,
+    const WorkloadSpec& workload,
+    const PlanStrategySource source,
+    const double raw_confidence) {
+    if (source == PlanStrategySource::explicit_request) {
+        return 1.0;
+    }
+
+    const auto it = calibration_store.find(build_confidence_calibration_key(workload, source, raw_confidence));
+    if (it == calibration_store.end() || it->second.observations < 2u) {
+        return std::clamp(raw_confidence, 0.0, 1.0);
+    }
+
+    const auto& stats = it->second;
+    const double success_rate =
+        static_cast<double>(stats.successful_observations + 1u) / static_cast<double>(stats.observations + 2u);
+    const double rollback_penalty =
+        static_cast<double>(stats.rollback_observations) / static_cast<double>(std::max<std::uint32_t>(1u, stats.observations));
+    const double empirical_confidence = std::clamp(
+        (success_rate * 0.55) +
+            (stats.average_successful_operation_ratio * 0.30) +
+            ((1.0 / std::max(1.0, stats.average_runtime_regression)) * 0.15) -
+            (rollback_penalty * 0.25),
+        0.05,
+        0.99);
+    const double calibration_weight = std::min(0.75, static_cast<double>(stats.observations) / 8.0);
+    return std::clamp(
+        (raw_confidence * (1.0 - calibration_weight)) + (empirical_confidence * calibration_weight),
+        0.05,
+        0.99);
+}
+
 Planner::Planner(std::filesystem::path cache_path)
     : cache_path_(std::move(cache_path)) {}
 
-PartitionStrategy Planner::resolve_partition_strategy(
+Planner::ResolvedStrategyDecision Planner::resolve_partition_strategy(
     const WorkloadSpec& workload,
     const std::vector<HardwareGraph>& graphs) const {
     if (workload.partition_strategy != PartitionStrategy::auto_balanced) {
-        return workload.partition_strategy;
+        return {
+            workload.partition_strategy,
+            PlanStrategySource::explicit_request,
+            1.0,
+            "explicit partition strategy request"};
     }
 
     struct StrategyResolution {
         PartitionStrategy strategy = PartitionStrategy::auto_balanced;
+        PlanStrategySource source = PlanStrategySource::heuristic_auto;
+        double confidence = 0.40;
+        std::string reason;
         bool has_baseline = false;
     };
 
@@ -618,7 +722,12 @@ PartitionStrategy Planner::resolve_partition_strategy(
                 const std::uint32_t observations =
                     strategy_it == bucket->end() ? 0u : strategy_it->second.observations;
                 if (observations < kStrategyExplorationTargetObservations) {
-                    return {strategy, true};
+                    return {
+                        strategy,
+                        PlanStrategySource::exploration,
+                        0.25,
+                        "exploring missing observations for " + to_string(strategy),
+                        true};
                 }
             }
         }
@@ -682,15 +791,51 @@ PartitionStrategy Planner::resolve_partition_strategy(
         }
 
         if (best_strategy == PartitionStrategy::auto_balanced) {
-            return {PartitionStrategy::auto_balanced, true};
+            return {
+                PartitionStrategy::auto_balanced,
+                PlanStrategySource::heuristic_auto,
+                auto_it == bucket->end() ? 0.35 : 0.60,
+                auto_it == bucket->end() ? "no learned strategy baseline" : "learned baseline favored auto",
+                true};
         }
         if (best_score <= (auto_score + margin)) {
-            return {PartitionStrategy::auto_balanced, true};
+            return {
+                PartitionStrategy::auto_balanced,
+                PlanStrategySource::heuristic_auto,
+                auto_it == bucket->end() ? 0.35 : 0.55,
+                "learned alternative margin too small",
+                true};
         }
         if (best_observations == 0u) {
-            return {PartitionStrategy::auto_balanced, true};
+            return {
+                PartitionStrategy::auto_balanced,
+                PlanStrategySource::heuristic_auto,
+                auto_it == bucket->end() ? 0.35 : 0.50,
+                "candidate strategy lacked observations",
+                true};
         }
-        return {best_strategy, true};
+        const auto best_it = bucket->find(to_string(best_strategy));
+        const auto freshness =
+            apply_family_aging && best_it != bucket->end()
+                ? family_freshness_weight(feedback_epoch_, best_it->second.last_update_epoch)
+                : 1.0;
+        const double confidence =
+            best_it == bucket->end()
+                ? 0.40
+                : strategy_decision_confidence(
+                      best_it->second.observations,
+                      best_it->second.successful_observations,
+                      best_it->second.average_successful_operation_ratio,
+                      best_score - auto_score,
+                      apply_family_aging,
+                      freshness);
+        return {
+            best_strategy,
+            apply_family_aging ? PlanStrategySource::family_learning : PlanStrategySource::exact_learning,
+            confidence,
+            std::string(apply_family_aging ? "family learned strategy " : "exact learned strategy ") +
+                to_string(best_strategy),
+            true};
     };
 
     const auto exact_resolution = resolve_from_bucket(
@@ -700,7 +845,15 @@ PartitionStrategy Planner::resolve_partition_strategy(
         kLearnedStrategyMargin,
         false);
     if (exact_resolution.strategy != PartitionStrategy::auto_balanced) {
-        return exact_resolution.strategy;
+        return {
+            exact_resolution.strategy,
+            exact_resolution.source,
+            apply_confidence_calibration(
+                confidence_calibration_stats_,
+                workload,
+                exact_resolution.source,
+                exact_resolution.confidence),
+            exact_resolution.reason};
     }
 
     const auto family_resolution = resolve_from_bucket(
@@ -710,13 +863,48 @@ PartitionStrategy Planner::resolve_partition_strategy(
         kLearnedFamilyStrategyMargin,
         true);
     if (family_resolution.strategy != PartitionStrategy::auto_balanced) {
-        return family_resolution.strategy;
+        return {
+            family_resolution.strategy,
+            family_resolution.source,
+            apply_confidence_calibration(
+                confidence_calibration_stats_,
+                workload,
+                family_resolution.source,
+                family_resolution.confidence),
+            family_resolution.reason};
     }
 
     if (exact_resolution.has_baseline || family_resolution.has_baseline) {
-        return PartitionStrategy::auto_balanced;
+        if (exact_resolution.has_baseline) {
+            return {
+                PartitionStrategy::auto_balanced,
+                exact_resolution.source,
+                apply_confidence_calibration(
+                    confidence_calibration_stats_,
+                    workload,
+                    exact_resolution.source,
+                    exact_resolution.confidence),
+                exact_resolution.reason};
+        }
+        return {
+            PartitionStrategy::auto_balanced,
+            family_resolution.source,
+            apply_confidence_calibration(
+                confidence_calibration_stats_,
+                workload,
+                family_resolution.source,
+                family_resolution.confidence),
+            family_resolution.reason};
     }
-    return PartitionStrategy::auto_balanced;
+    return {
+        PartitionStrategy::auto_balanced,
+        PlanStrategySource::heuristic_auto,
+        apply_confidence_calibration(
+            confidence_calibration_stats_,
+            workload,
+            PlanStrategySource::heuristic_auto,
+            0.30),
+        "no learning history, using heuristic auto"};
 }
 
 std::filesystem::path Planner::default_cache_path() {
@@ -730,13 +918,17 @@ std::filesystem::path Planner::default_cache_path() {
 ExecutionPlan Planner::build_plan(const WorkloadSpec& workload, const std::vector<HardwareGraph>& graphs) {
     load_cache();
 
-    const auto effective_strategy = resolve_partition_strategy(workload, graphs);
+    const auto strategy_decision = resolve_partition_strategy(workload, graphs);
+    const auto effective_strategy = strategy_decision.strategy;
     auto effective_workload = workload;
     effective_workload.partition_strategy = effective_strategy;
 
     ExecutionPlan plan;
     plan.signature = build_signature(effective_workload, graphs);
     plan.resolved_partition_strategy = effective_strategy;
+    plan.strategy_source = strategy_decision.source;
+    plan.strategy_confidence = strategy_decision.confidence;
+    plan.strategy_reason = strategy_decision.reason;
 
     std::unordered_map<std::string, HardwareGraph> graph_lookup;
     for (const auto& graph : graphs) {
@@ -967,6 +1159,29 @@ void Planner::ingest_strategy_feedback(
     ingest_into(strategy_stats_, build_learning_key(workload, graphs));
     ingest_into(family_strategy_stats_, build_family_learning_key(workload, graphs));
 
+    if (feedback.strategy_source != PlanStrategySource::explicit_request) {
+        auto& stats = confidence_calibration_stats_[build_confidence_calibration_key(
+            workload,
+            feedback.strategy_source,
+            feedback.planned_confidence)];
+        ++stats.observations;
+        if (feedback.all_succeeded && !feedback.runtime_regressed) {
+            ++stats.successful_observations;
+        }
+        if (feedback.rolled_back_to_auto) {
+            ++stats.rollback_observations;
+        }
+        const double sample_count = static_cast<double>(stats.observations);
+        const double op_success = std::clamp(feedback.successful_operation_ratio, 0.0, 1.0);
+        stats.average_successful_operation_ratio +=
+            (op_success - stats.average_successful_operation_ratio) / sample_count;
+        const double runtime_regression = feedback.runtime_regressed
+                                              ? std::max(1.05, 1.0 / std::max(0.01, feedback.speedup_vs_reference))
+                                              : 1.0;
+        stats.average_runtime_regression +=
+            (runtime_regression - stats.average_runtime_regression) / sample_count;
+    }
+
     persist_cache();
 }
 
@@ -1057,6 +1272,30 @@ void Planner::load_cache() {
     if (family_strategy_input.is_open()) {
         load_strategy_store(family_strategy_input, family_strategy_stats_);
     }
+
+    std::ifstream calibration_input(confidence_calibration_cache_path_for(cache_path_));
+    if (calibration_input.is_open()) {
+        std::string calibration_line;
+        while (std::getline(calibration_input, calibration_line)) {
+            if (calibration_line.empty() || calibration_line[0] == '#') {
+                continue;
+            }
+            const auto fields = split_tab(calibration_line);
+            if (fields.size() != 6) {
+                continue;
+            }
+            try {
+                confidence_calibration_stats_[fields[0]] = ConfidenceCalibrationStats{
+                    static_cast<std::uint32_t>(std::stoul(fields[1])),
+                    static_cast<std::uint32_t>(std::stoul(fields[2])),
+                    static_cast<std::uint32_t>(std::stoul(fields[3])),
+                    std::stod(fields[4]),
+                    std::stod(fields[5])};
+            } catch (const std::exception&) {
+                continue;
+            }
+        }
+    }
 }
 
 void Planner::persist_cache() const {
@@ -1111,6 +1350,21 @@ void Planner::persist_cache() const {
         return;
     }
     persist_strategy_store(family_strategy_output, family_strategy_stats_);
+
+    std::ofstream calibration_output(confidence_calibration_cache_path_for(cache_path_), std::ios::trunc);
+    if (!calibration_output.is_open()) {
+        return;
+    }
+    calibration_output
+        << "# calibration_key\tobservations\tsuccesses\trollbacks\tavg_operation_success\tavg_runtime_regression\n";
+    for (const auto& [calibration_key, stats] : confidence_calibration_stats_) {
+        calibration_output << calibration_key << '\t'
+                           << stats.observations << '\t'
+                           << stats.successful_observations << '\t'
+                           << stats.rollback_observations << '\t'
+                           << stats.average_successful_operation_ratio << '\t'
+                           << stats.average_runtime_regression << '\n';
+    }
 }
 
 }  // namespace jakal

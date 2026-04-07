@@ -170,6 +170,12 @@ int main() {
             std::cerr << "host-only managed path should have full kernel coverage\n";
             return 1;
         }
+        if (manifest_managed.planning.resolved_partition_strategy != manifest_managed.execution.optimization.partition_strategy ||
+            manifest_managed.safety.planner_confidence < 0.0 ||
+            manifest_managed.safety.planner_strategy_source == jakal::PlanStrategySource::exploration) {
+            std::cerr << "managed execute planner diagnostics mismatch\n";
+            return 1;
+        }
         if (manifest_managed.residency_sequence.actions.empty()) {
             std::cerr << "managed execute did not emit residency sequence\n";
             return 1;

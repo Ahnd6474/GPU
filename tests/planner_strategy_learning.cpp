@@ -103,6 +103,32 @@ bool expect_strategy(
     return false;
 }
 
+bool expect_source(
+    const char* label,
+    const jakal::ExecutionPlan& plan,
+    const jakal::PlanStrategySource expected) {
+    if (plan.strategy_source == expected) {
+        return true;
+    }
+
+    std::cerr << label << ": expected source " << jakal::to_string(expected) << " but got "
+              << jakal::to_string(plan.strategy_source) << '\n';
+    return false;
+}
+
+bool expect_confidence_at_least(
+    const char* label,
+    const jakal::ExecutionPlan& plan,
+    const double expected_minimum) {
+    if (plan.strategy_confidence >= expected_minimum) {
+        return true;
+    }
+
+    std::cerr << label << ": expected confidence >= " << expected_minimum << " but got "
+              << plan.strategy_confidence << '\n';
+    return false;
+}
+
 bool test_strategy_exploration() {
     const auto cache_path = unique_temp_file("planner-exploration");
     jakal::Planner planner(cache_path);
@@ -125,6 +151,9 @@ bool test_strategy_exploration() {
     if (!expect_strategy("initial exploration plan", initial_plan, jakal::PartitionStrategy::auto_balanced)) {
         return false;
     }
+    if (!expect_source("initial exploration source", initial_plan, jakal::PlanStrategySource::heuristic_auto)) {
+        return false;
+    }
 
     planner.ingest_strategy_feedback(
         workload,
@@ -133,6 +162,9 @@ bool test_strategy_exploration() {
 
     const auto exploratory_plan = planner.build_plan(workload, graphs);
     if (!expect_strategy("exploratory plan", exploratory_plan, jakal::PartitionStrategy::role_split)) {
+        return false;
+    }
+    if (!expect_source("exploratory source", exploratory_plan, jakal::PlanStrategySource::exploration)) {
         return false;
     }
 
@@ -199,6 +231,10 @@ bool test_strategy_learning() {
 
     const auto learned_plan = planner.build_plan(workload, graphs);
     if (!expect_strategy("learned plan", learned_plan, jakal::PartitionStrategy::role_split)) {
+        return false;
+    }
+    if (!expect_source("learned source", learned_plan, jakal::PlanStrategySource::exact_learning) ||
+        !expect_confidence_at_least("learned confidence", learned_plan, 0.50)) {
         return false;
     }
 
@@ -322,6 +358,103 @@ bool test_failure_penalty_learning() {
     std::filesystem::remove(cache_path, ec);
     std::filesystem::remove(strategy_cache, ec);
     std::filesystem::remove(family_strategy_cache, ec);
+    return true;
+}
+
+bool test_confidence_calibration_learning() {
+    const auto cache_path = unique_temp_file("planner-confidence-calibration");
+    jakal::Planner planner(cache_path);
+    const std::vector<jakal::HardwareGraph> graphs{make_host_graph(), make_gpu_graph()};
+
+    const jakal::WorkloadSpec workload{
+        "decode-confidence-calibration",
+        jakal::WorkloadKind::inference,
+        "llm-decode-token-lite",
+        640ull * 1024ull * 1024ull,
+        12ull * 1024ull * 1024ull,
+        3.8e10,
+        1,
+        true,
+        true,
+        true,
+        jakal::PartitionStrategy::auto_balanced,
+        jakal::WorkloadPhase::decode};
+
+    planner.ingest_strategy_feedback(
+        workload,
+        graphs,
+        {jakal::PartitionStrategy::auto_balanced, 1200.0, 420.0, 1.0, 1.0, true});
+    planner.ingest_strategy_feedback(
+        workload,
+        graphs,
+        {jakal::PartitionStrategy::blind_sharded, 1320.0, 470.0, 0.92, 1.0, true});
+    planner.ingest_strategy_feedback(
+        workload,
+        graphs,
+        {jakal::PartitionStrategy::role_split, 900.0, 290.0, 1.20, 1.0, true});
+    planner.ingest_strategy_feedback(
+        workload,
+        graphs,
+        {jakal::PartitionStrategy::role_split, 880.0, 280.0, 1.24, 1.0, true});
+    planner.ingest_strategy_feedback(
+        workload,
+        graphs,
+        {jakal::PartitionStrategy::reduce_on_gpu, 1080.0, 360.0, 1.08, 1.0, true});
+    planner.ingest_strategy_feedback(
+        workload,
+        graphs,
+        {jakal::PartitionStrategy::projection_sharded, 1020.0, 315.0, 1.11, 1.0, true});
+    planner.ingest_strategy_feedback(
+        workload,
+        graphs,
+        {jakal::PartitionStrategy::tpu_like, 980.0, 325.0, 1.10, 1.0, true});
+
+    const auto initial_plan = planner.build_plan(workload, graphs);
+    if (initial_plan.resolved_partition_strategy == jakal::PartitionStrategy::auto_balanced ||
+        !expect_source("confidence calibration initial source", initial_plan, jakal::PlanStrategySource::exact_learning)) {
+        std::cerr << "confidence calibration initial plan did not yield a learned non-auto strategy\n";
+        return false;
+    }
+
+    const auto learned_strategy = initial_plan.resolved_partition_strategy;
+    const double initial_confidence = initial_plan.strategy_confidence;
+    for (int index = 0; index < 6; ++index) {
+        auto unrelated_workload = workload;
+        unrelated_workload.name = "decode-confidence-calibration-fail-" + std::to_string(index);
+        unrelated_workload.shape_bucket = "calibration-fail-" + std::to_string(index);
+        planner.ingest_strategy_feedback(
+            unrelated_workload,
+            graphs,
+            {learned_strategy,
+             1500.0,
+             520.0,
+             0.82,
+             0.25,
+             false,
+             jakal::PlanStrategySource::exact_learning,
+             initial_confidence,
+             true,
+             true});
+    }
+
+    const auto calibrated_plan = planner.build_plan(workload, graphs);
+    if (!expect_strategy("confidence calibration learned plan", calibrated_plan, learned_strategy) ||
+        !expect_source("confidence calibration learned source", calibrated_plan, jakal::PlanStrategySource::exact_learning)) {
+        return false;
+    }
+    if (!(calibrated_plan.strategy_confidence < initial_confidence)) {
+        std::cerr << "confidence calibration did not reduce planner confidence\n";
+        return false;
+    }
+
+    const auto strategy_cache = cache_path.string() + ".strategy";
+    const auto family_strategy_cache = cache_path.string() + ".strategy_family";
+    const auto confidence_cache = cache_path.string() + ".confidence";
+    std::error_code ec;
+    std::filesystem::remove(cache_path, ec);
+    std::filesystem::remove(strategy_cache, ec);
+    std::filesystem::remove(family_strategy_cache, ec);
+    std::filesystem::remove(confidence_cache, ec);
     return true;
 }
 
@@ -570,6 +703,9 @@ bool test_hardware_family_transfer_learning() {
     if (!expect_strategy("hardware family transfer plan", family_plan, jakal::PartitionStrategy::role_split)) {
         return false;
     }
+    if (!expect_source("hardware family transfer source", family_plan, jakal::PlanStrategySource::family_learning)) {
+        return false;
+    }
 
     const auto strategy_cache = cache_path.string() + ".strategy";
     const auto family_strategy_cache = cache_path.string() + ".strategy_family";
@@ -664,6 +800,9 @@ int main() {
         return 1;
     }
     if (!test_failure_penalty_learning()) {
+        return 1;
+    }
+    if (!test_confidence_calibration_learning()) {
         return 1;
     }
     if (!test_phase_scoped_learning()) {

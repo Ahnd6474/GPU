@@ -1,6 +1,7 @@
 #include "jakal/runtime.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <fstream>
 #include <numeric>
@@ -12,6 +13,10 @@
 
 namespace jakal {
 namespace {
+
+bool runtime_regressed(
+    const DirectExecutionReport& report,
+    const double max_runtime_regression_ratio);
 
 std::vector<ExecutionFeedbackRecord> make_feedback_records(const DirectExecutionReport& report) {
     std::vector<ExecutionFeedbackRecord> feedback;
@@ -109,21 +114,37 @@ double successful_operation_ratio(const DirectExecutionReport& report) {
     return successful / static_cast<double>(report.operations.size());
 }
 
+StrategyFeedbackSample make_strategy_feedback_sample(
+    const WorkloadSpec& requested_workload,
+    const DirectExecutionReport& report,
+    const PartitionStrategy strategy,
+    const PlanStrategySource strategy_source,
+    const double planned_confidence,
+    const bool rolled_back_to_auto,
+    const double max_runtime_regression_ratio) {
+    const bool regressed = runtime_regressed(report, max_runtime_regression_ratio);
+    return StrategyFeedbackSample{
+        strategy,
+        report.total_runtime_us,
+        head_runtime_us(requested_workload, report),
+        report.speedup_vs_reference,
+        successful_operation_ratio(report),
+        report.all_succeeded,
+        strategy_source,
+        planned_confidence,
+        rolled_back_to_auto,
+        regressed};
+}
+
 void record_partition_strategy_feedback(
     Planner& planner,
     const WorkloadSpec& requested_workload,
     const std::vector<HardwareGraph>& graphs,
-    const DirectExecutionReport& report) {
+    const StrategyFeedbackSample& feedback) {
     planner.ingest_strategy_feedback(
         requested_workload,
         graphs,
-        StrategyFeedbackSample{
-            report.optimization.partition_strategy,
-            report.total_runtime_us,
-            head_runtime_us(requested_workload, report),
-            report.speedup_vs_reference,
-            successful_operation_ratio(report),
-            report.all_succeeded});
+        feedback);
 }
 
 bool runtime_regressed(
@@ -162,6 +183,27 @@ const HardwareGraph* find_graph_by_uid(
     return it == graphs.end() ? nullptr : &(*it);
 }
 
+std::string lowercase_copy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](const unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+bool looks_like_intel_opencl_graph(const HardwareGraph& graph) {
+    if (graph.probe != "opencl") {
+        return false;
+    }
+    const auto haystack = lowercase_copy(graph.presentation_name + " " + graph.uid);
+    return haystack.find("intel") != std::string::npos;
+}
+
+bool has_level_zero_graph(const std::vector<HardwareGraph>& graphs) {
+    return std::any_of(graphs.begin(), graphs.end(), [](const HardwareGraph& graph) {
+        return graph.probe == "level-zero";
+    });
+}
+
 std::string backend_name_for_graph(const HardwareGraph& graph) {
     if (graph.probe == "host") {
         return "host-direct";
@@ -188,17 +230,9 @@ bool backend_supports_operation(
     const HardwareGraph& graph,
     const OperationClass op_class,
     std::string* reason = nullptr) {
+    (void)op_class;
     if (graph.probe == "host" || graph.probe == "opencl" || graph.probe == "vulkan" || graph.probe == "cuda" ||
-        graph.probe == "rocm") {
-        return true;
-    }
-    if (graph.probe == "level-zero") {
-        if (op_class == OperationClass::convolution_2d || op_class == OperationClass::resample_2d) {
-            if (reason != nullptr) {
-                *reason = "native kernel missing";
-            }
-            return false;
-        }
+        graph.probe == "rocm" || graph.probe == "level-zero") {
         return true;
     }
     if (reason != nullptr) {
@@ -207,7 +241,58 @@ bool backend_supports_operation(
     return false;
 }
 
+double planner_risk_score(
+    const WorkloadSpec& workload,
+    const ExecutionPlan& planning,
+    const OptimizationReport& optimization,
+    const MemoryPreflightReport& memory,
+    const KernelCoverageReport& kernel_coverage,
+    const ResidencySequenceReport& residency) {
+    double score = 0.0;
+    if (planning.strategy_source == PlanStrategySource::exploration) {
+        score += 0.35;
+    } else if (planning.strategy_source == PlanStrategySource::family_learning) {
+        score += 0.18;
+    }
+    if (!planning.loaded_from_cache) {
+        score += 0.05;
+    }
+    if (workload.latency_sensitive) {
+        score += 0.05;
+    }
+    if (optimization.workload_host_exchange_bytes >= (64ull * 1024ull * 1024ull)) {
+        score += 0.10;
+    }
+    if (memory.requires_spill) {
+        score += 0.25;
+    }
+    if (memory.peak_pressure_ratio >= 0.90) {
+        score += 0.10;
+    }
+    if (residency.spill_bytes > 0u) {
+        score += 0.15;
+    }
+    if (residency.forced_spill_count > 0u) {
+        score += 0.25;
+    }
+    if (!kernel_coverage.all_supported) {
+        score += 0.30;
+    }
+    return std::clamp(score, 0.0, 1.0);
+}
+
 }  // namespace
+
+std::string runtime_backend_name_for_graph(const HardwareGraph& graph) {
+    return backend_name_for_graph(graph);
+}
+
+bool runtime_backend_supports_operation(
+    const HardwareGraph& graph,
+    const OperationClass op_class,
+    std::string* reason) {
+    return backend_supports_operation(graph, op_class, reason);
+}
 
 Runtime::Runtime(RuntimeOptions options)
     : options_(std::move(options)),
@@ -237,6 +322,7 @@ Runtime::Runtime(RuntimeOptions options)
 void Runtime::refresh_hardware() {
     devices_.clear();
     jakal_toolkit_index_.clear();
+    std::vector<HardwareGraph> discovered;
 
     for (auto& probe : probes_) {
         if (!probe->available()) {
@@ -245,9 +331,18 @@ void Runtime::refresh_hardware() {
 
         for (auto& graph : probe->discover_hardware()) {
             if (should_include_descriptor(graph)) {
-                devices_.push_back(std::move(graph));
+                discovered.push_back(std::move(graph));
             }
         }
+    }
+
+    const bool shadow_intel_opencl =
+        options_.prefer_level_zero_over_opencl && options_.enable_level_zero_probe && has_level_zero_graph(discovered);
+    for (auto& graph : discovered) {
+        if (shadow_intel_opencl && looks_like_intel_opencl_graph(graph)) {
+            continue;
+        }
+        devices_.push_back(std::move(graph));
     }
 
     std::sort(devices_.begin(), devices_.end(), [](const HardwareGraph& left, const HardwareGraph& right) {
@@ -369,7 +464,15 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
         safety_summary << "strategy blacklisted -> auto";
     }
 
-    auto optimization = optimize(effective_workload, workload_graph);
+    auto update_planner_diagnostics = [&](const ExecutionPlan& plan) {
+        managed.planning = plan;
+        managed.safety.planner_strategy_source = plan.strategy_source;
+        managed.safety.planner_confidence = plan.strategy_confidence;
+    };
+
+    auto planned = planner_.build_plan(effective_workload, devices_);
+    update_planner_diagnostics(planned);
+    auto optimization = execution_optimizer_.optimize(effective_workload, planned, devices_, &workload_graph);
     managed.safety.selected_strategy = optimization.partition_strategy;
     managed.memory_preflight = build_memory_preflight(optimization);
     managed.kernel_coverage = build_kernel_coverage(optimization);
@@ -379,6 +482,13 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
     managed.memory_preflight.forced_spill_count = managed.residency_sequence.forced_spill_count;
     managed.memory_preflight.requires_spill =
         managed.memory_preflight.requires_spill || managed.residency_sequence.spill_bytes > 0u;
+    managed.safety.planner_risk_score = planner_risk_score(
+        effective_workload,
+        managed.planning,
+        optimization,
+        managed.memory_preflight,
+        managed.kernel_coverage,
+        managed.residency_sequence);
 
     auto force_auto_if_needed = [&](const char* reason) {
         if (optimization.partition_strategy == PartitionStrategy::auto_balanced) {
@@ -386,10 +496,13 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
         }
         auto fallback_workload = workload;
         fallback_workload.partition_strategy = PartitionStrategy::auto_balanced;
-        auto fallback_optimization = optimize(fallback_workload, workload_graph);
+        auto fallback_plan = planner_.build_plan(fallback_workload, devices_);
+        auto fallback_optimization = execution_optimizer_.optimize(fallback_workload, fallback_plan, devices_, &workload_graph);
         auto fallback_memory = build_memory_preflight(fallback_optimization);
         if (fallback_memory.safe_to_run || !managed.memory_preflight.safe_to_run) {
             effective_workload = fallback_workload;
+            planned = std::move(fallback_plan);
+            update_planner_diagnostics(planned);
             optimization = std::move(fallback_optimization);
             managed.memory_preflight = std::move(fallback_memory);
             managed.kernel_coverage = build_kernel_coverage(optimization);
@@ -399,6 +512,13 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
             managed.memory_preflight.forced_spill_count = managed.residency_sequence.forced_spill_count;
             managed.memory_preflight.requires_spill =
                 managed.memory_preflight.requires_spill || managed.residency_sequence.spill_bytes > 0u;
+            managed.safety.planner_risk_score = planner_risk_score(
+                effective_workload,
+                managed.planning,
+                optimization,
+                managed.memory_preflight,
+                managed.kernel_coverage,
+                managed.residency_sequence);
             managed.safety.memory_forced_auto = true;
             if (safety_summary.tellp() > 0) {
                 safety_summary << "; ";
@@ -419,6 +539,13 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
         force_auto_if_needed("kernel coverage forced auto");
         managed.kernel_coverage.forced_auto = managed.safety.memory_forced_auto;
     }
+    if (options_.product.safety.enable_planner_risk_gate &&
+        managed.planning.resolved_partition_strategy != PartitionStrategy::auto_balanced &&
+        managed.safety.planner_confidence < options_.product.safety.minimum_planner_confidence &&
+        managed.safety.planner_risk_score >= options_.product.safety.planner_risk_gate) {
+        force_auto_if_needed("planner risk gate forced auto");
+        managed.safety.planner_forced_auto = true;
+    }
 
     managed.safety.selected_strategy = optimization.partition_strategy;
     if (!managed.memory_preflight.safe_to_run && options_.product.memory.enforce_preflight) {
@@ -436,6 +563,14 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
     managed.execution = execute_with_feedback(effective_workload, optimization, &workload_graph);
     managed.executed = true;
     managed.safety.final_strategy = managed.execution.optimization.partition_strategy;
+    auto planner_feedback = make_strategy_feedback_sample(
+        effective_workload,
+        managed.execution,
+        managed.safety.selected_strategy,
+        managed.planning.strategy_source,
+        managed.planning.strategy_confidence,
+        false,
+        options_.product.safety.max_runtime_regression_ratio);
 
     const bool explicit_strategy = managed.execution.optimization.partition_strategy != PartitionStrategy::auto_balanced;
     const bool canary_triggered =
@@ -447,6 +582,8 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
     if (canary_triggered) {
         managed.safety.canary_triggered = true;
         record_strategy_failure(workload, managed.execution.optimization.partition_strategy);
+        planner_feedback.runtime_regressed =
+            runtime_regressed(managed.execution, options_.product.safety.max_runtime_regression_ratio);
         if (options_.product.safety.enable_strategy_rollback) {
             auto fallback_workload = workload;
             fallback_workload.partition_strategy = PartitionStrategy::auto_balanced;
@@ -460,6 +597,7 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
                     managed.execution = std::move(fallback_execution);
                     managed.memory_preflight = std::move(fallback_memory);
                     managed.safety.rolled_back_to_auto = true;
+                    planner_feedback.rolled_back_to_auto = true;
                     managed.safety.final_strategy = managed.execution.optimization.partition_strategy;
                     if (safety_summary.tellp() > 0) {
                         safety_summary << "; ";
@@ -473,7 +611,7 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
     }
 
     if (managed.executed) {
-        record_partition_strategy_feedback(planner_, workload, devices_, managed.execution);
+        record_partition_strategy_feedback(planner_, workload, devices_, planner_feedback);
     }
 
     if (managed.memory_preflight.summary.size() > 0) {
@@ -481,6 +619,14 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
             safety_summary << "; ";
         }
         safety_summary << managed.memory_preflight.summary;
+    }
+    if (!managed.planning.strategy_reason.empty()) {
+        if (safety_summary.tellp() > 0) {
+            safety_summary << "; ";
+        }
+        safety_summary << "planner=" << to_string(managed.planning.strategy_source)
+                       << " conf=" << managed.planning.strategy_confidence
+                       << " reason=" << managed.planning.strategy_reason;
     }
     if (!managed.residency_sequence.summary.empty()) {
         if (safety_summary.tellp() > 0) {
@@ -1020,7 +1166,7 @@ void Runtime::persist_telemetry(
     }
 
     if (write_header) {
-        output << "# epoch\tworkload\tkind\tphase\tshape_bucket\trequested_strategy\tselected_strategy\tfinal_strategy\texecuted\tall_succeeded\tblocked_by_memory\trolled_back_to_auto\tblacklisted_before_run\tpeak_pressure_ratio\tspill_bytes\treload_bytes\tforced_spills\tprefetch_bytes\thost_io_bytes\th2d_bytes\ttotal_runtime_us\tspeedup_vs_reference\tsummary\n";
+        output << "# epoch\tworkload\tkind\tphase\tshape_bucket\trequested_strategy\tselected_strategy\tfinal_strategy\tplanner_source\tplanner_confidence\tplanner_risk\texecuted\tall_succeeded\tblocked_by_memory\trolled_back_to_auto\tblacklisted_before_run\tpeak_pressure_ratio\tspill_bytes\treload_bytes\tforced_spills\tprefetch_bytes\thost_io_bytes\th2d_bytes\ttotal_runtime_us\tspeedup_vs_reference\tsummary\n";
     }
 
     output << execution_epoch_ << '\t'
@@ -1031,6 +1177,9 @@ void Runtime::persist_telemetry(
            << to_string(report.safety.requested_strategy) << '\t'
            << to_string(report.safety.selected_strategy) << '\t'
            << to_string(report.safety.final_strategy) << '\t'
+           << to_string(report.safety.planner_strategy_source) << '\t'
+           << report.safety.planner_confidence << '\t'
+           << report.safety.planner_risk_score << '\t'
            << (report.executed ? 1 : 0) << '\t'
            << (report.executed && report.execution.all_succeeded ? 1 : 0) << '\t'
            << (report.safety.blocked_by_memory ? 1 : 0) << '\t'

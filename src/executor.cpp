@@ -11,12 +11,14 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <iostream>
 #include <sstream>
 #include <span>
 #include <stdexcept>
@@ -98,6 +100,18 @@ std::string sanitize_id_fragment(const std::string& text) {
     return result;
 }
 
+bool execution_trace_enabled() {
+    const char* value = std::getenv("JAKAL_EXEC_TRACE");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+void trace_execution_line(const std::string& text) {
+    if (!execution_trace_enabled()) {
+        return;
+    }
+    std::cerr << text << '\n' << std::flush;
+}
+
 std::string format_extents(const std::vector<std::uint64_t>& extents) {
     std::ostringstream stream;
     for (std::size_t index = 0; index < extents.size(); ++index) {
@@ -125,6 +139,25 @@ JakalL0WorkloadTraits make_gpu_traits(const OperationSpec& operation) {
     return traits;
 }
 
+bool variant_compatible_with_graph(
+    const HardwareGraph& graph,
+    const JakalToolkitVariant& variant) {
+    switch (variant.binding.backend) {
+    case JakalBackendKind::level_zero:
+        return graph.probe == "level-zero";
+    case JakalBackendKind::opencl:
+        return graph.probe == "opencl";
+    case JakalBackendKind::vulkan_compute:
+        return graph.probe == "vulkan";
+    case JakalBackendKind::cuda:
+        return graph.probe == "cuda";
+    case JakalBackendKind::rocm:
+        return graph.probe == "rocm";
+    default:
+        return false;
+    }
+}
+
 const JakalToolkitVariant* find_preferred_gpu_variant(
     const DeviceAssignment& assignment,
     const std::vector<JakalToolkitIndexEntry>& jakal_toolkit_index,
@@ -137,9 +170,12 @@ const JakalToolkitVariant* find_preferred_gpu_variant(
 
         const auto& variants = entry.variants;
         // Re-rank lightly per operation without rebuilding the toolkit index.
-        const JakalToolkitVariant* best = &variants.front();
-        double best_score = best->toolkit_score;
+        const JakalToolkitVariant* best = nullptr;
+        double best_score = 0.0;
         for (const auto& variant : variants) {
+            if (!variant_compatible_with_graph(*assignment.graph, variant)) {
+                continue;
+            }
             double score = variant.toolkit_score;
             if (traits.matrix_friendly && variant.binding.capabilities.subgroup_matrix) {
                 score += 0.05;
@@ -154,7 +190,7 @@ const JakalToolkitVariant* find_preferred_gpu_variant(
             if (!variant.executable) {
                 score -= 0.20;
             }
-            if (score > best_score) {
+            if (best == nullptr || score > best_score) {
                 best = &variant;
                 best_score = score;
             }
@@ -1408,9 +1444,15 @@ DirectExecutionReport DirectExecutor::execute(
 
     for (const auto& optimized : optimization.operations) {
         try {
+            trace_execution_line(
+                "exec:start op=" + optimized.operation.name +
+                " class=" + to_string(optimized.operation.op_class) +
+                " primary=" + optimized.config.primary_device_uid +
+                " parts=" + std::to_string(optimized.config.logical_partitions));
             const auto assignments =
                 scheduler.make_assignments(optimization, optimized, graphs, shardable_items(optimized.operation));
             if (assignments.empty()) {
+                trace_execution_line("exec:empty-assignments op=" + optimized.operation.name);
                 all_succeeded = false;
                 continue;
             }
@@ -1655,7 +1697,15 @@ DirectExecutionReport DirectExecutor::execute(
             report.total_runtime_us += record.runtime_us;
             report.total_reference_runtime_us += record.reference_runtime_us;
             report.operations.push_back(std::move(record));
+            const auto& completed = report.operations.back();
+            trace_execution_line(
+                "exec:done op=" + completed.operation_name +
+                " backend=" + completed.backend_name +
+                " runtime_us=" + std::to_string(completed.runtime_us) +
+                " verified=" + (completed.verified ? std::string("1") : std::string("0")) +
+                " error=" + completed.backend_error);
         } catch (const std::exception& error) {
+            trace_execution_line("exec:exception op=" + optimized.operation.name + " what=" + error.what());
             std::ostringstream message;
             message << "direct execution failed for operation '" << optimized.operation.name << "' ("
                     << to_string(optimized.operation.op_class) << ", extents=" << format_extents(optimized.operation.extents)

@@ -1081,8 +1081,113 @@ private:
         return result;
     }
 
-    BackendRunResult run_conv3x3_native(const HardwareGraph&, const std::span<const float>, const std::uint32_t, const std::uint32_t, const bool) const override { return failure("level-zero-kernel-missing"); }
-    BackendRunResult run_resample_native(const HardwareGraph&, const std::span<const float>, const std::uint32_t, const std::uint32_t, const std::uint32_t, const std::uint32_t, const std::uint32_t, const std::uint32_t, const bool) const override { return failure("level-zero-kernel-missing"); }
+    BackendRunResult run_conv3x3_native(const HardwareGraph& graph, const std::span<const float> input, const std::uint32_t height, const std::uint32_t width, const bool low_precision) const override {
+        auto context = acquire_context(graph);
+        if (context == nullptr) return failure(last_error_.empty() ? "level-zero-context" : last_error_);
+        BackendRunResult result;
+        result.output.resize(static_cast<std::size_t>(height - 2u) * (width - 2u), 0.0f);
+        result.runtime_us = measure_us([&]() {
+            std::scoped_lock lock(context->execution_mutex);
+            void* in_mem = nullptr;
+            void* out_mem = nullptr;
+            if (!alloc_shared(*context, input.size_bytes(), &in_mem) ||
+                !alloc_shared(*context, result.output.size() * sizeof(float), &out_mem)) {
+                free_shared(*context, in_mem);
+                free_shared(*context, out_mem);
+                result.error = "level-zero-memory";
+                return;
+            }
+            std::memcpy(in_mem, input.data(), input.size_bytes());
+            unsigned int input_height = height;
+            unsigned int input_width = width;
+            int low = low_precision ? 1 : 0;
+            const std::uint32_t out_width = width - 2u;
+            const std::uint32_t out_height = height - 2u;
+            if (!launch(
+                    *context,
+                    "conv3x3_valid",
+                    {kNativeTileSize, kNativeTileSize, 1u},
+                    {
+                        out_width == 0u ? 1u : (out_width + kNativeTileSize - 1u) / kNativeTileSize,
+                        out_height == 0u ? 1u : (out_height + kNativeTileSize - 1u) / kNativeTileSize,
+                        1u,
+                    },
+                    {
+                        {sizeof(void*), &in_mem},
+                        {sizeof(void*), &out_mem},
+                        {sizeof(unsigned int), &input_height},
+                        {sizeof(unsigned int), &input_width},
+                        {sizeof(int), &low},
+                    })) {
+                result.error = "level-zero-launch";
+            } else {
+                std::memcpy(result.output.data(), out_mem, result.output.size() * sizeof(float));
+                result.success = true;
+                result.used_host = false;
+                result.used_opencl = false;
+            }
+            free_shared(*context, in_mem);
+            free_shared(*context, out_mem);
+        });
+        return result;
+    }
+
+    BackendRunResult run_resample_native(const HardwareGraph& graph, const std::span<const float> input, const std::uint32_t src_h, const std::uint32_t src_w, const std::uint32_t dst_h, const std::uint32_t dst_w, const std::uint32_t row_offset, const std::uint32_t row_count, const bool low_precision) const override {
+        auto context = acquire_context(graph);
+        if (context == nullptr) return failure(last_error_.empty() ? "level-zero-context" : last_error_);
+        BackendRunResult result;
+        result.output.resize(static_cast<std::size_t>(row_count) * dst_w, 0.0f);
+        result.runtime_us = measure_us([&]() {
+            std::scoped_lock lock(context->execution_mutex);
+            void* in_mem = nullptr;
+            void* out_mem = nullptr;
+            if (!alloc_shared(*context, input.size_bytes(), &in_mem) ||
+                !alloc_shared(*context, result.output.size() * sizeof(float), &out_mem)) {
+                free_shared(*context, in_mem);
+                free_shared(*context, out_mem);
+                result.error = "level-zero-memory";
+                return;
+            }
+            std::memcpy(in_mem, input.data(), input.size_bytes());
+            unsigned int src_height = src_h;
+            unsigned int src_width = src_w;
+            unsigned int dst_height = dst_h;
+            unsigned int dst_width = dst_w;
+            unsigned int dst_row_offset = row_offset;
+            unsigned int dst_row_count = row_count;
+            int low = low_precision ? 1 : 0;
+            if (!launch(
+                    *context,
+                    "bilinear_resample",
+                    {kNativeTileSize, kNativeTileSize, 1u},
+                    {
+                        dst_w == 0u ? 1u : (dst_w + kNativeTileSize - 1u) / kNativeTileSize,
+                        row_count == 0u ? 1u : (row_count + kNativeTileSize - 1u) / kNativeTileSize,
+                        1u,
+                    },
+                    {
+                        {sizeof(void*), &in_mem},
+                        {sizeof(void*), &out_mem},
+                        {sizeof(unsigned int), &src_height},
+                        {sizeof(unsigned int), &src_width},
+                        {sizeof(unsigned int), &dst_height},
+                        {sizeof(unsigned int), &dst_width},
+                        {sizeof(unsigned int), &dst_row_offset},
+                        {sizeof(unsigned int), &dst_row_count},
+                        {sizeof(int), &low},
+                    })) {
+                result.error = "level-zero-launch";
+            } else {
+                std::memcpy(result.output.data(), out_mem, result.output.size() * sizeof(float));
+                result.success = true;
+                result.used_host = false;
+                result.used_opencl = false;
+            }
+            free_shared(*context, in_mem);
+            free_shared(*context, out_mem);
+        });
+        return result;
+    }
 
     mutable std::mutex mutex_;
     mutable std::unordered_map<std::string, std::shared_ptr<Context>> contexts_;

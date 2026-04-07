@@ -26,6 +26,9 @@ struct RuntimeMemoryPolicy {
 struct RuntimeSafetyPolicy {
     bool enable_canary = true;
     bool enable_strategy_rollback = true;
+    bool enable_planner_risk_gate = true;
+    double minimum_planner_confidence = 0.45;
+    double planner_risk_gate = 0.50;
     double max_runtime_regression_ratio = 1.10;
     std::uint32_t blacklist_after_failures = 2;
     std::uint64_t blacklist_cooldown_epochs = 16;
@@ -48,6 +51,7 @@ struct RuntimeOptions {
     bool enable_level_zero_probe = true;
     bool enable_cuda_probe = true;
     bool enable_rocm_probe = true;
+    bool prefer_level_zero_over_opencl = true;
     std::filesystem::path cache_path;
     std::filesystem::path execution_cache_path;
     RuntimeProductPolicy product;
@@ -81,8 +85,12 @@ struct StrategySafetyDecision {
     PartitionStrategy requested_strategy = PartitionStrategy::auto_balanced;
     PartitionStrategy selected_strategy = PartitionStrategy::auto_balanced;
     PartitionStrategy final_strategy = PartitionStrategy::auto_balanced;
+    PlanStrategySource planner_strategy_source = PlanStrategySource::heuristic_auto;
+    double planner_confidence = 0.0;
+    double planner_risk_score = 0.0;
     bool blacklisted_before_run = false;
     bool memory_forced_auto = false;
+    bool planner_forced_auto = false;
     bool rolled_back_to_auto = false;
     bool blocked_by_memory = false;
     bool canary_triggered = false;
@@ -158,6 +166,7 @@ struct ResidencySequenceReport {
 };
 
 struct ManagedExecutionReport {
+    ExecutionPlan planning;
     DirectExecutionReport execution;
     MemoryPreflightReport memory_preflight;
     StrategySafetyDecision safety;
@@ -221,6 +230,12 @@ private:
     std::unordered_map<std::string, std::uint32_t> strategy_failure_counts_;
     std::unordered_map<std::string, std::uint64_t> strategy_blacklist_until_epoch_;
 };
+
+[[nodiscard]] std::string runtime_backend_name_for_graph(const HardwareGraph& graph);
+[[nodiscard]] bool runtime_backend_supports_operation(
+    const HardwareGraph& graph,
+    OperationClass op_class,
+    std::string* reason = nullptr);
 
 }  // namespace jakal
 
