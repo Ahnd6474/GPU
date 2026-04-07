@@ -1,14 +1,14 @@
-#include "gpu/runtime.hpp"
+#include "jakal/runtime.hpp"
 
 #include <iomanip>
 #include <iostream>
 
 int main() {
-    gpu::Runtime runtime;
+    jakal::Runtime runtime;
 
     std::cout << "Discovered hardware graphs\n";
     for (const auto& graph : runtime.devices()) {
-        const auto summary = gpu::summarize_graph(graph);
+        const auto summary = jakal::summarize_graph(graph);
         std::cout
             << "\n[" << graph.ordinal << "] " << graph.presentation_name
             << " | probe=" << graph.probe
@@ -23,9 +23,9 @@ int main() {
         for (const auto& node : graph.nodes) {
             std::cout
                 << "    " << std::setw(24) << std::left << node.label
-                << " domain=" << gpu::to_string(node.domain)
-                << " role=" << gpu::to_string(node.role)
-                << " resolution=" << gpu::to_string(node.resolution)
+                << " domain=" << jakal::to_string(node.domain)
+                << " role=" << jakal::to_string(node.role)
+                << " resolution=" << jakal::to_string(node.resolution)
                 << '\n';
         }
 
@@ -34,7 +34,7 @@ int main() {
             std::cout
                 << "    " << edge.source_id
                 << " -> " << edge.target_id
-                << " semantics=" << gpu::to_string(edge.semantics)
+                << " semantics=" << jakal::to_string(edge.semantics)
                 << " weight=" << edge.weight
                 << " bw=" << edge.bandwidth_gbps
                 << "GB/s latency=" << edge.latency_us
@@ -43,12 +43,12 @@ int main() {
     }
 
     std::cout << "\nGPU toolkit index\n";
-    for (const auto& entry : runtime.gpu_toolkit_index()) {
+    for (const auto& entry : runtime.jakal_toolkit_index()) {
         std::cout << "  device=" << entry.device_uid << " variants=" << entry.variants.size() << '\n';
         for (const auto& variant : entry.variants) {
             std::cout
-                << "    vendor=" << std::setw(10) << std::left << gpu::to_string(variant.binding.vendor)
-                << " backend=" << std::setw(18) << gpu::to_string(variant.binding.backend)
+                << "    vendor=" << std::setw(10) << std::left << jakal::to_string(variant.binding.vendor)
+                << " backend=" << std::setw(18) << jakal::to_string(variant.binding.backend)
                 << " adapter=" << std::setw(20) << variant.binding.adapter_id
                 << " executable=" << (variant.executable ? "yes" : "no")
                 << " score=" << std::fixed << std::setprecision(3) << variant.toolkit_score
@@ -59,9 +59,9 @@ int main() {
         }
     }
 
-    const gpu::WorkloadSpec workload{
+    const jakal::WorkloadSpec workload{
         "sample-inference",
-        gpu::WorkloadKind::inference,
+        jakal::WorkloadKind::inference,
         "",
         4ull * 1024ull * 1024ull * 1024ull,
         512ull * 1024ull * 1024ull,
@@ -104,7 +104,7 @@ int main() {
     for (const auto& result : report.operations) {
         std::cout
             << "  op=" << std::setw(20) << std::left << result.operation.name
-            << " strategy=" << std::setw(12) << gpu::to_string(result.config.strategy)
+            << " strategy=" << std::setw(12) << jakal::to_string(result.config.strategy)
             << " optimizer=" << std::setw(15) << result.benchmark.optimizer_name
             << " partitions=" << result.config.logical_partitions
             << " devices=" << result.config.participating_devices.size()
@@ -142,3 +142,4 @@ int main() {
 
     return 0;
 }
+

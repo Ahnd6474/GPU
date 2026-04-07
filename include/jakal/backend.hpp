@@ -1,12 +1,12 @@
 #pragma once
 
-#include "gpu/device.hpp"
+#include "jakal/device.hpp"
 
 #include <memory>
 #include <string>
 #include <vector>
 
-namespace gpu {
+namespace jakal {
 
 class IDeviceProbe {
 public:
@@ -23,4 +23,5 @@ std::unique_ptr<IDeviceProbe> make_level_zero_probe();
 std::unique_ptr<IDeviceProbe> make_cuda_probe();
 std::unique_ptr<IDeviceProbe> make_rocm_probe();
 
-}  // namespace gpu
+}  // namespace jakal
+

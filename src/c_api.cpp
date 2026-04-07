@@ -1,6 +1,6 @@
-#include "gpu/c_api.h"
+#include "jakal/c_api.h"
 
-#include "gpu/runtime.hpp"
+#include "jakal/runtime.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -8,8 +8,8 @@
 #include <new>
 #include <string>
 
-struct gpu_runtime {
-    gpu::Runtime runtime;
+struct jakal_core_runtime {
+    jakal::Runtime runtime;
 };
 
 namespace {
@@ -24,12 +24,12 @@ void copy_string(const std::string& source, char* destination, const std::size_t
     destination[length] = '\0';
 }
 
-void fill_device_info(const gpu::HardwareGraph& graph, gpu_device_info* out_device) {
+void fill_device_info(const jakal::HardwareGraph& graph, jakal_core_device_info* out_device) {
     if (out_device == nullptr) {
         return;
     }
 
-    const auto summary = gpu::summarize_graph(graph);
+    const auto summary = jakal::summarize_graph(graph);
     copy_string(graph.uid, out_device->uid, sizeof(out_device->uid));
     copy_string(graph.probe, out_device->probe, sizeof(out_device->probe));
     copy_string(graph.presentation_name, out_device->presentation_name, sizeof(out_device->presentation_name));
@@ -64,7 +64,7 @@ void fill_device_info(const gpu::HardwareGraph& graph, gpu_device_info* out_devi
     out_device->supports_int8 = summary.supports_int8 ? 1 : 0;
 }
 
-void fill_graph_node_info(const gpu::HardwareObjectNode& node, gpu_graph_node_info* out_node) {
+void fill_graph_node_info(const jakal::HardwareObjectNode& node, jakal_core_graph_node_info* out_node) {
     if (out_node == nullptr) {
         return;
     }
@@ -72,9 +72,9 @@ void fill_graph_node_info(const gpu::HardwareObjectNode& node, gpu_graph_node_in
     copy_string(node.id, out_node->id, sizeof(out_node->id));
     copy_string(node.label, out_node->label, sizeof(out_node->label));
     copy_string(node.parent_id, out_node->parent_id, sizeof(out_node->parent_id));
-    copy_string(gpu::to_string(node.domain), out_node->domain, sizeof(out_node->domain));
-    copy_string(gpu::to_string(node.role), out_node->role, sizeof(out_node->role));
-    copy_string(gpu::to_string(node.resolution), out_node->resolution, sizeof(out_node->resolution));
+    copy_string(jakal::to_string(node.domain), out_node->domain, sizeof(out_node->domain));
+    copy_string(jakal::to_string(node.role), out_node->role, sizeof(out_node->role));
+    copy_string(jakal::to_string(node.resolution), out_node->resolution, sizeof(out_node->resolution));
     out_node->ordinal = node.ordinal;
     out_node->execution_width = node.compute.execution_width;
     out_node->resident_contexts = node.compute.resident_contexts;
@@ -101,27 +101,27 @@ void fill_graph_node_info(const gpu::HardwareObjectNode& node, gpu_graph_node_in
     out_node->supports_int8 = node.compute.supports_int8 ? 1 : 0;
 }
 
-void fill_graph_edge_info(const gpu::HardwareGraphEdge& edge, gpu_graph_edge_info* out_edge) {
+void fill_graph_edge_info(const jakal::HardwareGraphEdge& edge, jakal_core_graph_edge_info* out_edge) {
     if (out_edge == nullptr) {
         return;
     }
 
     copy_string(edge.source_id, out_edge->source_id, sizeof(out_edge->source_id));
     copy_string(edge.target_id, out_edge->target_id, sizeof(out_edge->target_id));
-    copy_string(gpu::to_string(edge.semantics), out_edge->semantics, sizeof(out_edge->semantics));
+    copy_string(jakal::to_string(edge.semantics), out_edge->semantics, sizeof(out_edge->semantics));
     out_edge->directed = edge.directed ? 1 : 0;
     out_edge->weight = edge.weight;
     out_edge->bandwidth_gbps = edge.bandwidth_gbps;
     out_edge->latency_us = edge.latency_us;
 }
 
-void fill_optimization_info(const gpu::OptimizationReport& report, gpu_optimization_info* out_optimization) {
+void fill_optimization_info(const jakal::OptimizationReport& report, jakal_core_optimization_info* out_optimization) {
     if (out_optimization == nullptr) {
         return;
     }
 
     copy_string(report.signature, out_optimization->signature, sizeof(out_optimization->signature));
-    copy_string(gpu::to_string(report.workload_kind), out_optimization->workload_kind, sizeof(out_optimization->workload_kind));
+    copy_string(jakal::to_string(report.workload_kind), out_optimization->workload_kind, sizeof(out_optimization->workload_kind));
     copy_string(report.dataset_tag, out_optimization->dataset_tag, sizeof(out_optimization->dataset_tag));
     out_optimization->operation_count = static_cast<unsigned long long>(report.operations.size());
     out_optimization->tensor_count = static_cast<unsigned long long>(report.workload_graph.tensors.size());
@@ -133,14 +133,14 @@ void fill_optimization_info(const gpu::OptimizationReport& report, gpu_optimizat
 }
 
 void fill_operation_optimization_info(
-    const gpu::OperationOptimizationResult& operation,
-    gpu_operation_optimization_info* out_operation) {
+    const jakal::OperationOptimizationResult& operation,
+    jakal_core_operation_optimization_info* out_operation) {
     if (out_operation == nullptr) {
         return;
     }
 
     copy_string(operation.operation.name, out_operation->operation_name, sizeof(out_operation->operation_name));
-    copy_string(gpu::to_string(operation.config.strategy), out_operation->strategy, sizeof(out_operation->strategy));
+    copy_string(jakal::to_string(operation.config.strategy), out_operation->strategy, sizeof(out_operation->strategy));
     copy_string(operation.config.primary_device_uid, out_operation->primary_device_uid, sizeof(out_operation->primary_device_uid));
     out_operation->logical_partitions = operation.config.logical_partitions;
     out_operation->participating_device_count = static_cast<unsigned int>(operation.config.participating_devices.size());
@@ -153,7 +153,7 @@ void fill_operation_optimization_info(
     out_operation->use_low_precision = operation.config.use_low_precision ? 1 : 0;
 }
 
-void fill_execution_info(const gpu::DirectExecutionReport& report, gpu_execution_info* out_execution) {
+void fill_execution_info(const jakal::DirectExecutionReport& report, jakal_core_execution_info* out_execution) {
     if (out_execution == nullptr) {
         return;
     }
@@ -167,8 +167,8 @@ void fill_execution_info(const gpu::DirectExecutionReport& report, gpu_execution
 }
 
 void fill_execution_operation_info(
-    const gpu::OperationExecutionRecord& operation,
-    gpu_execution_operation_info* out_operation) {
+    const jakal::OperationExecutionRecord& operation,
+    jakal_core_execution_operation_info* out_operation) {
     if (out_operation == nullptr) {
         return;
     }
@@ -188,45 +188,45 @@ void fill_execution_operation_info(
     out_operation->logical_partitions_used = operation.logical_partitions_used;
 }
 
-gpu::WorkloadKind parse_workload_kind(const char* kind) {
+jakal::WorkloadKind parse_workload_kind(const char* kind) {
     if (kind == nullptr) {
-        return gpu::WorkloadKind::custom;
+        return jakal::WorkloadKind::custom;
     }
 
     const std::string value(kind);
     if (value == "inference") {
-        return gpu::WorkloadKind::inference;
+        return jakal::WorkloadKind::inference;
     }
     if (value == "image") {
-        return gpu::WorkloadKind::image;
+        return jakal::WorkloadKind::image;
     }
     if (value == "tensor") {
-        return gpu::WorkloadKind::tensor;
+        return jakal::WorkloadKind::tensor;
     }
     if (value == "gaming") {
-        return gpu::WorkloadKind::gaming;
+        return jakal::WorkloadKind::gaming;
     }
     if (value == "training") {
-        return gpu::WorkloadKind::training;
+        return jakal::WorkloadKind::training;
     }
-    return gpu::WorkloadKind::custom;
+    return jakal::WorkloadKind::custom;
 }
 
 }  // namespace
 
-gpu_runtime_t* gpu_runtime_create(void) {
+jakal_core_runtime_t* jakal_core_runtime_create(void) {
     try {
-        return new gpu_runtime_t{gpu::Runtime{}};
+        return new jakal_core_runtime_t{jakal::Runtime{}};
     } catch (const std::bad_alloc&) {
         return nullptr;
     }
 }
 
-void gpu_runtime_destroy(gpu_runtime_t* runtime) {
+void jakal_core_runtime_destroy(jakal_core_runtime_t* runtime) {
     delete runtime;
 }
 
-int gpu_runtime_refresh(gpu_runtime_t* runtime) {
+int jakal_core_runtime_refresh(jakal_core_runtime_t* runtime) {
     if (runtime == nullptr) {
         return -1;
     }
@@ -235,7 +235,7 @@ int gpu_runtime_refresh(gpu_runtime_t* runtime) {
     return 0;
 }
 
-size_t gpu_runtime_device_count(const gpu_runtime_t* runtime) {
+size_t jakal_core_runtime_device_count(const jakal_core_runtime_t* runtime) {
     if (runtime == nullptr) {
         return 0;
     }
@@ -243,7 +243,7 @@ size_t gpu_runtime_device_count(const gpu_runtime_t* runtime) {
     return runtime->runtime.devices().size();
 }
 
-int gpu_runtime_get_device(const gpu_runtime_t* runtime, size_t index, gpu_device_info* out_device) {
+int jakal_core_runtime_get_device(const jakal_core_runtime_t* runtime, size_t index, jakal_core_device_info* out_device) {
     if (runtime == nullptr || out_device == nullptr) {
         return -1;
     }
@@ -257,7 +257,7 @@ int gpu_runtime_get_device(const gpu_runtime_t* runtime, size_t index, gpu_devic
     return 0;
 }
 
-size_t gpu_runtime_graph_node_count(const gpu_runtime_t* runtime, size_t device_index) {
+size_t jakal_core_runtime_graph_node_count(const jakal_core_runtime_t* runtime, size_t device_index) {
     if (runtime == nullptr) {
         return 0;
     }
@@ -270,11 +270,11 @@ size_t gpu_runtime_graph_node_count(const gpu_runtime_t* runtime, size_t device_
     return devices[device_index].nodes.size();
 }
 
-int gpu_runtime_get_graph_node(
-    const gpu_runtime_t* runtime,
+int jakal_core_runtime_get_graph_node(
+    const jakal_core_runtime_t* runtime,
     size_t device_index,
     size_t node_index,
-    gpu_graph_node_info* out_node) {
+    jakal_core_graph_node_info* out_node) {
     if (runtime == nullptr || out_node == nullptr) {
         return -1;
     }
@@ -293,7 +293,7 @@ int gpu_runtime_get_graph_node(
     return 0;
 }
 
-size_t gpu_runtime_graph_edge_count(const gpu_runtime_t* runtime, size_t device_index) {
+size_t jakal_core_runtime_graph_edge_count(const jakal_core_runtime_t* runtime, size_t device_index) {
     if (runtime == nullptr) {
         return 0;
     }
@@ -306,11 +306,11 @@ size_t gpu_runtime_graph_edge_count(const gpu_runtime_t* runtime, size_t device_
     return devices[device_index].edges.size();
 }
 
-int gpu_runtime_get_graph_edge(
-    const gpu_runtime_t* runtime,
+int jakal_core_runtime_get_graph_edge(
+    const jakal_core_runtime_t* runtime,
     size_t device_index,
     size_t edge_index,
-    gpu_graph_edge_info* out_edge) {
+    jakal_core_graph_edge_info* out_edge) {
     if (runtime == nullptr || out_edge == nullptr) {
         return -1;
     }
@@ -329,10 +329,10 @@ int gpu_runtime_get_graph_edge(
     return 0;
 }
 
-int gpu_runtime_plan(
-    gpu_runtime_t* runtime,
-    const gpu_workload_spec* workload,
-    gpu_plan_entry* entries,
+int jakal_core_runtime_plan(
+    jakal_core_runtime_t* runtime,
+    const jakal_core_workload_spec* workload,
+    jakal_core_plan_entry* entries,
     size_t capacity,
     size_t* out_count,
     int* out_loaded_from_cache) {
@@ -340,7 +340,7 @@ int gpu_runtime_plan(
         return -1;
     }
 
-    const gpu::WorkloadSpec cpp_workload{
+    const jakal::WorkloadSpec cpp_workload{
         workload->name == nullptr ? std::string("unnamed") : std::string(workload->name),
         parse_workload_kind(workload->kind),
         "",
@@ -372,18 +372,18 @@ int gpu_runtime_plan(
     return 0;
 }
 
-int gpu_runtime_optimize(
-    gpu_runtime_t* runtime,
-    const gpu_workload_spec* workload,
-    gpu_optimization_info* out_optimization,
-    gpu_operation_optimization_info* operations,
+int jakal_core_runtime_optimize(
+    jakal_core_runtime_t* runtime,
+    const jakal_core_workload_spec* workload,
+    jakal_core_optimization_info* out_optimization,
+    jakal_core_operation_optimization_info* operations,
     size_t capacity,
     size_t* out_count) {
     if (runtime == nullptr || workload == nullptr || out_count == nullptr) {
         return -1;
     }
 
-    const gpu::WorkloadSpec cpp_workload{
+    const jakal::WorkloadSpec cpp_workload{
         workload->name == nullptr ? std::string("unnamed") : std::string(workload->name),
         parse_workload_kind(workload->kind),
         "",
@@ -410,18 +410,18 @@ int gpu_runtime_optimize(
     return 0;
 }
 
-int gpu_runtime_execute(
-    gpu_runtime_t* runtime,
-    const gpu_workload_spec* workload,
-    gpu_execution_info* out_execution,
-    gpu_execution_operation_info* operations,
+int jakal_core_runtime_execute(
+    jakal_core_runtime_t* runtime,
+    const jakal_core_workload_spec* workload,
+    jakal_core_execution_info* out_execution,
+    jakal_core_execution_operation_info* operations,
     size_t capacity,
     size_t* out_count) {
     if (runtime == nullptr || workload == nullptr || out_count == nullptr) {
         return -1;
     }
 
-    const gpu::WorkloadSpec cpp_workload{
+    const jakal::WorkloadSpec cpp_workload{
         workload->name == nullptr ? std::string("unnamed") : std::string(workload->name),
         parse_workload_kind(workload->kind),
         "",
@@ -447,3 +447,5 @@ int gpu_runtime_execute(
 
     return 0;
 }
+
+

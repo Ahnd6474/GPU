@@ -1,4 +1,4 @@
-#include "gpu/gpu_l0.hpp"
+#include "jakal/jakal_l0.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -15,7 +15,7 @@
 #include <dlfcn.h>
 #endif
 
-namespace gpu {
+namespace jakal {
 namespace {
 
 #if defined(_WIN32)
@@ -79,8 +79,8 @@ bool looks_like_gpu_graph(const HardwareGraph& graph) {
            summary.addressable_bytes > (256ull * 1024ull * 1024ull);
 }
 
-GpuL0WorkloadTraits default_traits(const HardwareGraphSummary& summary) {
-    GpuL0WorkloadTraits traits;
+JakalL0WorkloadTraits default_traits(const HardwareGraphSummary& summary) {
+    JakalL0WorkloadTraits traits;
     traits.bytes = summary.addressable_bytes;
     traits.matrix_friendly = summary.matrix_units > 0;
     traits.streaming_friendly = summary.host_read_gbps >= 16.0;
@@ -95,40 +95,40 @@ double hardware_weight(const HardwareGraphSummary& summary) {
     return execution + std::log2(memory_gib + 2.0) + (host_link * 0.05);
 }
 
-GpuVendorFamily infer_vendor_from_graph(const HardwareGraph& graph) {
+JakalVendorFamily infer_vendor_from_graph(const HardwareGraph& graph) {
     if (graph.probe == "level-zero") {
-        return GpuVendorFamily::intel;
+        return JakalVendorFamily::intel;
     }
     if (graph.probe == "cuda") {
-        return GpuVendorFamily::nvidia;
+        return JakalVendorFamily::nvidia;
     }
     if (graph.probe == "rocm") {
-        return GpuVendorFamily::amd;
+        return JakalVendorFamily::amd;
     }
     if (contains_case_insensitive(graph.presentation_name, "intel") ||
         contains_case_insensitive(graph.presentation_name, "iris") ||
         contains_case_insensitive(graph.presentation_name, "arc")) {
-        return GpuVendorFamily::intel;
+        return JakalVendorFamily::intel;
     }
     if (contains_case_insensitive(graph.presentation_name, "nvidia") ||
         contains_case_insensitive(graph.presentation_name, "geforce") ||
         contains_case_insensitive(graph.presentation_name, "rtx") ||
         contains_case_insensitive(graph.presentation_name, "gtx")) {
-        return GpuVendorFamily::nvidia;
+        return JakalVendorFamily::nvidia;
     }
     if (contains_case_insensitive(graph.presentation_name, "amd") ||
         contains_case_insensitive(graph.presentation_name, "radeon") ||
         contains_case_insensitive(graph.presentation_name, "ryzen ai")) {
-        return GpuVendorFamily::amd;
+        return JakalVendorFamily::amd;
     }
-    return GpuVendorFamily::unknown;
+    return JakalVendorFamily::unknown;
 }
 
-class OpenClGpuL0Adapter final : public IGpuL0Adapter {
+class OpenClJakalL0Adapter final : public IJakalL0Adapter {
 public:
     [[nodiscard]] std::string id() const override { return "gpu-l0.opencl"; }
-    [[nodiscard]] GpuVendorFamily vendor() const override { return GpuVendorFamily::unknown; }
-    [[nodiscard]] GpuBackendKind backend_kind() const override { return GpuBackendKind::opencl; }
+    [[nodiscard]] JakalVendorFamily vendor() const override { return JakalVendorFamily::unknown; }
+    [[nodiscard]] JakalBackendKind backend_kind() const override { return JakalBackendKind::opencl; }
     [[nodiscard]] bool available() const override {
 #if defined(_WIN32)
         return library_present({"OpenCL.dll"});
@@ -143,9 +143,9 @@ public:
         return graph.probe == "opencl" || looks_like_gpu_graph(graph);
     }
 
-    [[nodiscard]] GpuL0Binding describe(const HardwareGraph& graph) const override {
+    [[nodiscard]] JakalL0Binding describe(const HardwareGraph& graph) const override {
         const auto summary = summarize_graph(graph);
-        GpuL0Binding binding;
+        JakalL0Binding binding;
         binding.device_uid = graph.uid;
         binding.graph_fingerprint = structural_fingerprint(graph);
         binding.adapter_id = id();
@@ -180,12 +180,12 @@ public:
         return binding;
     }
 
-    [[nodiscard]] GpuL0LaunchTuning suggest_tuning(
+    [[nodiscard]] JakalL0LaunchTuning suggest_tuning(
         const HardwareGraph& graph,
-        const GpuL0WorkloadTraits& workload) const override {
+        const JakalL0WorkloadTraits& workload) const override {
         const auto summary = summarize_graph(graph);
         const auto traits = workload.bytes == 0 ? default_traits(summary) : workload;
-        GpuL0LaunchTuning tuning;
+        JakalL0LaunchTuning tuning;
         tuning.workgroup_x = std::clamp(summary.lanes_per_object * 4u, 32u, 256u);
         tuning.workgroup_y = traits.streaming_friendly ? 2u : 1u;
         tuning.workgroup_z = 1u;
@@ -198,11 +198,11 @@ public:
     }
 };
 
-class LevelZeroGpuL0Adapter final : public IGpuL0Adapter {
+class LevelZeroJakalL0Adapter final : public IJakalL0Adapter {
 public:
     [[nodiscard]] std::string id() const override { return "gpu-l0.level-zero"; }
-    [[nodiscard]] GpuVendorFamily vendor() const override { return GpuVendorFamily::intel; }
-    [[nodiscard]] GpuBackendKind backend_kind() const override { return GpuBackendKind::level_zero; }
+    [[nodiscard]] JakalVendorFamily vendor() const override { return JakalVendorFamily::intel; }
+    [[nodiscard]] JakalBackendKind backend_kind() const override { return JakalBackendKind::level_zero; }
     [[nodiscard]] bool available() const override {
 #if defined(_WIN32)
         return library_present({"ze_loader.dll"});
@@ -224,9 +224,9 @@ public:
                graph.probe == "opencl";
     }
 
-    [[nodiscard]] GpuL0Binding describe(const HardwareGraph& graph) const override {
+    [[nodiscard]] JakalL0Binding describe(const HardwareGraph& graph) const override {
         const auto summary = summarize_graph(graph);
-        GpuL0Binding binding;
+        JakalL0Binding binding;
         binding.device_uid = graph.uid;
         binding.graph_fingerprint = structural_fingerprint(graph);
         binding.adapter_id = id();
@@ -261,12 +261,12 @@ public:
         return binding;
     }
 
-    [[nodiscard]] GpuL0LaunchTuning suggest_tuning(
+    [[nodiscard]] JakalL0LaunchTuning suggest_tuning(
         const HardwareGraph& graph,
-        const GpuL0WorkloadTraits& workload) const override {
+        const JakalL0WorkloadTraits& workload) const override {
         const auto summary = summarize_graph(graph);
         const auto traits = workload.bytes == 0 ? default_traits(summary) : workload;
-        GpuL0LaunchTuning tuning;
+        JakalL0LaunchTuning tuning;
         tuning.workgroup_x = std::clamp(summary.lanes_per_object * 8u, 32u, 512u);
         tuning.workgroup_y = traits.matrix_friendly ? 2u : 1u;
         tuning.workgroup_z = 1u;
@@ -279,11 +279,11 @@ public:
     }
 };
 
-class VulkanGpuL0Adapter final : public IGpuL0Adapter {
+class VulkanJakalL0Adapter final : public IJakalL0Adapter {
 public:
     [[nodiscard]] std::string id() const override { return "gpu-l0.vulkan"; }
-    [[nodiscard]] GpuVendorFamily vendor() const override { return GpuVendorFamily::unknown; }
-    [[nodiscard]] GpuBackendKind backend_kind() const override { return GpuBackendKind::vulkan_compute; }
+    [[nodiscard]] JakalVendorFamily vendor() const override { return JakalVendorFamily::unknown; }
+    [[nodiscard]] JakalBackendKind backend_kind() const override { return JakalBackendKind::vulkan_compute; }
     [[nodiscard]] bool available() const override {
 #if defined(_WIN32)
         return library_present({"vulkan-1.dll"});
@@ -296,9 +296,9 @@ public:
         return looks_like_gpu_graph(graph);
     }
 
-    [[nodiscard]] GpuL0Binding describe(const HardwareGraph& graph) const override {
+    [[nodiscard]] JakalL0Binding describe(const HardwareGraph& graph) const override {
         const auto summary = summarize_graph(graph);
-        GpuL0Binding binding;
+        JakalL0Binding binding;
         binding.device_uid = graph.uid;
         binding.graph_fingerprint = structural_fingerprint(graph);
         binding.adapter_id = id();
@@ -331,11 +331,11 @@ public:
         return binding;
     }
 
-    [[nodiscard]] GpuL0LaunchTuning suggest_tuning(
+    [[nodiscard]] JakalL0LaunchTuning suggest_tuning(
         const HardwareGraph& graph,
-        const GpuL0WorkloadTraits& workload) const override {
+        const JakalL0WorkloadTraits& workload) const override {
         const auto summary = summarize_graph(graph);
-        GpuL0LaunchTuning tuning;
+        JakalL0LaunchTuning tuning;
         tuning.workgroup_x = std::clamp(summary.lanes_per_object * 4u, 32u, 256u);
         tuning.workgroup_y = workload.op_class == OperationClass::resample_2d ? 4u : 1u;
         tuning.workgroup_z = 1u;
@@ -348,11 +348,11 @@ public:
     }
 };
 
-class CudaGpuL0Adapter final : public IGpuL0Adapter {
+class CudaJakalL0Adapter final : public IJakalL0Adapter {
 public:
     [[nodiscard]] std::string id() const override { return "gpu-l0.cuda"; }
-    [[nodiscard]] GpuVendorFamily vendor() const override { return GpuVendorFamily::nvidia; }
-    [[nodiscard]] GpuBackendKind backend_kind() const override { return GpuBackendKind::cuda; }
+    [[nodiscard]] JakalVendorFamily vendor() const override { return JakalVendorFamily::nvidia; }
+    [[nodiscard]] JakalBackendKind backend_kind() const override { return JakalBackendKind::cuda; }
     [[nodiscard]] bool available() const override {
 #if defined(_WIN32)
         return library_present({"nvcuda.dll"});
@@ -374,9 +374,9 @@ public:
                contains_case_insensitive(graph.presentation_name, "cuda");
     }
 
-    [[nodiscard]] GpuL0Binding describe(const HardwareGraph& graph) const override {
+    [[nodiscard]] JakalL0Binding describe(const HardwareGraph& graph) const override {
         const auto summary = summarize_graph(graph);
-        GpuL0Binding binding;
+        JakalL0Binding binding;
         binding.device_uid = graph.uid;
         binding.graph_fingerprint = structural_fingerprint(graph);
         binding.adapter_id = id();
@@ -409,11 +409,11 @@ public:
         return binding;
     }
 
-    [[nodiscard]] GpuL0LaunchTuning suggest_tuning(
+    [[nodiscard]] JakalL0LaunchTuning suggest_tuning(
         const HardwareGraph& graph,
-        const GpuL0WorkloadTraits& workload) const override {
+        const JakalL0WorkloadTraits& workload) const override {
         const auto summary = summarize_graph(graph);
-        GpuL0LaunchTuning tuning;
+        JakalL0LaunchTuning tuning;
         tuning.workgroup_x = std::clamp(summary.lanes_per_object * 8u, 64u, 512u);
         tuning.workgroup_y = workload.matrix_friendly ? 2u : 1u;
         tuning.workgroup_z = 1u;
@@ -426,11 +426,11 @@ public:
     }
 };
 
-class RocmGpuL0Adapter final : public IGpuL0Adapter {
+class RocmJakalL0Adapter final : public IJakalL0Adapter {
 public:
     [[nodiscard]] std::string id() const override { return "gpu-l0.rocm"; }
-    [[nodiscard]] GpuVendorFamily vendor() const override { return GpuVendorFamily::amd; }
-    [[nodiscard]] GpuBackendKind backend_kind() const override { return GpuBackendKind::rocm; }
+    [[nodiscard]] JakalVendorFamily vendor() const override { return JakalVendorFamily::amd; }
+    [[nodiscard]] JakalBackendKind backend_kind() const override { return JakalBackendKind::rocm; }
     [[nodiscard]] bool available() const override {
 #if defined(_WIN32)
         return library_present({"amdhip64.dll"});
@@ -453,9 +453,9 @@ public:
                contains_case_insensitive(graph.presentation_name, "hip");
     }
 
-    [[nodiscard]] GpuL0Binding describe(const HardwareGraph& graph) const override {
+    [[nodiscard]] JakalL0Binding describe(const HardwareGraph& graph) const override {
         const auto summary = summarize_graph(graph);
-        GpuL0Binding binding;
+        JakalL0Binding binding;
         binding.device_uid = graph.uid;
         binding.graph_fingerprint = structural_fingerprint(graph);
         binding.adapter_id = id();
@@ -488,11 +488,11 @@ public:
         return binding;
     }
 
-    [[nodiscard]] GpuL0LaunchTuning suggest_tuning(
+    [[nodiscard]] JakalL0LaunchTuning suggest_tuning(
         const HardwareGraph& graph,
-        const GpuL0WorkloadTraits& workload) const override {
+        const JakalL0WorkloadTraits& workload) const override {
         const auto summary = summarize_graph(graph);
-        GpuL0LaunchTuning tuning;
+        JakalL0LaunchTuning tuning;
         tuning.workgroup_x = std::clamp(summary.lanes_per_object * 8u, 64u, 512u);
         tuning.workgroup_y = workload.matrix_friendly ? 2u : 1u;
         tuning.workgroup_z = 1u;
@@ -507,44 +507,45 @@ public:
 
 }  // namespace
 
-std::string to_string(const GpuVendorFamily vendor_family) {
+std::string to_string(const JakalVendorFamily vendor_family) {
     switch (vendor_family) {
-    case GpuVendorFamily::intel:
+    case JakalVendorFamily::intel:
         return "intel";
-    case GpuVendorFamily::amd:
+    case JakalVendorFamily::amd:
         return "amd";
-    case GpuVendorFamily::nvidia:
+    case JakalVendorFamily::nvidia:
         return "nvidia";
-    case GpuVendorFamily::unknown:
+    case JakalVendorFamily::unknown:
         return "unknown";
     }
     return "unknown";
 }
 
-std::string to_string(const GpuBackendKind backend_kind) {
+std::string to_string(const JakalBackendKind backend_kind) {
     switch (backend_kind) {
-    case GpuBackendKind::opencl:
+    case JakalBackendKind::opencl:
         return "opencl";
-    case GpuBackendKind::level_zero:
+    case JakalBackendKind::level_zero:
         return "level-zero";
-    case GpuBackendKind::vulkan_compute:
+    case JakalBackendKind::vulkan_compute:
         return "vulkan-compute";
-    case GpuBackendKind::cuda:
+    case JakalBackendKind::cuda:
         return "cuda";
-    case GpuBackendKind::rocm:
+    case JakalBackendKind::rocm:
         return "rocm";
     }
     return "unknown";
 }
 
-std::vector<std::unique_ptr<IGpuL0Adapter>> make_default_gpu_l0_adapters() {
-    std::vector<std::unique_ptr<IGpuL0Adapter>> adapters;
-    adapters.push_back(std::make_unique<LevelZeroGpuL0Adapter>());
-    adapters.push_back(std::make_unique<CudaGpuL0Adapter>());
-    adapters.push_back(std::make_unique<RocmGpuL0Adapter>());
-    adapters.push_back(std::make_unique<VulkanGpuL0Adapter>());
-    adapters.push_back(std::make_unique<OpenClGpuL0Adapter>());
+std::vector<std::unique_ptr<IJakalL0Adapter>> make_default_jakal_l0_adapters() {
+    std::vector<std::unique_ptr<IJakalL0Adapter>> adapters;
+    adapters.push_back(std::make_unique<LevelZeroJakalL0Adapter>());
+    adapters.push_back(std::make_unique<CudaJakalL0Adapter>());
+    adapters.push_back(std::make_unique<RocmJakalL0Adapter>());
+    adapters.push_back(std::make_unique<VulkanJakalL0Adapter>());
+    adapters.push_back(std::make_unique<OpenClJakalL0Adapter>());
     return adapters;
 }
 
-}  // namespace gpu
+}  // namespace jakal
+

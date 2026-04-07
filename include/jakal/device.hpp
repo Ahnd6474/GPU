@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-namespace gpu {
+namespace jakal {
 
 enum class HardwareObjectDomain {
     compute,
@@ -155,4 +155,5 @@ void materialize_graph_costs(HardwareGraph& graph);
 [[nodiscard]] HardwareGraphSummary summarize_graph(const HardwareGraph& graph);
 [[nodiscard]] std::string structural_fingerprint(const HardwareGraph& graph);
 
-}  // namespace gpu
+}  // namespace jakal
+

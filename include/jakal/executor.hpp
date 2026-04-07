@@ -1,12 +1,12 @@
 #pragma once
 
-#include "gpu/execution.hpp"
-#include "gpu/gpu_toolkit.hpp"
+#include "jakal/execution.hpp"
+#include "jakal/jakal_toolkit.hpp"
 
 #include <string>
 #include <vector>
 
-namespace gpu {
+namespace jakal {
 
 struct OperationExecutionRecord {
     std::string operation_name;
@@ -40,7 +40,8 @@ public:
     [[nodiscard]] DirectExecutionReport execute(
         const OptimizationReport& optimization,
         const std::vector<HardwareGraph>& graphs,
-        const std::vector<GpuToolkitIndexEntry>& gpu_toolkit_index) const;
+        const std::vector<JakalToolkitIndexEntry>& jakal_toolkit_index) const;
 };
 
-}  // namespace gpu
+}  // namespace jakal
+

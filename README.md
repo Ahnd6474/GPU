@@ -2,7 +2,7 @@
 
 Graph-first heterogeneous compute runtime skeleton for C++20.
 
-This repository is `Jakal-Core`. The CMake project and library target are still named `GPU` and `gpu::runtime`.
+This repository is `Jakal-Core`. The CMake project, library target, and public headers now use the `Jakal-Core` naming scheme consistently.
 
 Jakal-Core is not a production runtime yet. It is a small CMake library with examples and tests that:
 
@@ -51,17 +51,17 @@ cmake --build build
 
 The default build produces:
 
-- `gpu_runtime`
-- `gpu_inspect`
-- `gpu_profile_workloads`
-- `gpu_explore_cpu_dl`
-- `gpu_smoke`
-- `gpu_optimization`
+- `jakal_core`
+- `jakal_inspect`
+- `jakal_profile_workloads`
+- `jakal_explore_cpu_dl`
+- `jakal_smoke`
+- `jakal_optimization`
 
 Useful CMake switches:
 
 ```powershell
-cmake -S . -B build -DGPU_BUILD_EXAMPLES=OFF -DGPU_BUILD_TESTS=OFF
+cmake -S . -B build -DJAKAL_CORE_BUILD_EXAMPLES=OFF -DJAKAL_CORE_BUILD_TESTS=OFF
 ```
 
 If you are using a multi-config generator such as Visual Studio, CTest also needs a configuration name:
@@ -74,22 +74,22 @@ On single-config generators such as Ninja or Unix Makefiles, the `-C Debug` part
 
 ## Quick start
 
-If you want to consume the library from another CMake project, add this repository as a subdirectory and link `gpu::runtime`.
+If you want to consume the library from another CMake project, add this repository as a subdirectory and link `jakal::core`.
 
 ```cmake
 add_subdirectory(path/to/Jakal-Core)
-target_link_libraries(my_app PRIVATE gpu::runtime)
+target_link_libraries(my_app PRIVATE jakal::core)
 ```
 
 Minimal C++ example:
 
 ```cpp
-#include "gpu/runtime.hpp"
+#include "jakal/runtime.hpp"
 
 #include <iostream>
 
 int main() {
-    gpu::Runtime runtime;
+    jakal::Runtime runtime;
 
     for (const auto& graph : runtime.devices()) {
         std::cout << graph.presentation_name << '\n';
@@ -99,15 +99,15 @@ int main() {
 }
 ```
 
-`gpu::Runtime` refreshes hardware during construction, so `devices()` is ready right away unless you explicitly disable every probe.
+`jakal::Runtime` refreshes hardware during construction, so `devices()` is ready right away unless you explicitly disable every probe.
 
 If you just want to see what the repository does without writing code, build the tree and run:
 
 ```powershell
-.\build\Debug\gpu_inspect.exe
+.\build\Debug\jakal_inspect.exe
 ```
 
-On single-config generators, the executable is typically `./build/gpu_inspect`.
+On single-config generators, the executable is typically `./build/jakal_inspect`.
 
 ## What is this repository?
 
@@ -180,35 +180,35 @@ What is still missing:
 
 The main public headers are:
 
-- [`include/gpu/runtime.hpp`](./include/gpu/runtime.hpp)
-- [`include/gpu/planner.hpp`](./include/gpu/planner.hpp)
-- [`include/gpu/execution.hpp`](./include/gpu/execution.hpp)
-- [`include/gpu/workloads.hpp`](./include/gpu/workloads.hpp)
-- [`include/gpu/c_api.h`](./include/gpu/c_api.h)
+- [`include/jakal/runtime.hpp`](./include/jakal/runtime.hpp)
+- [`include/jakal/planner.hpp`](./include/jakal/planner.hpp)
+- [`include/jakal/execution.hpp`](./include/jakal/execution.hpp)
+- [`include/jakal/workloads.hpp`](./include/jakal/workloads.hpp)
+- [`include/jakal/c_api.h`](./include/jakal/c_api.h)
 
-`gpu::Runtime` is the main entry point.
+`jakal::Runtime` is the main entry point.
 
 | Method | What it does |
 | --- | --- |
 | `refresh_hardware()` | Re-runs device discovery and rebuilds the toolkit index |
 | `devices()` | Returns discovered hardware graphs |
-| `gpu_toolkit_index()` | Returns ranked backend variants per discovered device |
+| `jakal_toolkit_index()` | Returns ranked backend variants per discovered device |
 | `plan(workload)` | Builds or loads a cached placement plan |
 | `optimize(workload)` | Builds workload and execution graphs, then picks execution settings |
 | `execute(workload)` | Runs the selected execution path and feeds the results back into the optimizer |
 
-`gpu::RuntimeOptions` lets you:
+`jakal::RuntimeOptions` lets you:
 
 - enable or disable host, OpenCL, Level Zero, CUDA, and ROCm probes
 - override the plan cache path
 - override the execution cache path
 
-`gpu::WorkloadSpec` is the main planning input.
+`jakal::WorkloadSpec` is the main planning input.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `name` | `std::string` | Human-readable workload name |
-| `kind` | `gpu::WorkloadKind` | Broad workload class such as `inference` or `training` |
+| `kind` | `jakal::WorkloadKind` | Broad workload class such as `inference` or `training` |
 | `dataset_tag` | `std::string` | Optional preset or dataset identifier |
 | `working_set_bytes` | `std::uint64_t` | Estimated active working set |
 | `host_exchange_bytes` | `std::uint64_t` | Estimated host-device exchange volume |
@@ -220,7 +220,7 @@ The main public headers are:
 
 ### Workload helpers
 
-If you do not want to invent workloads by hand, [`include/gpu/workloads.hpp`](./include/gpu/workloads.hpp) exposes two helper sets:
+If you do not want to invent workloads by hand, [`include/jakal/workloads.hpp`](./include/jakal/workloads.hpp) exposes two helper sets:
 
 - `canonical_workload_presets()` for gaming, vision inference, and compact training-step surrogates
 - `cpu_deep_learning_exploration_presets()` for host-heavy inference cases such as decode, KV-cache maintenance, and dequant pipelines
@@ -229,27 +229,27 @@ If you do not want to invent workloads by hand, [`include/gpu/workloads.hpp`](./
 
 ### C API
 
-The C API in [`include/gpu/c_api.h`](./include/gpu/c_api.h) mirrors the same runtime in a smaller surface.
+The C API in [`include/jakal/c_api.h`](./include/jakal/c_api.h) mirrors the same runtime in a smaller surface.
 
 Core lifecycle and inspection:
 
-- `gpu_runtime_create`
-- `gpu_runtime_destroy`
-- `gpu_runtime_refresh`
-- `gpu_runtime_device_count`
-- `gpu_runtime_get_device`
-- `gpu_runtime_graph_node_count`
-- `gpu_runtime_get_graph_node`
-- `gpu_runtime_graph_edge_count`
-- `gpu_runtime_get_graph_edge`
+- `jakal_core_runtime_create`
+- `jakal_core_runtime_destroy`
+- `jakal_core_runtime_refresh`
+- `jakal_core_runtime_device_count`
+- `jakal_core_runtime_get_device`
+- `jakal_core_runtime_graph_node_count`
+- `jakal_core_runtime_get_graph_node`
+- `jakal_core_runtime_graph_edge_count`
+- `jakal_core_runtime_get_graph_edge`
 
 Planning, optimization, and execution:
 
-- `gpu_runtime_plan`
-- `gpu_runtime_optimize`
-- `gpu_runtime_execute`
+- `jakal_core_runtime_plan`
+- `jakal_core_runtime_optimize`
+- `jakal_core_runtime_execute`
 
-Accepted `gpu_workload_spec.kind` strings are:
+Accepted `jakal_core_workload_spec.kind` strings are:
 
 - `custom`
 - `inference`
@@ -264,18 +264,18 @@ The array-returning functions follow the usual "capacity plus out-count" pattern
 
 By default the runtime writes lightweight TSV caches to the system temp directory:
 
-- `gpu_runtime_plan_cache.tsv`
-- `gpu_runtime_execution_cache.tsv`
-- `gpu_runtime_execution_cache.tsv.perf`
+- `jakal_core_plan_cache.tsv`
+- `jakal_core_execution_cache.tsv`
+- `jakal_core_execution_cache.tsv.perf`
 
-You can redirect those files through `gpu::RuntimeOptions`.
+You can redirect those files through `jakal::RuntimeOptions`.
 
 ## Examples
 
 ### Inspect discovered hardware and one sample workload
 
 ```powershell
-.\build\Debug\gpu_inspect.exe
+.\build\Debug\jakal_inspect.exe
 ```
 
 This prints:
@@ -290,7 +290,7 @@ This prints:
 ### Profile canonical workload presets
 
 ```powershell
-.\build\Debug\gpu_profile_workloads.exe
+.\build\Debug\jakal_profile_workloads.exe
 ```
 
 This runs the built-in gaming, inference, and training-style presets twice so you can compare cold and warm behavior and see what the learning cache changes.
@@ -300,25 +300,25 @@ This runs the built-in gaming, inference, and training-style presets twice so yo
 By default, this example optimizes one preset without executing it:
 
 ```powershell
-.\build\Debug\gpu_explore_cpu_dl.exe
+.\build\Debug\jakal_explore_cpu_dl.exe
 ```
 
 Run the executor as well:
 
 ```powershell
-.\build\Debug\gpu_explore_cpu_dl.exe --execute
+.\build\Debug\jakal_explore_cpu_dl.exe --execute
 ```
 
 Run every preset:
 
 ```powershell
-.\build\Debug\gpu_explore_cpu_dl.exe --all --execute
+.\build\Debug\jakal_explore_cpu_dl.exe --all --execute
 ```
 
 You can also pass a preset name or dataset tag:
 
 ```powershell
-.\build\Debug\gpu_explore_cpu_dl.exe llm-decode-token-lite --execute
+.\build\Debug\jakal_explore_cpu_dl.exe llm-decode-token-lite --execute
 ```
 
 The output includes:
@@ -345,8 +345,8 @@ ctest --test-dir build --output-on-failure
 You can also run the binaries directly:
 
 ```powershell
-.\build\Debug\gpu_smoke.exe
-.\build\Debug\gpu_optimization.exe
+.\build\Debug\jakal_smoke.exe
+.\build\Debug\jakal_optimization.exe
 ```
 
 ## Further reading
@@ -361,3 +361,4 @@ You can also run the binaries directly:
 ## License
 
 MIT. See [`LICENSE`](./LICENSE).
+

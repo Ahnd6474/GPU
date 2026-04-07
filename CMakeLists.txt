@@ -1,19 +1,19 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(GPU
+project(JakalCore
     VERSION 0.1.0
     DESCRIPTION "Structural-descriptor runtime skeleton for heterogeneous compute"
     LANGUAGES CXX)
 
-option(GPU_BUILD_EXAMPLES "Build example applications" ON)
-option(GPU_BUILD_TESTS "Build test targets" ON)
+option(JAKAL_CORE_BUILD_EXAMPLES "Build example applications" ON)
+option(JAKAL_CORE_BUILD_TESTS "Build test targets" ON)
 
-add_library(gpu_runtime
+add_library(jakal_core
     src/device.cpp
     src/execution.cpp
     src/executor.cpp
-    src/gpu_l0.cpp
-    src/gpu_toolkit.cpp
+    src/jakal_l0.cpp
+    src/jakal_toolkit.cpp
     src/executors/common_scheduler.cpp
     src/executors/direct_backends.cpp
     src/executors/native_gpu_backends.cpp
@@ -25,46 +25,51 @@ add_library(gpu_runtime
     src/backends/native_gpu_probes.cpp
     src/backends/opencl_backend.cpp)
 
-add_library(gpu::runtime ALIAS gpu_runtime)
+add_library(jakal::core ALIAS jakal_core)
+add_library(jakal::runtime ALIAS jakal_core)
 
-target_include_directories(gpu_runtime
+target_include_directories(jakal_core
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-target_compile_features(gpu_runtime PUBLIC cxx_std_20)
+target_compile_features(jakal_core PUBLIC cxx_std_20)
 
 if(MSVC)
-    target_compile_options(gpu_runtime PRIVATE /W4 /permissive-)
-    target_compile_definitions(gpu_runtime PRIVATE NOMINMAX)
+    target_compile_options(jakal_core PRIVATE /W4 /permissive-)
+    target_compile_definitions(jakal_core PRIVATE NOMINMAX)
 else()
-    target_compile_options(gpu_runtime PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(jakal_core PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 if(UNIX AND NOT APPLE)
-    target_link_libraries(gpu_runtime PRIVATE dl)
+    target_link_libraries(jakal_core PRIVATE dl)
 endif()
 
-if(GPU_BUILD_EXAMPLES)
-    add_executable(gpu_inspect examples/inspect_runtime.cpp)
-    target_link_libraries(gpu_inspect PRIVATE gpu::runtime)
+if(JAKAL_CORE_BUILD_EXAMPLES)
+    add_executable(jakal_inspect examples/inspect_runtime.cpp)
+    target_link_libraries(jakal_inspect PRIVATE jakal::core)
 
-    add_executable(gpu_profile_workloads examples/profile_workloads.cpp)
-    target_link_libraries(gpu_profile_workloads PRIVATE gpu::runtime)
+    add_executable(jakal_profile_workloads examples/profile_workloads.cpp)
+    target_link_libraries(jakal_profile_workloads PRIVATE jakal::core)
 
-    add_executable(gpu_explore_cpu_dl examples/explore_cpu_dl.cpp)
-    target_link_libraries(gpu_explore_cpu_dl PRIVATE gpu::runtime)
+    add_executable(jakal_explore_cpu_dl examples/explore_cpu_dl.cpp)
+    target_link_libraries(jakal_explore_cpu_dl PRIVATE jakal::core)
+
+    add_executable(jakal_partition_roles examples/partition_roles.cpp)
+    target_link_libraries(jakal_partition_roles PRIVATE jakal::core)
 endif()
 
-if(GPU_BUILD_TESTS)
+if(JAKAL_CORE_BUILD_TESTS)
     enable_testing()
 
-    add_executable(gpu_smoke tests/smoke.cpp)
-    target_link_libraries(gpu_smoke PRIVATE gpu::runtime)
+    add_executable(jakal_smoke tests/smoke.cpp)
+    target_link_libraries(jakal_smoke PRIVATE jakal::core)
 
-    add_test(NAME gpu_smoke COMMAND gpu_smoke)
+    add_test(NAME jakal_smoke COMMAND jakal_smoke)
 
-    add_executable(gpu_optimization tests/optimization.cpp)
-    target_link_libraries(gpu_optimization PRIVATE gpu::runtime)
+    add_executable(jakal_optimization tests/optimization.cpp)
+    target_link_libraries(jakal_optimization PRIVATE jakal::core)
 
-    add_test(NAME gpu_optimization COMMAND gpu_optimization)
+    add_test(NAME jakal_optimization COMMAND jakal_optimization)
 endif()
+

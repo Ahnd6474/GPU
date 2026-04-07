@@ -1,8 +1,8 @@
-#include "gpu/executor.hpp"
+#include "jakal/executor.hpp"
 
-#include "gpu/device.hpp"
-#include "gpu/executors/direct_backends.hpp"
-#include "gpu/executors/scheduler.hpp"
+#include "jakal/device.hpp"
+#include "jakal/executors/direct_backends.hpp"
+#include "jakal/executors/scheduler.hpp"
 
 #include <algorithm>
 #include <array>
@@ -32,7 +32,7 @@
 #include <dlfcn.h>
 #endif
 
-namespace gpu {
+namespace jakal {
 namespace {
 
 constexpr std::uint32_t kOpenClReductionGroupSize = 256u;
@@ -102,8 +102,8 @@ using executors::BackendRunResult;
 using executors::DeviceAssignment;
 using executors::OperationData;
 
-GpuL0WorkloadTraits make_gpu_traits(const OperationSpec& operation) {
-    GpuL0WorkloadTraits traits;
+JakalL0WorkloadTraits make_gpu_traits(const OperationSpec& operation) {
+    JakalL0WorkloadTraits traits;
     traits.op_class = operation.op_class;
     traits.extents = operation.extents;
     traits.bytes = operation.input_bytes + operation.output_bytes + operation.temporary_bytes;
@@ -114,19 +114,19 @@ GpuL0WorkloadTraits make_gpu_traits(const OperationSpec& operation) {
     return traits;
 }
 
-const GpuToolkitVariant* find_preferred_gpu_variant(
+const JakalToolkitVariant* find_preferred_gpu_variant(
     const DeviceAssignment& assignment,
-    const std::vector<GpuToolkitIndexEntry>& gpu_toolkit_index,
+    const std::vector<JakalToolkitIndexEntry>& jakal_toolkit_index,
     const OperationSpec& operation) {
     const auto traits = make_gpu_traits(operation);
-    for (const auto& entry : gpu_toolkit_index) {
+    for (const auto& entry : jakal_toolkit_index) {
         if (entry.device_uid != assignment.graph->uid || entry.variants.empty()) {
             continue;
         }
 
         const auto& variants = entry.variants;
         // Re-rank lightly per operation without rebuilding the toolkit index.
-        const GpuToolkitVariant* best = &variants.front();
+        const JakalToolkitVariant* best = &variants.front();
         double best_score = best->toolkit_score;
         for (const auto& variant : variants) {
             double score = variant.toolkit_score;
@@ -137,7 +137,7 @@ const GpuToolkitVariant* find_preferred_gpu_variant(
                 score += 0.03;
             }
             if (traits.op_class == OperationClass::resample_2d &&
-                variant.binding.backend == GpuBackendKind::vulkan_compute) {
+                variant.binding.backend == JakalBackendKind::vulkan_compute) {
                 score += 0.04;
             }
             if (!variant.executable) {
@@ -155,18 +155,18 @@ const GpuToolkitVariant* find_preferred_gpu_variant(
 
 std::string actual_backend_name(
     const std::vector<DeviceAssignment>& assignments,
-    const std::vector<GpuToolkitIndexEntry>& gpu_toolkit_index,
+    const std::vector<JakalToolkitIndexEntry>& jakal_toolkit_index,
     const OperationSpec& operation) {
     bool uses_host = false;
     bool uses_gpu = false;
-    const GpuToolkitVariant* preferred_gpu = nullptr;
+    const JakalToolkitVariant* preferred_gpu = nullptr;
     for (const auto& assignment : assignments) {
         if (assignment.graph->probe == "host") {
             uses_host = true;
         } else {
             uses_gpu = true;
             if (preferred_gpu == nullptr) {
-                preferred_gpu = find_preferred_gpu_variant(assignment, gpu_toolkit_index, operation);
+                preferred_gpu = find_preferred_gpu_variant(assignment, jakal_toolkit_index, operation);
             }
         }
     }
@@ -1234,7 +1234,7 @@ BackendRunResult dispatch_backend(
     const executors::IKernelBackend& cuda,
     const executors::IKernelBackend& rocm,
     const executors::IKernelBackend& vulkan,
-    const GpuToolkitVariant* preferred_gpu_variant) {
+    const JakalToolkitVariant* preferred_gpu_variant) {
     const auto& graph = *assignment.graph;
     const bool low_precision = operation.config.use_low_precision;
     const bool request_gpu_direct = preferred_gpu_variant != nullptr && preferred_gpu_variant->executable;
@@ -1245,15 +1245,15 @@ BackendRunResult dispatch_backend(
         }
 
         switch (preferred_gpu_variant->binding.backend) {
-        case GpuBackendKind::level_zero:
+        case JakalBackendKind::level_zero:
             return invoke(level_zero);
-        case GpuBackendKind::cuda:
+        case JakalBackendKind::cuda:
             return invoke(cuda);
-        case GpuBackendKind::rocm:
+        case JakalBackendKind::rocm:
             return invoke(rocm);
-        case GpuBackendKind::vulkan_compute:
+        case JakalBackendKind::vulkan_compute:
             return invoke(vulkan);
-        case GpuBackendKind::opencl:
+        case JakalBackendKind::opencl:
         default:
             return std::nullopt;
         }
@@ -1381,7 +1381,7 @@ BackendRunResult dispatch_backend(
 DirectExecutionReport DirectExecutor::execute(
     const OptimizationReport& optimization,
     const std::vector<HardwareGraph>& graphs,
-    const std::vector<GpuToolkitIndexEntry>& gpu_toolkit_index) const {
+    const std::vector<JakalToolkitIndexEntry>& jakal_toolkit_index) const {
     DirectExecutionReport report;
     report.optimization = optimization;
 
@@ -1406,7 +1406,7 @@ DirectExecutionReport DirectExecutor::execute(
         const auto operation_data = make_operation_data(optimized.operation);
         OperationExecutionRecord record;
         record.operation_name = optimized.operation.name;
-        record.backend_name = actual_backend_name(assignments, gpu_toolkit_index, optimized.operation);
+        record.backend_name = actual_backend_name(assignments, jakal_toolkit_index, optimized.operation);
         record.participating_devices = optimized.config.participating_devices;
         record.used_multiple_devices = assignments.size() > 1;
         record.logical_partitions_used = optimized.config.logical_partitions;
@@ -1415,7 +1415,7 @@ DirectExecutionReport DirectExecutor::execute(
                 continue;
             }
             const auto* preferred_gpu_variant =
-                find_preferred_gpu_variant(assignment, gpu_toolkit_index, optimized.operation);
+                find_preferred_gpu_variant(assignment, jakal_toolkit_index, optimized.operation);
             if (preferred_gpu_variant != nullptr) {
                 record.requested_gpu_vendor = to_string(preferred_gpu_variant->binding.vendor);
                 record.requested_gpu_backend = to_string(preferred_gpu_variant->binding.backend);
@@ -1566,7 +1566,7 @@ DirectExecutionReport DirectExecutor::execute(
 
             if (assignments.size() == 1) {
                 const auto* preferred_gpu_variant =
-                    find_preferred_gpu_variant(assignments.front(), gpu_toolkit_index, optimized.operation);
+                    find_preferred_gpu_variant(assignments.front(), jakal_toolkit_index, optimized.operation);
                 const auto shard =
                     dispatch_backend(
                         assignments.front(),
@@ -1598,10 +1598,10 @@ DirectExecutionReport DirectExecutor::execute(
                      &cuda_backend,
                      &rocm_backend,
                      &vulkan_backend,
-                     &gpu_toolkit_index,
+                     &jakal_toolkit_index,
                      assignment]() {
                         const auto* preferred_gpu_variant =
-                            find_preferred_gpu_variant(assignment, gpu_toolkit_index, optimized.operation);
+                            find_preferred_gpu_variant(assignment, jakal_toolkit_index, optimized.operation);
                         return dispatch_backend(
                             assignment,
                             optimized,
@@ -1648,4 +1648,5 @@ DirectExecutionReport DirectExecutor::execute(
     return report;
 }
 
-}  // namespace gpu
+}  // namespace jakal
+

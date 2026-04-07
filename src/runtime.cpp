@@ -1,11 +1,11 @@
-#include "gpu/runtime.hpp"
+#include "jakal/runtime.hpp"
 
 #include <algorithm>
 #include <numeric>
 #include <unordered_map>
 #include <utility>
 
-namespace gpu {
+namespace jakal {
 namespace {
 
 std::vector<ExecutionFeedbackRecord> make_feedback_records(const DirectExecutionReport& report) {
@@ -100,7 +100,7 @@ Runtime::Runtime(RuntimeOptions options)
 
 void Runtime::refresh_hardware() {
     devices_.clear();
-    gpu_toolkit_index_.clear();
+    jakal_toolkit_index_.clear();
 
     for (auto& probe : probes_) {
         if (!probe->available()) {
@@ -130,15 +130,15 @@ void Runtime::refresh_hardware() {
         return structural_fingerprint(left) < structural_fingerprint(right);
     });
 
-    gpu_toolkit_index_ = gpu_toolkit_.build_index(devices_);
+    jakal_toolkit_index_ = jakal_toolkit_.build_index(devices_);
 }
 
 const std::vector<HardwareGraph>& Runtime::devices() const {
     return devices_;
 }
 
-const std::vector<GpuToolkitIndexEntry>& Runtime::gpu_toolkit_index() const {
-    return gpu_toolkit_index_;
+const std::vector<JakalToolkitIndexEntry>& Runtime::jakal_toolkit_index() const {
+    return jakal_toolkit_index_;
 }
 
 ExecutionPlan Runtime::plan(const WorkloadSpec& workload) {
@@ -164,7 +164,7 @@ DirectExecutionReport Runtime::execute(const WorkloadSpec& workload) {
     }
 
     const auto initial_optimization = optimize(workload);
-    auto initial_report = direct_executor_.execute(initial_optimization, devices_, gpu_toolkit_index_);
+    auto initial_report = direct_executor_.execute(initial_optimization, devices_, jakal_toolkit_index_);
     execution_optimizer_.ingest_execution_feedback(
         initial_report.optimization,
         make_feedback_records(initial_report),
@@ -179,7 +179,7 @@ DirectExecutionReport Runtime::execute(const WorkloadSpec& workload) {
         return initial_report;
     }
 
-    auto refined_report = direct_executor_.execute(refined_optimization, devices_, gpu_toolkit_index_);
+    auto refined_report = direct_executor_.execute(refined_optimization, devices_, jakal_toolkit_index_);
     execution_optimizer_.ingest_execution_feedback(
         refined_report.optimization,
         make_feedback_records(refined_report),
@@ -209,4 +209,5 @@ bool Runtime::should_include_descriptor(const HardwareGraph& candidate) const {
     });
 }
 
-}  // namespace gpu
+}  // namespace jakal
+

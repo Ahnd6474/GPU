@@ -1,8 +1,8 @@
 #pragma once
 
-#include "gpu/executors/interfaces.hpp"
+#include "jakal/executors/interfaces.hpp"
 
-namespace gpu::executors {
+namespace jakal::executors {
 
 class DefaultIntraDeviceScheduler final : public IIntraDeviceScheduler {
 public:
@@ -13,4 +13,5 @@ public:
         std::size_t total_items) const override;
 };
 
-}  // namespace gpu::executors
+}  // namespace jakal::executors
+

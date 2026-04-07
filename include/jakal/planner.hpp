@@ -1,6 +1,6 @@
 #pragma once
 
-#include "gpu/backend.hpp"
+#include "jakal/backend.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -8,7 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace gpu {
+namespace jakal {
 
 enum class WorkloadKind {
     custom,
@@ -71,4 +71,5 @@ private:
     std::unordered_map<std::string, std::vector<CachedAllocation>> cache_;
 };
 
-}  // namespace gpu
+}  // namespace jakal
+

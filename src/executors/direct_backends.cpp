@@ -1,7 +1,7 @@
-#include "gpu/executors/direct_backends.hpp"
-#include "gpu/executors/native_gpu_backend.hpp"
+#include "jakal/executors/direct_backends.hpp"
+#include "jakal/executors/native_gpu_backend.hpp"
 
-#include "gpu/gpu_l0.hpp"
+#include "jakal/jakal_l0.hpp"
 
 #include <algorithm>
 #include <array>
@@ -22,7 +22,7 @@
 #include <dlfcn.h>
 #endif
 
-namespace gpu::executors {
+namespace jakal::executors {
 namespace {
 
 #if defined(_WIN32)
@@ -284,52 +284,52 @@ public:
 };
 
 double gpu_runtime_scale(
-    const GpuBackendKind backend,
+    const JakalBackendKind backend,
     const OperationClass op_class,
     const HardwareGraph& graph) {
     const auto summary = summarize_graph(graph);
     double scale = 1.0;
     switch (backend) {
-    case GpuBackendKind::level_zero:
+    case JakalBackendKind::level_zero:
         scale = op_class == OperationClass::matmul ? 0.42 : 0.60;
         scale -= summary.unified_address_space ? 0.05 : 0.0;
         scale -= (summary.supports_fp16 || summary.matrix_units > 0) ? 0.05 : 0.0;
         break;
-    case GpuBackendKind::cuda:
+    case JakalBackendKind::cuda:
         scale = op_class == OperationClass::matmul ? 0.34 : 0.54;
         scale -= op_class == OperationClass::convolution_2d ? 0.08 : 0.0;
         scale -= (summary.supports_int8 || summary.matrix_units > 0) ? 0.05 : 0.0;
         break;
-    case GpuBackendKind::rocm:
+    case JakalBackendKind::rocm:
         scale = op_class == OperationClass::matmul ? 0.36 : 0.56;
         scale -= op_class == OperationClass::convolution_2d ? 0.06 : 0.0;
         scale -= (summary.supports_fp16 || summary.matrix_units > 0) ? 0.04 : 0.0;
         break;
-    case GpuBackendKind::vulkan_compute:
+    case JakalBackendKind::vulkan_compute:
         scale = op_class == OperationClass::resample_2d ? 0.38 : 0.68;
         scale -= op_class == OperationClass::elementwise_map ? 0.06 : 0.0;
         scale -= summary.supports_asynchronous_dispatch ? 0.03 : 0.0;
         break;
-    case GpuBackendKind::opencl:
+    case JakalBackendKind::opencl:
     default:
         return 1.0;
     }
     return std::clamp(scale, 0.22, 0.90);
 }
 
-double gpu_dispatch_overhead_us(const GpuBackendKind backend, const HardwareGraph& graph) {
+double gpu_dispatch_overhead_us(const JakalBackendKind backend, const HardwareGraph& graph) {
     const auto summary = summarize_graph(graph);
     const double baseline = std::max(summary.dispatch_latency_us, 1.0);
     switch (backend) {
-    case GpuBackendKind::level_zero:
+    case JakalBackendKind::level_zero:
         return std::max(1.0, baseline * 0.45);
-    case GpuBackendKind::cuda:
+    case JakalBackendKind::cuda:
         return std::max(1.5, baseline * 0.50);
-    case GpuBackendKind::rocm:
+    case JakalBackendKind::rocm:
         return std::max(1.5, baseline * 0.52);
-    case GpuBackendKind::vulkan_compute:
+    case JakalBackendKind::vulkan_compute:
         return std::max(2.0, baseline * 0.70);
-    case GpuBackendKind::opencl:
+    case JakalBackendKind::opencl:
     default:
         return baseline;
     }
@@ -337,7 +337,7 @@ double gpu_dispatch_overhead_us(const GpuBackendKind backend, const HardwareGrap
 
 class NativeRuntimeBootstrap final {
 public:
-    explicit NativeRuntimeBootstrap(const GpuBackendKind backend)
+    explicit NativeRuntimeBootstrap(const JakalBackendKind backend)
         : backend_(backend) {}
 
     [[nodiscard]] bool ready() const {
@@ -368,17 +368,17 @@ private:
     void initialize_locked() {
         attempted_ = true;
         switch (backend_) {
-        case GpuBackendKind::level_zero:
+        case JakalBackendKind::level_zero:
             ready_ = bootstrap_level_zero();
             break;
-        case GpuBackendKind::cuda:
+        case JakalBackendKind::cuda:
             ready_ = bootstrap_cuda();
             break;
-        case GpuBackendKind::rocm:
+        case JakalBackendKind::rocm:
             ready_ = bootstrap_rocm();
             break;
-        case GpuBackendKind::vulkan_compute:
-        case GpuBackendKind::opencl:
+        case JakalBackendKind::vulkan_compute:
+        case JakalBackendKind::opencl:
         default:
             ready_ = true;
             break;
@@ -502,7 +502,7 @@ private:
         return ok;
     }
 
-    GpuBackendKind backend_;
+    JakalBackendKind backend_;
     mutable std::mutex mutex_;
     bool attempted_ = false;
     bool ready_ = false;
@@ -510,7 +510,7 @@ private:
 
 class GenericGpuKernelBackend final : public IKernelBackend {
 public:
-    explicit GenericGpuKernelBackend(const GpuBackendKind backend)
+    explicit GenericGpuKernelBackend(const JakalBackendKind backend)
         : backend_(backend),
           bootstrap_(backend) {}
 
@@ -596,7 +596,7 @@ private:
         return result;
     }
 
-    GpuBackendKind backend_;
+    JakalBackendKind backend_;
     HostKernelBackend host_;
     NativeRuntimeBootstrap bootstrap_;
 };
@@ -608,19 +608,20 @@ std::unique_ptr<IKernelBackend> make_host_kernel_backend() {
 }
 
 std::unique_ptr<IKernelBackend> make_level_zero_kernel_backend() {
-    return make_native_gpu_kernel_backend(GpuBackendKind::level_zero);
+    return make_native_gpu_kernel_backend(JakalBackendKind::level_zero);
 }
 
 std::unique_ptr<IKernelBackend> make_cuda_kernel_backend() {
-    return make_native_gpu_kernel_backend(GpuBackendKind::cuda);
+    return make_native_gpu_kernel_backend(JakalBackendKind::cuda);
 }
 
 std::unique_ptr<IKernelBackend> make_rocm_kernel_backend() {
-    return make_native_gpu_kernel_backend(GpuBackendKind::rocm);
+    return make_native_gpu_kernel_backend(JakalBackendKind::rocm);
 }
 
 std::unique_ptr<IKernelBackend> make_vulkan_kernel_backend() {
-    return std::make_unique<GenericGpuKernelBackend>(GpuBackendKind::vulkan_compute);
+    return std::make_unique<GenericGpuKernelBackend>(JakalBackendKind::vulkan_compute);
 }
 
-}  // namespace gpu::executors
+}  // namespace jakal::executors
+

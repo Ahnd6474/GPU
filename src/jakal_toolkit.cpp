@@ -1,14 +1,14 @@
-#include "gpu/gpu_toolkit.hpp"
+#include "jakal/jakal_toolkit.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <optional>
 #include <utility>
 
-namespace gpu {
+namespace jakal {
 namespace {
 
-double workload_bias(const GpuToolkitVariant& variant, const GpuL0WorkloadTraits& workload) {
+double workload_bias(const JakalToolkitVariant& variant, const JakalL0WorkloadTraits& workload) {
     double bias = 0.0;
 
     if (workload.matrix_friendly && variant.binding.capabilities.subgroup_matrix) {
@@ -29,7 +29,7 @@ double workload_bias(const GpuToolkitVariant& variant, const GpuL0WorkloadTraits
         bias += variant.binding.capabilities.kernel_specialization ? 0.04 : 0.0;
         break;
     case OperationClass::resample_2d:
-        bias += variant.binding.backend == GpuBackendKind::vulkan_compute ? 0.05 : 0.0;
+        bias += variant.binding.backend == JakalBackendKind::vulkan_compute ? 0.05 : 0.0;
         break;
     case OperationClass::reduction:
         bias += variant.binding.capabilities.asynchronous_dispatch ? 0.03 : 0.0;
@@ -44,7 +44,7 @@ double workload_bias(const GpuToolkitVariant& variant, const GpuL0WorkloadTraits
     return bias;
 }
 
-std::string make_rationale(const GpuToolkitVariant& variant) {
+std::string make_rationale(const JakalToolkitVariant& variant) {
     std::string rationale = to_string(variant.binding.vendor);
     rationale += ":";
     rationale += to_string(variant.binding.backend);
@@ -61,21 +61,21 @@ std::string make_rationale(const GpuToolkitVariant& variant) {
 
 }  // namespace
 
-GpuToolkit::GpuToolkit() : adapters_(make_default_gpu_l0_adapters()) {}
+JakalToolkit::JakalToolkit() : adapters_(make_default_jakal_l0_adapters()) {}
 
-GpuToolkit::GpuToolkit(std::vector<std::unique_ptr<IGpuL0Adapter>> adapters)
+JakalToolkit::JakalToolkit(std::vector<std::unique_ptr<IJakalL0Adapter>> adapters)
     : adapters_(std::move(adapters)) {}
 
-std::vector<GpuToolkitVariant> GpuToolkit::rank_variants(
+std::vector<JakalToolkitVariant> JakalToolkit::rank_variants(
     const HardwareGraph& graph,
-    const GpuL0WorkloadTraits& workload) const {
-    std::vector<GpuToolkitVariant> variants;
+    const JakalL0WorkloadTraits& workload) const {
+    std::vector<JakalToolkitVariant> variants;
     for (const auto& adapter : adapters_) {
         if (!adapter->matches(graph)) {
             continue;
         }
 
-        GpuToolkitVariant variant;
+        JakalToolkitVariant variant;
         variant.binding = adapter->describe(graph);
         variant.tuning = adapter->suggest_tuning(graph, workload);
         variant.executable = variant.binding.capabilities.adapter_available;
@@ -87,7 +87,7 @@ std::vector<GpuToolkitVariant> GpuToolkit::rank_variants(
         variants.push_back(std::move(variant));
     }
 
-    std::sort(variants.begin(), variants.end(), [](const GpuToolkitVariant& left, const GpuToolkitVariant& right) {
+    std::sort(variants.begin(), variants.end(), [](const JakalToolkitVariant& left, const JakalToolkitVariant& right) {
         if (left.executable != right.executable) {
             return left.executable && !right.executable;
         }
@@ -99,9 +99,9 @@ std::vector<GpuToolkitVariant> GpuToolkit::rank_variants(
     return variants;
 }
 
-std::optional<GpuToolkitVariant> GpuToolkit::select_best(
+std::optional<JakalToolkitVariant> JakalToolkit::select_best(
     const HardwareGraph& graph,
-    const GpuL0WorkloadTraits& workload) const {
+    const JakalL0WorkloadTraits& workload) const {
     auto variants = rank_variants(graph, workload);
     if (variants.empty()) {
         return std::nullopt;
@@ -109,10 +109,10 @@ std::optional<GpuToolkitVariant> GpuToolkit::select_best(
     return variants.front();
 }
 
-std::vector<GpuToolkitIndexEntry> GpuToolkit::build_index(
+std::vector<JakalToolkitIndexEntry> JakalToolkit::build_index(
     const std::vector<HardwareGraph>& graphs,
-    const GpuL0WorkloadTraits& workload) const {
-    std::vector<GpuToolkitIndexEntry> index;
+    const JakalL0WorkloadTraits& workload) const {
+    std::vector<JakalToolkitIndexEntry> index;
     index.reserve(graphs.size());
     for (const auto& graph : graphs) {
         auto variants = rank_variants(graph, workload);
@@ -120,7 +120,7 @@ std::vector<GpuToolkitIndexEntry> GpuToolkit::build_index(
             continue;
         }
 
-        index.push_back(GpuToolkitIndexEntry{
+        index.push_back(JakalToolkitIndexEntry{
             graph.uid,
             structural_fingerprint(graph),
             std::move(variants)});
@@ -128,4 +128,5 @@ std::vector<GpuToolkitIndexEntry> GpuToolkit::build_index(
     return index;
 }
 
-}  // namespace gpu
+}  // namespace jakal
+

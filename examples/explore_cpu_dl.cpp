@@ -1,5 +1,5 @@
-#include "gpu/runtime.hpp"
-#include "gpu/workloads.hpp"
+#include "jakal/runtime.hpp"
+#include "jakal/workloads.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -42,11 +42,11 @@ double mib(const std::uint64_t bytes) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    gpu::RuntimeOptions options;
+    jakal::RuntimeOptions options;
     options.cache_path = unique_temp_file("gpu-cpu-dl-plan");
     options.execution_cache_path = unique_temp_file("gpu-cpu-dl-exec");
 
-    gpu::Runtime runtime(options);
+    jakal::Runtime runtime(options);
     bool execute_workloads = false;
     bool run_all = false;
     std::optional<std::string> selected_preset_name;
@@ -61,19 +61,19 @@ int main(int argc, char** argv) {
         }
     }
 
-    const auto presets = gpu::cpu_deep_learning_exploration_presets();
+    const auto presets = jakal::cpu_deep_learning_exploration_presets();
     if (presets.empty()) {
         std::cerr << "No CPU deep-learning exploration presets defined.\n";
         return 1;
     }
-    std::vector<gpu::CpuDeepLearningExplorationPreset> selected_presets;
+    std::vector<jakal::CpuDeepLearningExplorationPreset> selected_presets;
     if (run_all) {
         selected_presets = presets;
     } else if (selected_preset_name.has_value()) {
         const auto it = std::find_if(
             presets.begin(),
             presets.end(),
-            [&](const gpu::CpuDeepLearningExplorationPreset& preset) {
+            [&](const jakal::CpuDeepLearningExplorationPreset& preset) {
                 return preset.workload.name == *selected_preset_name ||
                        preset.workload.dataset_tag == *selected_preset_name;
             });
@@ -86,7 +86,7 @@ int main(int argc, char** argv) {
         const auto it = std::find_if(
             presets.begin(),
             presets.end(),
-            [](const gpu::CpuDeepLearningExplorationPreset& preset) {
+            [](const jakal::CpuDeepLearningExplorationPreset& preset) {
                 return preset.workload.dataset_tag == "llm-decode-token-lite";
             });
         selected_presets.push_back(it == presets.end() ? presets.front() : *it);
@@ -98,7 +98,7 @@ int main(int argc, char** argv) {
               << " preset_count=" << selected_presets.size() << '\n';
     std::cout << "Discovered devices\n";
     for (const auto& graph : runtime.devices()) {
-        const auto summary = gpu::summarize_graph(graph);
+        const auto summary = jakal::summarize_graph(graph);
         std::cout << "  - " << graph.uid
                   << " probe=" << graph.probe
                   << " name=" << graph.presentation_name
@@ -118,7 +118,7 @@ int main(int argc, char** argv) {
         std::size_t opencl_ops = 0;
         std::size_t mixed_ops = 0;
 
-        std::vector<gpu::OperationExecutionRecord> execution_records;
+        std::vector<jakal::OperationExecutionRecord> execution_records;
         if (execute_workloads) {
             const auto report = runtime.execute(preset.workload);
             if (!report.all_succeeded) {
@@ -139,7 +139,7 @@ int main(int argc, char** argv) {
                 optimization.operations.begin(),
                 optimization.operations.end(),
                 0.0,
-                [](const double total, const gpu::OperationOptimizationResult& operation) {
+                [](const double total, const jakal::OperationOptimizationResult& operation) {
                     return total + operation.graph.predicted_latency_us;
                 });
         }
@@ -148,26 +148,26 @@ int main(int argc, char** argv) {
             optimization.workload_graph.tensors.begin(),
             optimization.workload_graph.tensors.end(),
             std::uint64_t{0},
-            [](const std::uint64_t total, const gpu::WorkloadTensor& tensor) {
+            [](const std::uint64_t total, const jakal::WorkloadTensor& tensor) {
                 return total + (tensor.persistent ? tensor.bytes : 0ull);
             });
         const auto host_visible_bytes = std::accumulate(
             optimization.workload_graph.tensors.begin(),
             optimization.workload_graph.tensors.end(),
             std::uint64_t{0},
-            [](const std::uint64_t total, const gpu::WorkloadTensor& tensor) {
+            [](const std::uint64_t total, const jakal::WorkloadTensor& tensor) {
                 return total + (tensor.host_visible ? tensor.bytes : 0ull);
             });
         const auto total_transfer_bytes = std::accumulate(
             optimization.operations.begin(),
             optimization.operations.end(),
             std::uint64_t{0},
-            [](const std::uint64_t total, const gpu::OperationOptimizationResult& operation) {
+            [](const std::uint64_t total, const jakal::OperationOptimizationResult& operation) {
                 return total + std::accumulate(
                            operation.graph.transfer_schedule.begin(),
                            operation.graph.transfer_schedule.end(),
                            std::uint64_t{0},
-                           [](const std::uint64_t op_total, const gpu::TransferScheduleEntry& transfer) {
+                           [](const std::uint64_t op_total, const jakal::TransferScheduleEntry& transfer) {
                                return op_total + transfer.bytes;
                            });
             });
@@ -214,13 +214,13 @@ int main(int argc, char** argv) {
                 optimized.graph.transfer_schedule.begin(),
                 optimized.graph.transfer_schedule.end(),
                 std::uint64_t{0},
-                [](const std::uint64_t total, const gpu::TransferScheduleEntry& transfer) {
+                [](const std::uint64_t total, const jakal::TransferScheduleEntry& transfer) {
                     return total + transfer.bytes;
                 });
             std::cout << "    "
                       << optimized.operation.name
-                      << " class=" << gpu::to_string(optimized.operation.op_class)
-                      << " strategy=" << gpu::to_string(optimized.config.strategy)
+                      << " class=" << jakal::to_string(optimized.operation.op_class)
+                      << " strategy=" << jakal::to_string(optimized.config.strategy)
                       << " primary=" << optimized.config.primary_device_uid
                       << " devices=" << join_devices(optimized.config.participating_devices)
                       << " parts=" << optimized.config.logical_partitions
@@ -246,3 +246,4 @@ int main(int argc, char** argv) {
 
     return 0;
 }
+

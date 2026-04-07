@@ -1,11 +1,11 @@
 #pragma once
 
-#include "gpu/planner.hpp"
+#include "jakal/planner.hpp"
 
 #include <string>
 #include <vector>
 
-namespace gpu {
+namespace jakal {
 
 struct CanonicalWorkloadPreset {
     WorkloadSpec workload;
@@ -23,4 +23,5 @@ struct CpuDeepLearningExplorationPreset {
 [[nodiscard]] std::vector<CanonicalWorkloadPreset> canonical_workload_presets();
 [[nodiscard]] std::vector<CpuDeepLearningExplorationPreset> cpu_deep_learning_exploration_presets();
 
-}  // namespace gpu
+}  // namespace jakal
+

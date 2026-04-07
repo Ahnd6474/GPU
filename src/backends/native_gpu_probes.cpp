@@ -1,6 +1,6 @@
-#include "gpu/backend.hpp"
+#include "jakal/backend.hpp"
 
-#include "gpu/device.hpp"
+#include "jakal/device.hpp"
 
 #include <algorithm>
 #include <array>
@@ -17,7 +17,7 @@
 #include <dlfcn.h>
 #endif
 
-namespace gpu {
+namespace jakal {
 namespace {
 
 #if defined(_WIN32)
@@ -520,4 +520,5 @@ std::unique_ptr<IDeviceProbe> make_rocm_probe() {
     return std::make_unique<RocmProbe>();
 }
 
-}  // namespace gpu
+}  // namespace jakal
+

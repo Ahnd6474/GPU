@@ -1,16 +1,16 @@
 #pragma once
 
-#include "gpu/backend.hpp"
-#include "gpu/execution.hpp"
-#include "gpu/executor.hpp"
-#include "gpu/gpu_toolkit.hpp"
-#include "gpu/planner.hpp"
+#include "jakal/backend.hpp"
+#include "jakal/execution.hpp"
+#include "jakal/executor.hpp"
+#include "jakal/jakal_toolkit.hpp"
+#include "jakal/planner.hpp"
 
 #include <filesystem>
 #include <memory>
 #include <vector>
 
-namespace gpu {
+namespace jakal {
 
 struct RuntimeOptions {
     bool enable_host_probe = true;
@@ -29,7 +29,7 @@ public:
     void refresh_hardware();
 
     [[nodiscard]] const std::vector<HardwareGraph>& devices() const;
-    [[nodiscard]] const std::vector<GpuToolkitIndexEntry>& gpu_toolkit_index() const;
+    [[nodiscard]] const std::vector<JakalToolkitIndexEntry>& jakal_toolkit_index() const;
     [[nodiscard]] ExecutionPlan plan(const WorkloadSpec& workload);
     [[nodiscard]] OptimizationReport optimize(const WorkloadSpec& workload);
     [[nodiscard]] DirectExecutionReport execute(const WorkloadSpec& workload);
@@ -41,10 +41,11 @@ private:
     Planner planner_;
     ExecutionOptimizer execution_optimizer_;
     DirectExecutor direct_executor_;
-    GpuToolkit gpu_toolkit_;
+    JakalToolkit jakal_toolkit_;
     std::vector<std::unique_ptr<IDeviceProbe>> probes_;
     std::vector<HardwareGraph> devices_;
-    std::vector<GpuToolkitIndexEntry> gpu_toolkit_index_;
+    std::vector<JakalToolkitIndexEntry> jakal_toolkit_index_;
 };
 
-}  // namespace gpu
+}  // namespace jakal
+

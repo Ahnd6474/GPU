@@ -1,12 +1,12 @@
-#include "gpu/execution.hpp"
-#include "gpu/workloads.hpp"
+#include "jakal/execution.hpp"
+#include "jakal/workloads.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <unordered_map>
 #include <utility>
 
-namespace gpu {
+namespace jakal {
 namespace {
 
 constexpr std::uint64_t kKiB = 1024ull;
@@ -585,4 +585,4 @@ std::vector<OperationSpec> default_operation_suite(const WorkloadSpec& workload)
     return default_workload_graph(workload).operations;
 }
 
-}  // namespace gpu
+}  // namespace jakal

@@ -6,9 +6,9 @@
 extern "C" {
 #endif
 
-typedef struct gpu_runtime gpu_runtime_t;
+typedef struct jakal_core_runtime jakal_core_runtime_t;
 
-typedef struct gpu_device_info {
+typedef struct jakal_core_device_info {
     char uid[128];
     char probe[32];
     char presentation_name[128];
@@ -41,9 +41,9 @@ typedef struct gpu_device_info {
     int supports_fp16;
     int supports_bf16;
     int supports_int8;
-} gpu_device_info;
+} jakal_core_device_info;
 
-typedef struct gpu_graph_node_info {
+typedef struct jakal_core_graph_node_info {
     char id[128];
     char label[128];
     char parent_id[128];
@@ -74,9 +74,9 @@ typedef struct gpu_graph_node_info {
     int supports_fp16;
     int supports_bf16;
     int supports_int8;
-} gpu_graph_node_info;
+} jakal_core_graph_node_info;
 
-typedef struct gpu_graph_edge_info {
+typedef struct jakal_core_graph_edge_info {
     char source_id[128];
     char target_id[128];
     char semantics[32];
@@ -84,9 +84,9 @@ typedef struct gpu_graph_edge_info {
     double weight;
     double bandwidth_gbps;
     double latency_us;
-} gpu_graph_edge_info;
+} jakal_core_graph_edge_info;
 
-typedef struct gpu_workload_spec {
+typedef struct jakal_core_workload_spec {
     const char* name;
     const char* kind;
     unsigned long long working_set_bytes;
@@ -96,15 +96,15 @@ typedef struct gpu_workload_spec {
     int latency_sensitive;
     int prefer_unified_memory;
     int matrix_friendly;
-} gpu_workload_spec;
+} jakal_core_workload_spec;
 
-typedef struct gpu_plan_entry {
-    gpu_device_info device;
+typedef struct jakal_core_plan_entry {
+    jakal_core_device_info device;
     double ratio;
     double score;
-} gpu_plan_entry;
+} jakal_core_plan_entry;
 
-typedef struct gpu_optimization_info {
+typedef struct jakal_core_optimization_info {
     char signature[128];
     char workload_kind[32];
     char dataset_tag[128];
@@ -115,9 +115,9 @@ typedef struct gpu_optimization_info {
     double stability_score;
     double sustained_slowdown;
     int loaded_from_cache;
-} gpu_optimization_info;
+} jakal_core_optimization_info;
 
-typedef struct gpu_operation_optimization_info {
+typedef struct jakal_core_operation_optimization_info {
     char operation_name[128];
     char strategy[32];
     char primary_device_uid[128];
@@ -130,18 +130,18 @@ typedef struct gpu_operation_optimization_info {
     unsigned long long peak_resident_bytes;
     double target_error_tolerance;
     int use_low_precision;
-} gpu_operation_optimization_info;
+} jakal_core_operation_optimization_info;
 
-typedef struct gpu_execution_info {
+typedef struct jakal_core_execution_info {
     char signature[128];
     unsigned long long operation_count;
     double total_runtime_us;
     double total_reference_runtime_us;
     double speedup_vs_reference;
     int all_succeeded;
-} gpu_execution_info;
+} jakal_core_execution_info;
 
-typedef struct gpu_execution_operation_info {
+typedef struct jakal_core_execution_operation_info {
     char operation_name[128];
     char backend_name[64];
     char requested_gpu_vendor[32];
@@ -155,47 +155,48 @@ typedef struct gpu_execution_operation_info {
     int used_opencl;
     int used_multiple_devices;
     unsigned int logical_partitions_used;
-} gpu_execution_operation_info;
+} jakal_core_execution_operation_info;
 
-gpu_runtime_t* gpu_runtime_create(void);
-void gpu_runtime_destroy(gpu_runtime_t* runtime);
-int gpu_runtime_refresh(gpu_runtime_t* runtime);
-size_t gpu_runtime_device_count(const gpu_runtime_t* runtime);
-int gpu_runtime_get_device(const gpu_runtime_t* runtime, size_t index, gpu_device_info* out_device);
-size_t gpu_runtime_graph_node_count(const gpu_runtime_t* runtime, size_t device_index);
-int gpu_runtime_get_graph_node(
-    const gpu_runtime_t* runtime,
+jakal_core_runtime_t* jakal_core_runtime_create(void);
+void jakal_core_runtime_destroy(jakal_core_runtime_t* runtime);
+int jakal_core_runtime_refresh(jakal_core_runtime_t* runtime);
+size_t jakal_core_runtime_device_count(const jakal_core_runtime_t* runtime);
+int jakal_core_runtime_get_device(const jakal_core_runtime_t* runtime, size_t index, jakal_core_device_info* out_device);
+size_t jakal_core_runtime_graph_node_count(const jakal_core_runtime_t* runtime, size_t device_index);
+int jakal_core_runtime_get_graph_node(
+    const jakal_core_runtime_t* runtime,
     size_t device_index,
     size_t node_index,
-    gpu_graph_node_info* out_node);
-size_t gpu_runtime_graph_edge_count(const gpu_runtime_t* runtime, size_t device_index);
-int gpu_runtime_get_graph_edge(
-    const gpu_runtime_t* runtime,
+    jakal_core_graph_node_info* out_node);
+size_t jakal_core_runtime_graph_edge_count(const jakal_core_runtime_t* runtime, size_t device_index);
+int jakal_core_runtime_get_graph_edge(
+    const jakal_core_runtime_t* runtime,
     size_t device_index,
     size_t edge_index,
-    gpu_graph_edge_info* out_edge);
-int gpu_runtime_plan(
-    gpu_runtime_t* runtime,
-    const gpu_workload_spec* workload,
-    gpu_plan_entry* entries,
+    jakal_core_graph_edge_info* out_edge);
+int jakal_core_runtime_plan(
+    jakal_core_runtime_t* runtime,
+    const jakal_core_workload_spec* workload,
+    jakal_core_plan_entry* entries,
     size_t capacity,
     size_t* out_count,
     int* out_loaded_from_cache);
-int gpu_runtime_optimize(
-    gpu_runtime_t* runtime,
-    const gpu_workload_spec* workload,
-    gpu_optimization_info* out_optimization,
-    gpu_operation_optimization_info* operations,
+int jakal_core_runtime_optimize(
+    jakal_core_runtime_t* runtime,
+    const jakal_core_workload_spec* workload,
+    jakal_core_optimization_info* out_optimization,
+    jakal_core_operation_optimization_info* operations,
     size_t capacity,
     size_t* out_count);
-int gpu_runtime_execute(
-    gpu_runtime_t* runtime,
-    const gpu_workload_spec* workload,
-    gpu_execution_info* out_execution,
-    gpu_execution_operation_info* operations,
+int jakal_core_runtime_execute(
+    jakal_core_runtime_t* runtime,
+    const jakal_core_workload_spec* workload,
+    jakal_core_execution_info* out_execution,
+    jakal_core_execution_operation_info* operations,
     size_t capacity,
     size_t* out_count);
 
 #ifdef __cplusplus
 }
 #endif
+

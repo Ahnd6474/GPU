@@ -1,6 +1,6 @@
 #pragma once
 
-#include "gpu/planner.hpp"
+#include "jakal/planner.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -8,7 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace gpu {
+namespace jakal {
 
 enum class OperationClass {
     elementwise_map,
@@ -351,4 +351,5 @@ private:
 [[nodiscard]] std::vector<OperationSpec> default_operation_suite(const WorkloadSpec& workload);
 [[nodiscard]] WorkloadGraph default_workload_graph(const WorkloadSpec& workload);
 
-}  // namespace gpu
+}  // namespace jakal
+

@@ -1,4 +1,4 @@
-#include "gpu/planner.hpp"
+#include "jakal/planner.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -10,7 +10,7 @@
 #include <unordered_map>
 #include <utility>
 
-namespace gpu {
+namespace jakal {
 namespace {
 
 constexpr double kMinShardRatio = 0.05;
@@ -224,9 +224,9 @@ Planner::Planner(std::filesystem::path cache_path)
 
 std::filesystem::path Planner::default_cache_path() {
     try {
-        return std::filesystem::temp_directory_path() / "gpu_runtime_plan_cache.tsv";
+        return std::filesystem::temp_directory_path() / "jakal_core_plan_cache.tsv";
     } catch (const std::exception&) {
-        return std::filesystem::path("gpu_runtime_plan_cache.tsv");
+        return std::filesystem::path("jakal_core_plan_cache.tsv");
     }
 }
 
@@ -444,4 +444,5 @@ void Planner::persist_cache() const {
     }
 }
 
-}  // namespace gpu
+}  // namespace jakal
+

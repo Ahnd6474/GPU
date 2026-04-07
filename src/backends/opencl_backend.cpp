@@ -1,4 +1,4 @@
-#include "gpu/backend.hpp"
+#include "jakal/backend.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -14,7 +14,7 @@
 #include <dlfcn.h>
 #endif
 
-namespace gpu {
+namespace jakal {
 namespace {
 
 #if defined(_WIN32)
@@ -578,4 +578,5 @@ std::unique_ptr<IDeviceProbe> make_opencl_probe() {
     return std::make_unique<OpenClProbe>();
 }
 
-}  // namespace gpu
+}  // namespace jakal
+

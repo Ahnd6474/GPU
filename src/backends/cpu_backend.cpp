@@ -1,4 +1,4 @@
-#include "gpu/backend.hpp"
+#include "jakal/backend.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -22,7 +22,7 @@
 #include <cpuid.h>
 #endif
 
-namespace gpu {
+namespace jakal {
 namespace {
 
 struct HostStructuralSeed {
@@ -337,4 +337,5 @@ std::unique_ptr<IDeviceProbe> make_host_probe() {
     return std::make_unique<HostProbe>();
 }
 
-}  // namespace gpu
+}  // namespace jakal
+

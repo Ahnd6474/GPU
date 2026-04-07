@@ -1,6 +1,6 @@
-#include "gpu/executors/native_gpu_backend.hpp"
+#include "jakal/executors/native_gpu_backend.hpp"
 
-#include "gpu/executors/direct_backends.hpp"
+#include "jakal/executors/direct_backends.hpp"
 
 #include <algorithm>
 #include <array>
@@ -9,9 +9,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -24,12 +27,64 @@
 #include <dlfcn.h>
 #endif
 
-namespace gpu::executors {
+namespace jakal::executors {
 namespace {
 
 #if defined(_WIN32)
 using LibraryHandle = HMODULE;
 LibraryHandle load_library(const char* name) { return LoadLibraryA(name); }
+std::optional<std::string> env_value(const char* name) {
+    char* buffer = nullptr;
+    std::size_t length = 0;
+    if (_dupenv_s(&buffer, &length, name) != 0 || buffer == nullptr || length <= 1) {
+        std::free(buffer);
+        return std::nullopt;
+    }
+    std::string value(buffer);
+    std::free(buffer);
+    return value;
+}
+std::vector<std::filesystem::path> candidate_cuda_binary_dirs() {
+    std::vector<std::filesystem::path> paths;
+    if (const auto cuda_path = env_value("CUDA_PATH")) {
+        paths.emplace_back(*cuda_path);
+    }
+    if (const auto cuda_path = env_value("CUDA_PATH_V13_2")) {
+        paths.emplace_back(*cuda_path);
+    }
+    paths.emplace_back("C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.2");
+    paths.emplace_back("D:\\");
+
+    std::vector<std::filesystem::path> binary_dirs;
+    binary_dirs.reserve(paths.size() * 2u);
+    for (const auto& root : paths) {
+        if (root.empty()) {
+            continue;
+        }
+        binary_dirs.push_back(root / "bin");
+        binary_dirs.push_back(root / "bin" / "x64");
+    }
+    binary_dirs.push_back("D:\\bin");
+    binary_dirs.push_back("D:\\bin\\x64");
+    return binary_dirs;
+}
+LibraryHandle load_library_with_fallbacks(std::initializer_list<const char*> names) {
+    for (const char* name : names) {
+        if (LibraryHandle handle = load_library(name); handle != nullptr) {
+            return handle;
+        }
+        for (const auto& directory : candidate_cuda_binary_dirs()) {
+            const auto candidate = directory / name;
+            if (!std::filesystem::exists(candidate)) {
+                continue;
+            }
+            if (LibraryHandle handle = LoadLibraryA(candidate.string().c_str()); handle != nullptr) {
+                return handle;
+            }
+        }
+    }
+    return nullptr;
+}
 void* load_symbol(LibraryHandle library, const char* name) {
     return reinterpret_cast<void*>(GetProcAddress(library, name));
 }
@@ -64,6 +119,60 @@ T round_up(const T value, const T alignment) {
 
 constexpr std::uint32_t kNativeTileSize = 16u;
 constexpr std::uint32_t kNativeReductionGroupSize = 256u;
+
+std::vector<std::filesystem::path> candidate_ocloc_paths() {
+    std::vector<std::filesystem::path> paths;
+#if defined(_WIN32)
+    paths.emplace_back("C:\\Program Files (x86)\\Intel\\oneAPI\\2025.1\\bin\\ocloc.exe");
+    paths.emplace_back("C:\\Program Files (x86)\\Intel\\oneAPI\\ocloc\\2025.1\\bin\\ocloc.exe");
+    paths.emplace_back("C:\\Program Files (x86)\\Intel\\oneAPI\\latest\\bin\\ocloc.exe");
+#else
+    paths.emplace_back("/opt/intel/oneapi/compiler/latest/bin/ocloc");
+#endif
+    return paths;
+}
+
+std::optional<std::filesystem::path> locate_ocloc() {
+    for (const auto& path : candidate_ocloc_paths()) {
+        std::error_code error;
+        if (std::filesystem::exists(path, error)) {
+            return path;
+        }
+    }
+    return std::nullopt;
+}
+
+bool write_text_file(const std::filesystem::path& path, const std::string& text) {
+    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+    if (!stream) {
+        return false;
+    }
+    stream.write(text.data(), static_cast<std::streamsize>(text.size()));
+    return stream.good();
+}
+
+std::vector<std::uint8_t> read_binary_file(const std::filesystem::path& path) {
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) {
+        return {};
+    }
+    stream.seekg(0, std::ios::end);
+    const auto size = stream.tellg();
+    if (size <= 0) {
+        return {};
+    }
+    stream.seekg(0, std::ios::beg);
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
+    stream.read(reinterpret_cast<char*>(bytes.data()), size);
+    if (!stream.good() && !stream.eof()) {
+        return {};
+    }
+    return bytes;
+}
+
+int run_command(const std::string& command) {
+    return std::system(command.c_str());
+}
 
 constexpr const char* kCudaLikeProgramSource = R"GPU(
 extern "C" __device__ __forceinline__ float q(float value, int low_precision) {
@@ -170,8 +279,15 @@ __kernel void matmul_tiled(__global const float* lhs,__global const float* rhs,_
 }
 __kernel void conv3x3_valid(__global const float* input,__global float* output,uint height,uint width,int low_precision) {
   uint x = get_global_id(0); uint y = get_global_id(1); uint out_width = width - 2u; uint out_height = height - 2u; if (x >= out_width || y >= out_height) return;
-  const float kernel[9] = {0.0625f,0.125f,0.0625f,0.125f,0.25f,0.125f,0.0625f,0.125f,0.0625f}; float acc = 0.0f;
-  for (uint ky = 0; ky < 3; ++ky) for (uint kx = 0; kx < 3; ++kx) acc = q(acc + q(input[(y + ky) * width + (x + kx)], low_precision) * kernel[ky * 3u + kx], low_precision);
+  float acc = 0.0f;
+  for (uint ky = 0; ky < 3; ++ky) {
+    for (uint kx = 0; kx < 3; ++kx) {
+      float weight = 0.125f;
+      if ((ky == 1u) && (kx == 1u)) weight = 0.25f;
+      else if ((ky != 1u) && (kx != 1u)) weight = 0.0625f;
+      acc = q(acc + q(input[(y + ky) * width + (x + kx)], low_precision) * weight, low_precision);
+    }
+  }
   output[y * out_width + x] = acc;
 }
 __kernel void bilinear_resample(__global const float* input,__global float* output,uint src_h,uint src_w,uint dst_h,uint dst_w,uint dst_y_offset,uint shard_rows,int low_precision) {
@@ -188,7 +304,7 @@ __kernel void bilinear_resample(__global const float* input,__global float* outp
 
 class NativeKernelBackendBase : public IKernelBackend {
 public:
-    NativeKernelBackendBase(const GpuBackendKind backend, std::string probe_name)
+    NativeKernelBackendBase(const JakalBackendKind backend, std::string probe_name)
         : backend_(backend),
           probe_name_(std::move(probe_name)),
           host_(make_host_kernel_backend()) {}
@@ -241,14 +357,14 @@ protected:
     virtual BackendRunResult run_conv3x3_native(const HardwareGraph&, std::span<const float>, std::uint32_t, std::uint32_t, bool) const = 0;
     virtual BackendRunResult run_resample_native(const HardwareGraph&, std::span<const float>, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, bool) const = 0;
 
-    GpuBackendKind backend_;
+    JakalBackendKind backend_;
     std::string probe_name_;
     std::unique_ptr<IKernelBackend> host_;
 };
 
 class FallbackNativeBackend final : public NativeKernelBackendBase {
 public:
-    FallbackNativeBackend(const GpuBackendKind backend, std::string probe_name)
+    FallbackNativeBackend(const JakalBackendKind backend, std::string probe_name)
         : NativeKernelBackendBase(backend, std::move(probe_name)) {}
 
 private:
@@ -262,7 +378,7 @@ private:
 class CudaNativeBackend final : public NativeKernelBackendBase {
 public:
     CudaNativeBackend()
-        : NativeKernelBackendBase(GpuBackendKind::cuda, "cuda") {}
+        : NativeKernelBackendBase(JakalBackendKind::cuda, "cuda") {}
 
 private:
     using cu_result_t = int;
@@ -324,11 +440,14 @@ private:
         Api() {
 #if defined(_WIN32)
             driver_library = load_library("nvcuda.dll");
-            nvrtc_library = load_library("nvrtc64_125_0.dll");
-            if (nvrtc_library == nullptr) nvrtc_library = load_library("nvrtc64_124_0.dll");
-            if (nvrtc_library == nullptr) nvrtc_library = load_library("nvrtc64_122_0.dll");
-            if (nvrtc_library == nullptr) nvrtc_library = load_library("nvrtc64_121_0.dll");
-            if (nvrtc_library == nullptr) nvrtc_library = load_library("nvrtc64_120_0.dll");
+            nvrtc_library = load_library_with_fallbacks({
+                "nvrtc64_130_0.dll",
+                "nvrtc64_125_0.dll",
+                "nvrtc64_124_0.dll",
+                "nvrtc64_122_0.dll",
+                "nvrtc64_121_0.dll",
+                "nvrtc64_120_0.dll",
+            });
 #else
             driver_library = load_library("libcuda.so");
             if (driver_library == nullptr) driver_library = load_library("libcuda.so.1");
@@ -586,7 +705,7 @@ private:
 class LevelZeroNativeBackend final : public NativeKernelBackendBase {
 public:
     LevelZeroNativeBackend()
-        : NativeKernelBackendBase(GpuBackendKind::level_zero, "level-zero") {}
+        : NativeKernelBackendBase(JakalBackendKind::level_zero, "level-zero") {}
 
 private:
     using ze_result_t = std::int32_t;
@@ -771,6 +890,34 @@ private:
     BinaryBlob compile_binary() const {
         std::scoped_lock lock(binary_mutex_);
         if (!cached_binary_.bytes.empty()) return cached_binary_;
+        if (const auto ocloc = locate_ocloc(); ocloc.has_value()) {
+            const auto temp_dir = std::filesystem::temp_directory_path() / "jakal-level-zero-ocloc";
+            std::error_code ignore_error;
+            std::filesystem::create_directories(temp_dir, ignore_error);
+            const auto source_path = temp_dir / "jakal_level_zero_native.cl";
+            const std::string output_name = "jakal_level_zero_native";
+            const auto output_bin = temp_dir / "jakal_level_zero_native.bin";
+            if (write_text_file(source_path, kOpenClProgramSource)) {
+                std::string command =
+#if defined(_WIN32)
+                    "powershell -NoProfile -Command \"& '" + ocloc->string() + "' compile -file '" + source_path.string() +
+                    "' -device adl-p --format zebin -output_no_suffix -output '" + output_name +
+                    "' -out_dir '" + temp_dir.string() + "'\"";
+#else
+                    "\"" + ocloc->string() + "\" compile -file \"" + source_path.string() +
+                    "\" -device adl-p --format zebin -output_no_suffix -output \"" + output_name +
+                    "\" -out_dir \"" + temp_dir.string() + "\"";
+#endif
+                if (run_command(command) == 0) {
+                    const auto bytes = read_binary_file(output_bin);
+                    if (!bytes.empty()) {
+                        cached_binary_.bytes = bytes;
+                        cached_binary_.format = ZE_MODULE_FORMAT_NATIVE;
+                        return cached_binary_;
+                    }
+                }
+            }
+        }
         if (!opencl_api().ready) return {};
         cl_uint platform_count = 0;
         if (opencl_api().get_platform_ids(0, nullptr, &platform_count) != CL_SUCCESS || platform_count == 0) return {};
@@ -947,7 +1094,7 @@ private:
 class RocmNativeBackend final : public NativeKernelBackendBase {
 public:
     RocmNativeBackend()
-        : NativeKernelBackendBase(GpuBackendKind::rocm, "rocm") {}
+        : NativeKernelBackendBase(JakalBackendKind::rocm, "rocm") {}
 
 private:
     using hip_result_t = int;
@@ -1183,20 +1330,21 @@ private:
 
 }  // namespace
 
-std::unique_ptr<IKernelBackend> make_native_gpu_kernel_backend(const GpuBackendKind backend) {
+std::unique_ptr<IKernelBackend> make_native_gpu_kernel_backend(const JakalBackendKind backend) {
     switch (backend) {
-    case GpuBackendKind::cuda:
+    case JakalBackendKind::cuda:
         return std::make_unique<CudaNativeBackend>();
-    case GpuBackendKind::level_zero:
+    case JakalBackendKind::level_zero:
         return std::make_unique<LevelZeroNativeBackend>();
-    case GpuBackendKind::rocm:
+    case JakalBackendKind::rocm:
         return std::make_unique<RocmNativeBackend>();
-    case GpuBackendKind::vulkan_compute:
+    case JakalBackendKind::vulkan_compute:
         return std::make_unique<FallbackNativeBackend>(backend, "vulkan");
-    case GpuBackendKind::opencl:
+    case JakalBackendKind::opencl:
     default:
         return std::make_unique<FallbackNativeBackend>(backend, "opencl");
     }
 }
 
-}  // namespace gpu::executors
+}  // namespace jakal::executors
+

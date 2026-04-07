@@ -1,5 +1,5 @@
-#include "gpu/runtime.hpp"
-#include "gpu/workloads.hpp"
+#include "jakal/runtime.hpp"
+#include "jakal/workloads.hpp"
 
 #include <chrono>
 #include <filesystem>
@@ -25,16 +25,16 @@ double measure_ms(const auto& func) {
 }  // namespace
 
 int main() {
-    gpu::RuntimeOptions options;
+    jakal::RuntimeOptions options;
     options.enable_opencl_probe = false;
     options.cache_path = unique_temp_file("gpu-compare-plan");
     options.execution_cache_path = unique_temp_file("gpu-compare-exec");
 
-    gpu::Runtime runtime(options);
-    const std::vector<gpu::WorkloadSpec> workloads{
-        gpu::WorkloadSpec{
+    jakal::Runtime runtime(options);
+    const std::vector<jakal::WorkloadSpec> workloads{
+        jakal::WorkloadSpec{
             "host-gaming-lite",
-            gpu::WorkloadKind::gaming,
+            jakal::WorkloadKind::gaming,
             "",
             192ull * 1024ull * 1024ull,
             24ull * 1024ull * 1024ull,
@@ -43,9 +43,9 @@ int main() {
             true,
             true,
             false},
-        gpu::WorkloadSpec{
+        jakal::WorkloadSpec{
             "host-inference-lite",
-            gpu::WorkloadKind::inference,
+            jakal::WorkloadKind::inference,
             "",
             256ull * 1024ull * 1024ull,
             32ull * 1024ull * 1024ull,
@@ -54,9 +54,9 @@ int main() {
             false,
             false,
             true},
-        gpu::WorkloadSpec{
+        jakal::WorkloadSpec{
             "host-training-lite",
-            gpu::WorkloadKind::training,
+            jakal::WorkloadKind::training,
             "",
             320ull * 1024ull * 1024ull,
             48ull * 1024ull * 1024ull,
@@ -69,7 +69,7 @@ int main() {
     std::cout << std::fixed << std::setprecision(3);
     std::cout << "profile\tpass\tkind\tops\twarm_ms\ttotal_runtime_us\treference_us\tspeedup\treadiness\tstability\n";
     for (const auto& workload : workloads) {
-        gpu::DirectExecutionReport cold;
+        jakal::DirectExecutionReport cold;
         const auto cold_ms = measure_ms([&]() {
             cold = runtime.execute(workload);
         });
@@ -78,7 +78,7 @@ int main() {
             return 1;
         }
 
-        gpu::DirectExecutionReport warm;
+        jakal::DirectExecutionReport warm;
         const auto warm_ms = measure_ms([&]() {
             warm = runtime.execute(workload);
         });
@@ -89,7 +89,7 @@ int main() {
 
         std::cout << workload.name
                   << "\tcold"
-                  << '\t' << gpu::to_string(workload.kind)
+                  << '\t' << jakal::to_string(workload.kind)
                   << '\t' << cold.operations.size()
                   << '\t' << cold_ms
                   << '\t' << cold.total_runtime_us
@@ -101,7 +101,7 @@ int main() {
 
         std::cout << workload.name
                   << "\twarm"
-                  << '\t' << gpu::to_string(workload.kind)
+                  << '\t' << jakal::to_string(workload.kind)
                   << '\t' << warm.operations.size()
                   << '\t' << warm_ms
                   << '\t' << warm.total_runtime_us
@@ -114,3 +114,4 @@ int main() {
 
     return 0;
 }
+

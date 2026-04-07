@@ -1,5 +1,5 @@
-#include "gpu/runtime.hpp"
-#include "gpu/workloads.hpp"
+#include "jakal/runtime.hpp"
+#include "jakal/workloads.hpp"
 
 #include <chrono>
 #include <filesystem>
@@ -9,13 +9,13 @@
 
 int main() {
     const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
-    gpu::RuntimeOptions options;
+    jakal::RuntimeOptions options;
     options.cache_path = std::filesystem::temp_directory_path() /
                          ("gpu-profile-plan-" + std::to_string(nonce) + ".tsv");
     options.execution_cache_path = std::filesystem::temp_directory_path() /
                                    ("gpu-profile-exec-" + std::to_string(nonce) + ".tsv");
-    gpu::Runtime runtime(options);
-    const auto presets = gpu::canonical_workload_presets();
+    jakal::Runtime runtime(options);
+    const auto presets = jakal::canonical_workload_presets();
 
     if (presets.empty()) {
         std::cerr << "No canonical workloads defined.\n";
@@ -50,7 +50,7 @@ int main() {
         std::cout << '\n'
                   << preset.workload.name
                   << " [" << preset.workload.dataset_tag << "]"
-                  << "\n  kind=" << gpu::to_string(preset.workload.kind)
+                  << "\n  kind=" << jakal::to_string(preset.workload.kind)
                   << " ops=" << warm_report.operations.size()
                   << "\n  pass0=" << std::fixed << std::setprecision(3) << report.total_runtime_us << "us"
                   << " readiness0=" << report.optimization.system_profile.readiness_score
@@ -86,3 +86,4 @@ int main() {
 
     return 0;
 }
+

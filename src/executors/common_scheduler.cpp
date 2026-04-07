@@ -1,10 +1,10 @@
-#include "gpu/executors/scheduler.hpp"
+#include "jakal/executors/scheduler.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <unordered_map>
 
-namespace gpu::executors {
+namespace jakal::executors {
 
 std::vector<DeviceAssignment> DefaultIntraDeviceScheduler::make_assignments(
     const OptimizationReport& optimization,
@@ -94,4 +94,5 @@ std::vector<DeviceAssignment> DefaultIntraDeviceScheduler::make_assignments(
     return assignments;
 }
 
-}  // namespace gpu::executors
+}  // namespace jakal::executors
+

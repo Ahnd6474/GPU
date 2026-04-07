@@ -1,7 +1,7 @@
-#include "gpu/c_api.h"
-#include "gpu/device.hpp"
-#include "gpu/runtime.hpp"
-#include "gpu/workloads.hpp"
+#include "jakal/c_api.h"
+#include "jakal/device.hpp"
+#include "jakal/runtime.hpp"
+#include "jakal/workloads.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -17,42 +17,42 @@ std::filesystem::path unique_temp_file(const std::string& stem) {
            (stem + "-" + std::to_string(nonce) + ".tsv");
 }
 
-gpu::HardwareGraph make_manual_gpu_graph(
+jakal::HardwareGraph make_manual_gpu_graph(
     const std::string& uid,
     const std::string& presentation_name,
     const bool unified_memory) {
-    gpu::HardwareGraph graph;
+    jakal::HardwareGraph graph;
     graph.uid = uid;
     graph.probe = "opencl";
     graph.presentation_name = presentation_name;
 
-    graph.nodes.push_back({"root", "root", "", gpu::HardwareObjectDomain::control, gpu::HardwareObjectRole::root});
-    graph.nodes.push_back({"queue", "queue", "root", gpu::HardwareObjectDomain::control, gpu::HardwareObjectRole::queue});
+    graph.nodes.push_back({"root", "root", "", jakal::HardwareObjectDomain::control, jakal::HardwareObjectRole::root});
+    graph.nodes.push_back({"queue", "queue", "root", jakal::HardwareObjectDomain::control, jakal::HardwareObjectRole::queue});
     graph.nodes.back().control.supports_asynchronous_dispatch = true;
-    graph.nodes.push_back({"cluster", "cluster", "root", gpu::HardwareObjectDomain::compute, gpu::HardwareObjectRole::cluster});
+    graph.nodes.push_back({"cluster", "cluster", "root", jakal::HardwareObjectDomain::compute, jakal::HardwareObjectRole::cluster});
     graph.nodes.back().compute.execution_width = 128;
     graph.nodes.back().compute.clock_mhz = 1800;
     graph.nodes.back().compute.matrix_engines = 16;
     graph.nodes.back().compute.supports_fp16 = true;
     graph.nodes.back().compute.supports_int8 = true;
-    graph.nodes.push_back({"memory", "memory", "root", gpu::HardwareObjectDomain::storage, gpu::HardwareObjectRole::global_memory});
+    graph.nodes.push_back({"memory", "memory", "root", jakal::HardwareObjectDomain::storage, jakal::HardwareObjectRole::global_memory});
     graph.nodes.back().storage.capacity_bytes = 8ull * 1024ull * 1024ull * 1024ull;
     graph.nodes.back().storage.unified_address_space = unified_memory;
     graph.nodes.back().storage.coherent_with_host = unified_memory;
     graph.nodes.back().storage.shared_host_bytes = unified_memory ? graph.nodes.back().storage.capacity_bytes : 0ull;
-    graph.nodes.push_back({"host-link", "host-link", "root", gpu::HardwareObjectDomain::transfer, gpu::HardwareObjectRole::transfer_link});
+    graph.nodes.push_back({"host-link", "host-link", "root", jakal::HardwareObjectDomain::transfer, jakal::HardwareObjectRole::transfer_link});
     graph.nodes.back().transfer.read_bandwidth_gbps = 96.0;
     graph.nodes.back().transfer.write_bandwidth_gbps = 96.0;
     graph.nodes.back().transfer.dispatch_latency_us = 6.0;
     graph.nodes.back().transfer.synchronization_latency_us = 5.0;
 
-    graph.edges.push_back({"root", "queue", gpu::GraphEdgeSemantics::contains, true});
-    graph.edges.push_back({"root", "cluster", gpu::GraphEdgeSemantics::contains, true});
-    graph.edges.push_back({"root", "memory", gpu::GraphEdgeSemantics::contains, true});
-    graph.edges.push_back({"root", "host-link", gpu::GraphEdgeSemantics::contains, true});
-    graph.edges.push_back({"queue", "cluster", gpu::GraphEdgeSemantics::dispatches, true, 1.0, 0.0, 6.0});
-    graph.edges.push_back({"host-link", "memory", gpu::GraphEdgeSemantics::transfers_to, true, 1.0, 96.0, 5.0});
-    gpu::materialize_graph_costs(graph);
+    graph.edges.push_back({"root", "queue", jakal::GraphEdgeSemantics::contains, true});
+    graph.edges.push_back({"root", "cluster", jakal::GraphEdgeSemantics::contains, true});
+    graph.edges.push_back({"root", "memory", jakal::GraphEdgeSemantics::contains, true});
+    graph.edges.push_back({"root", "host-link", jakal::GraphEdgeSemantics::contains, true});
+    graph.edges.push_back({"queue", "cluster", jakal::GraphEdgeSemantics::dispatches, true, 1.0, 0.0, 6.0});
+    graph.edges.push_back({"host-link", "memory", jakal::GraphEdgeSemantics::transfers_to, true, 1.0, 96.0, 5.0});
+    jakal::materialize_graph_costs(graph);
     return graph;
 }
 
@@ -61,15 +61,15 @@ bool verify_auto_accelerator_data_parallel() {
     const auto amd = make_manual_gpu_graph("opencl:amd:0", "AMD Radeon RX 7900", false);
     const auto nvidia = make_manual_gpu_graph("opencl:nvidia:0", "NVIDIA RTX 4090", false);
 
-    gpu::ExecutionPlan placement;
+    jakal::ExecutionPlan placement;
     placement.signature = "ddp-smoke";
     placement.allocations.push_back({intel, 0.34, 2.0});
     placement.allocations.push_back({amd, 0.33, 1.9});
     placement.allocations.push_back({nvidia, 0.33, 2.1});
 
-    gpu::WorkloadSpec workload{
+    jakal::WorkloadSpec workload{
         "ddp-smoke",
-        gpu::WorkloadKind::custom,
+        jakal::WorkloadKind::custom,
         "",
         64ull * 1024ull * 1024ull,
         16ull * 1024ull * 1024ull,
@@ -79,14 +79,14 @@ bool verify_auto_accelerator_data_parallel() {
         false,
         true};
 
-    gpu::ExecutionOptimizer optimizer(unique_temp_file("gpu-ddp-smoke"));
+    jakal::ExecutionOptimizer optimizer(unique_temp_file("gpu-ddp-smoke"));
     const auto report = optimizer.optimize(workload, placement, {intel, amd, nvidia});
     const bool success = std::any_of(
         report.operations.begin(),
         report.operations.end(),
-        [](const gpu::OperationOptimizationResult& result) {
-            return result.operation.op_class == gpu::OperationClass::matmul &&
-                   result.config.strategy == gpu::ExecutionStrategy::sharded &&
+        [](const jakal::OperationOptimizationResult& result) {
+            return result.operation.op_class == jakal::OperationClass::matmul &&
+                   result.config.strategy == jakal::ExecutionStrategy::sharded &&
                    result.config.participating_devices.size() == 3 &&
                    std::find(result.config.participating_devices.begin(), result.config.participating_devices.end(), "host:0") ==
                        result.config.participating_devices.end();
@@ -94,8 +94,8 @@ bool verify_auto_accelerator_data_parallel() {
     if (!success) {
         for (const auto& result : report.operations) {
             std::cerr << "DDP debug op=" << result.operation.name
-                      << " class=" << gpu::to_string(result.operation.op_class)
-                      << " strategy=" << gpu::to_string(result.config.strategy)
+                      << " class=" << jakal::to_string(result.operation.op_class)
+                      << " strategy=" << jakal::to_string(result.config.strategy)
                       << " primary=" << result.config.primary_device_uid
                       << " devices=" << result.config.participating_devices.size()
                       << '\n';
@@ -107,9 +107,9 @@ bool verify_auto_accelerator_data_parallel() {
 }  // namespace
 
 int main() {
-    gpu::RuntimeOptions options;
+    jakal::RuntimeOptions options;
     options.enable_opencl_probe = false;
-    gpu::Runtime runtime(options);
+    jakal::Runtime runtime(options);
 
     if (runtime.devices().empty()) {
         std::cerr << "No hardware graphs discovered.\n";
@@ -127,9 +127,9 @@ int main() {
         }
     }
 
-    const gpu::WorkloadSpec workload{
+    const jakal::WorkloadSpec workload{
         "smoke",
-        gpu::WorkloadKind::tensor,
+        jakal::WorkloadKind::tensor,
         "",
         128ull * 1024ull * 1024ull,
         64ull * 1024ull * 1024ull,
@@ -163,13 +163,13 @@ int main() {
         }
     }
 
-    const auto cpu_dl_presets = gpu::cpu_deep_learning_exploration_presets();
+    const auto cpu_dl_presets = jakal::cpu_deep_learning_exploration_presets();
     if (cpu_dl_presets.size() < 3) {
         std::cerr << "CPU deep-learning presets missing.\n";
         return 1;
     }
     for (const auto& preset : cpu_dl_presets) {
-        const auto graph = gpu::default_workload_graph(preset.workload);
+        const auto graph = jakal::default_workload_graph(preset.workload);
         if (graph.operations.empty() || graph.tensors.empty() || graph.signature.empty()) {
             std::cerr << "CPU deep-learning workload graph missing metadata.\n";
             return 1;
@@ -178,7 +178,7 @@ int main() {
     const auto decode_it = std::find_if(
         cpu_dl_presets.begin(),
         cpu_dl_presets.end(),
-        [](const gpu::CpuDeepLearningExplorationPreset& preset) {
+        [](const jakal::CpuDeepLearningExplorationPreset& preset) {
             return preset.workload.dataset_tag == "llm-decode-token-lite";
         });
     if (decode_it == cpu_dl_presets.end()) {
@@ -189,7 +189,7 @@ int main() {
     const auto host_primary_count = std::count_if(
         decode_report.operations.begin(),
         decode_report.operations.end(),
-        [](const gpu::OperationOptimizationResult& result) {
+        [](const jakal::OperationOptimizationResult& result) {
             return result.config.primary_device_uid == "host:0";
         });
     if (host_primary_count == 0) {
@@ -207,13 +207,13 @@ int main() {
         return 1;
     }
 
-    gpu_runtime_t* c_runtime = gpu_runtime_create();
+    jakal_core_runtime_t* c_runtime = jakal_core_runtime_create();
     if (c_runtime == nullptr) {
         std::cerr << "Failed to create C runtime.\n";
         return 1;
     }
 
-    const gpu_workload_spec c_workload{
+    const jakal_core_workload_spec c_workload{
         "smoke",
         "tensor",
         128ull * 1024ull * 1024ull,
@@ -224,10 +224,10 @@ int main() {
         0,
         1};
 
-    gpu_optimization_info optimization_info{};
-    gpu_operation_optimization_info optimization_ops[8]{};
+    jakal_core_optimization_info optimization_info{};
+    jakal_core_operation_optimization_info optimization_ops[8]{};
     size_t optimization_count = 0;
-    if (gpu_runtime_optimize(
+    if (jakal_core_runtime_optimize(
             c_runtime,
             &c_workload,
             &optimization_info,
@@ -236,14 +236,14 @@ int main() {
             &optimization_count) != 0 ||
         optimization_count == 0) {
         std::cerr << "C API optimize failed.\n";
-        gpu_runtime_destroy(c_runtime);
+        jakal_core_runtime_destroy(c_runtime);
         return 1;
     }
 
-    gpu_execution_info execution_info{};
-    gpu_execution_operation_info execution_ops[8]{};
+    jakal_core_execution_info execution_info{};
+    jakal_core_execution_operation_info execution_ops[8]{};
     size_t execution_count = 0;
-    if (gpu_runtime_execute(
+    if (jakal_core_runtime_execute(
             c_runtime,
             &c_workload,
             &execution_info,
@@ -253,11 +253,11 @@ int main() {
         execution_count == 0 ||
         execution_info.all_succeeded == 0) {
         std::cerr << "C API execute failed.\n";
-        gpu_runtime_destroy(c_runtime);
+        jakal_core_runtime_destroy(c_runtime);
         return 1;
     }
 
-    gpu_runtime_destroy(c_runtime);
+    jakal_core_runtime_destroy(c_runtime);
 
     std::cout << "Graphs=" << runtime.devices().size()
               << " allocations=" << plan.allocations.size()
@@ -268,3 +268,4 @@ int main() {
 
     return 0;
 }
+

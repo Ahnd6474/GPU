@@ -1,14 +1,14 @@
 #pragma once
 
-#include "gpu/device.hpp"
-#include "gpu/execution.hpp"
+#include "jakal/device.hpp"
+#include "jakal/execution.hpp"
 
 #include <cstddef>
 #include <span>
 #include <string>
 #include <vector>
 
-namespace gpu::executors {
+namespace jakal::executors {
 
 struct ShardRange {
     std::size_t start = 0;
@@ -108,4 +108,5 @@ public:
         const OperationData& data) const = 0;
 };
 
-}  // namespace gpu::executors
+}  // namespace jakal::executors
+

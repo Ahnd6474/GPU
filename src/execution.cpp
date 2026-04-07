@@ -1,6 +1,6 @@
-#include "gpu/execution.hpp"
+#include "jakal/execution.hpp"
 
-#include "gpu/device.hpp"
+#include "jakal/device.hpp"
 
 #include <algorithm>
 #include <array>
@@ -24,7 +24,7 @@
 #include <Windows.h>
 #endif
 
-namespace gpu {
+namespace jakal {
 namespace {
 
 constexpr std::uint64_t kKiB = 1024ull;
@@ -55,7 +55,7 @@ std::string join_csv(const std::vector<std::string>& values);
 
 std::filesystem::path performance_cache_path_for(const std::filesystem::path& cache_path) {
     if (cache_path.empty()) {
-        return std::filesystem::path("gpu_runtime_execution_perf_cache.tsv");
+        return std::filesystem::path("jakal_core_execution_cache.tsv.perf");
     }
     auto path = cache_path;
     path += ".perf";
@@ -937,6 +937,61 @@ std::vector<std::string> accelerator_device_uids(
     return uids;
 }
 
+std::vector<std::size_t> active_continuous_dimensions(
+    const WorkloadSpec& workload,
+    const std::vector<OperationSpec>& operations,
+    const ExecutionPlan& placement,
+    const SystemProfile& system) {
+    bool has_parallelizable = false;
+    bool has_streaming = false;
+    bool has_matrix = false;
+    bool tolerates_low_precision = false;
+    for (const auto& operation : operations) {
+        has_parallelizable = has_parallelizable || operation.parallelizable;
+        has_streaming = has_streaming || operation.streaming_friendly;
+        has_matrix = has_matrix || operation.matrix_friendly;
+        tolerates_low_precision = tolerates_low_precision || operation.max_relative_error >= 4.0e-4;
+    }
+
+    std::vector<std::size_t> dims{0u, 1u, 2u, 3u, 6u, 9u};
+    if (has_parallelizable) {
+        dims.push_back(4u);
+    }
+    if (tolerates_low_precision) {
+        dims.push_back(5u);
+    }
+    if (placement.allocations.size() > 1u && !workload.latency_sensitive) {
+        dims.push_back(7u);
+    }
+    if (has_streaming && (!system.low_spec_mode || workload.kind == WorkloadKind::image)) {
+        dims.push_back(8u);
+    }
+    if (!has_matrix) {
+        dims.erase(std::remove(dims.begin(), dims.end(), 2u), dims.end());
+    }
+    return dims;
+}
+
+std::uint32_t choose_graph_optimization_passes(
+    const WorkloadSpec& workload,
+    const std::vector<OperationSpec>& operations,
+    const ExecutionPlan& placement,
+    const SystemProfile& system) {
+    if (operations.size() <= 2u) {
+        return 1u;
+    }
+    if (system.low_spec_mode || workload.latency_sensitive) {
+        return 2u;
+    }
+    if (placement.allocations.size() <= 1u && operations.size() <= 4u) {
+        return 2u;
+    }
+    if (operations.size() <= 4u) {
+        return 3u;
+    }
+    return kGraphOptimizationPasses;
+}
+
 bool should_auto_accelerator_data_parallel(
     const WorkloadSpec& workload,
     const OperationSpec& operation,
@@ -1227,7 +1282,9 @@ std::vector<ExecutionConfig> build_candidate_configs(
             }
         };
 
-        for (std::size_t rank = 0; rank < ranked.size() && rank < 2u; ++rank) {
+        const std::size_t max_ranked_strategies =
+            (system.low_spec_mode || workload.latency_sensitive) ? 1u : 2u;
+        for (std::size_t rank = 0; rank < ranked.size() && rank < max_ranked_strategies; ++rank) {
             if (ranked[rank].weight < 0.0) {
                 continue;
             }
@@ -1262,7 +1319,9 @@ std::vector<ExecutionConfig> build_candidate_configs(
                     apply_strategy(config, ranked[rank].strategy);
                     add_candidate(config);
                     ++added_devices;
-                    if (ranked[rank].weight > 0.65 && added_devices >= 2u) {
+                    const std::size_t max_devices_for_strategy =
+                        (system.low_spec_mode || workload.latency_sensitive) ? 1u : 2u;
+                    if (ranked[rank].weight > 0.65 && added_devices >= max_devices_for_strategy) {
                         break;
                     }
                 }
@@ -2163,6 +2222,8 @@ struct CandidateEvaluation {
     double trace_objective = std::numeric_limits<double>::max();
     double explore_objective = std::numeric_limits<double>::max();
     double reinforce_objective = std::numeric_limits<double>::max();
+    double historical_latency_us = 0.0;
+    double average_reward = 0.0;
     std::uint32_t observations = 0;
 };
 
@@ -2294,6 +2355,72 @@ double objective_for_policy(const CandidateEvaluation& evaluation, const Optimiz
     }
 }
 
+void refresh_candidate_objectives(
+    CandidateEvaluation& evaluation,
+    const double trace_weight,
+    const double historical_latency_us,
+    const double average_reward,
+    const double log_observation_budget) {
+    auto& benchmark = evaluation.benchmark;
+    double heuristic_objective = benchmark.calibrated_prediction_us > 0.0
+                                     ? benchmark.calibrated_prediction_us
+                                     : benchmark.surrogate_latency_us;
+    if (!benchmark.simulated) {
+        heuristic_objective = std::min(heuristic_objective, benchmark.validation_latency_us);
+    }
+    if (!benchmark.accuracy_within_tolerance) {
+        const double tolerance = std::max(evaluation.config.target_error_tolerance, 1.0e-9);
+        heuristic_objective *= 10.0 + (benchmark.relative_error / tolerance);
+    }
+
+    evaluation.heuristic_objective = heuristic_objective;
+    evaluation.learned_objective =
+        (heuristic_objective * 0.45) + (benchmark.effective_latency_us * 0.45) +
+        (evaluation.graph.predicted_transfer_latency_us * 0.05) +
+        (evaluation.graph.predicted_memory_pressure * benchmark.effective_latency_us * 0.05);
+    const double trace_bias =
+        evaluation.observations >= kLearningWarmupSamples ? (trace_weight + 2.0) : trace_weight;
+    evaluation.trace_objective =
+        evaluation.observations == 0
+            ? evaluation.learned_objective
+            : ((historical_latency_us * trace_bias) + evaluation.learned_objective) / (trace_bias + 1.0);
+    const double exploration_bonus =
+        evaluation.learned_objective * 0.35 *
+        std::sqrt(std::log(log_observation_budget + 1.0) / static_cast<double>(evaluation.observations + 1u));
+    evaluation.explore_objective = std::max(0.01, evaluation.learned_objective - exploration_bonus);
+    const double preference_scale = std::exp(std::clamp(average_reward, -1.5, 1.5));
+    evaluation.reinforce_objective = evaluation.learned_objective / std::max(0.20, preference_scale);
+    benchmark.trace_weight = trace_weight;
+}
+
+std::size_t choose_validation_shortlist_size(
+    const std::vector<CandidateEvaluation>& evaluations,
+    const OptimizationPolicy policy) {
+    if (evaluations.size() <= 1u) {
+        return evaluations.size();
+    }
+
+    std::vector<double> objectives;
+    objectives.reserve(evaluations.size());
+    for (const auto& evaluation : evaluations) {
+        objectives.push_back(objective_for_policy(evaluation, policy));
+    }
+    std::sort(objectives.begin(), objectives.end());
+    const double best = objectives[0];
+    const double second = objectives[1];
+    const double gap_ratio = (second - best) / std::max(best, 1.0);
+    const auto max_observations = std::max_element(
+        evaluations.begin(),
+        evaluations.end(),
+        [](const CandidateEvaluation& left, const CandidateEvaluation& right) {
+            return left.observations < right.observations;
+        })->observations;
+    if (gap_ratio > 0.20 && max_observations >= kLearningWarmupSamples) {
+        return 1u;
+    }
+    return std::min<std::size_t>(2u, evaluations.size());
+}
+
 struct GraphStateEvaluation {
     ContinuousExecutionState state;
     double total_objective_us = 0.0;
@@ -2398,6 +2525,8 @@ GraphOptimizationSummary optimize_graph_continuous_state(
     summary.optimizer_name = "adam_surrogate";
     auto state = default_continuous_state(workload, system);
     summary.initial_state = state;
+    const auto active_dims = active_continuous_dimensions(workload, operations, placement, system);
+    const auto graph_passes = choose_graph_optimization_passes(workload, operations, placement, system);
 
     const auto initial = evaluate_global_state(
         state,
@@ -2421,11 +2550,17 @@ GraphOptimizationSummary optimize_graph_continuous_state(
     double learning_rate = system.low_spec_mode ? 0.06 : 0.08;
     double best_objective = initial.total_objective_us;
     auto best_state = state;
+    if (active_dims.empty() || graph_passes == 0u) {
+        summary.final_state = best_state;
+        summary.final_objective_us = best_objective;
+        summary.converged = true;
+        return summary;
+    }
 
-    for (std::uint32_t pass_index = 1; pass_index <= kGraphOptimizationPasses; ++pass_index) {
+    for (std::uint32_t pass_index = 1; pass_index <= graph_passes; ++pass_index) {
         std::array<double, 10> gradient{};
 
-        for (std::size_t dim = 0; dim < gradient.size(); ++dim) {
+        for (const std::size_t dim : active_dims) {
             auto plus = state;
             auto minus = state;
             switch (dim) {
@@ -2649,34 +2784,39 @@ OperationOptimizationResult optimize_operation(
     }
 
     std::string spsa_signature;
-    if (const auto spsa_candidate = make_spsa_candidate(
-            candidates.front(),
-            report_signature,
-            workload_graph,
-            operation,
-            placement,
-            graph_lookup,
-            selected_configs,
-            system,
-            warmed_devices);
-        spsa_candidate.has_value()) {
-        const auto duplicate = std::find_if(
-            candidates.begin(),
-            candidates.end(),
-            [&](const ExecutionConfig& existing) {
-                return existing.signature == spsa_candidate->signature;
-            });
-        if (duplicate == candidates.end()) {
-            spsa_signature = spsa_candidate->signature;
-            candidates.push_back(*spsa_candidate);
+    if (allow_validation || continuous_state == nullptr) {
+        if (const auto spsa_candidate = make_spsa_candidate(
+                candidates.front(),
+                report_signature,
+                workload_graph,
+                operation,
+                placement,
+                graph_lookup,
+                selected_configs,
+                system,
+                warmed_devices);
+            spsa_candidate.has_value()) {
+            const auto duplicate = std::find_if(
+                candidates.begin(),
+                candidates.end(),
+                [&](const ExecutionConfig& existing) {
+                    return existing.signature == spsa_candidate->signature;
+                });
+            if (duplicate == candidates.end()) {
+                spsa_signature = spsa_candidate->signature;
+                candidates.push_back(*spsa_candidate);
+            }
         }
+    }
+
+    if (continuous_state != nullptr && !allow_validation && candidates.size() > 4u) {
+        candidates.resize(4u);
     }
 
     const auto shape_bucket = shape_bucket_for(operation);
     const double trace_weight = preset_trace_weight(workload);
     std::vector<CandidateEvaluation> evaluations;
     evaluations.reserve(candidates.size());
-
     double log_observation_budget = 1.0;
     for (auto candidate : candidates) {
         auto graph = build_execution_graph(
@@ -2723,77 +2863,47 @@ OperationOptimizationResult optimize_operation(
             llm_cpu_policy_bias_us(workload, operation, candidate, graph_lookup) +
             auto_accelerator_data_parallel_bias_us(workload, operation, placement, candidate, graph_lookup);
         BenchmarkRecord benchmark;
-        if (allow_validation) {
-            benchmark = benchmark_operation(
-                operation,
-                candidate,
-                graph,
-                graph_lookup,
-                shape_bucket,
-                surrogate_latency_us,
-                system_penalty_us);
-        } else {
-            benchmark.operation_name = operation.name;
-            benchmark.config_signature = candidate.signature;
-            benchmark.shape_bucket = shape_bucket;
-            benchmark.predicted_latency_us = graph.predicted_latency_us;
-            benchmark.surrogate_latency_us = surrogate_latency_us;
-            benchmark.calibrated_prediction_us = surrogate_latency_us;
-            benchmark.calibration_ratio = calibration_ratio;
-            benchmark.calibration_confidence = observations == 0 ? 0.15 : 0.35;
-            benchmark.candidate_spread_us = validation_spread_us;
-            benchmark.reference_spread_us = validation_spread_us * 0.5;
-            benchmark.validation_samples = observations == 0 ? 1u : std::min(5u, observations + 1u);
-            benchmark.effective_latency_us = std::max(0.01, surrogate_latency_us);
-            benchmark.system_penalty_us = system_penalty_us;
-            benchmark.relative_error = graph.expected_relative_error;
-            benchmark.accuracy_within_tolerance =
-                graph.expected_relative_error <= (candidate.target_error_tolerance + 1.0e-12);
-            benchmark.simulated = true;
-            benchmark.speedup_vs_reference = 1.0;
-        }
-
-        double heuristic_objective = benchmark.calibrated_prediction_us > 0.0
-                                         ? benchmark.calibrated_prediction_us
-                                         : surrogate_latency_us;
-        if (!benchmark.simulated) {
-            heuristic_objective = std::min(heuristic_objective, benchmark.validation_latency_us);
-        }
-        if (!benchmark.accuracy_within_tolerance) {
-            const double tolerance = std::max(candidate.target_error_tolerance, 1.0e-9);
-            heuristic_objective *= 10.0 + (benchmark.relative_error / tolerance);
-        }
-
-        const double learned_objective =
-            (heuristic_objective * 0.45) + (benchmark.effective_latency_us * 0.45) +
-            (graph.predicted_transfer_latency_us * 0.05) +
-            (graph.predicted_memory_pressure * benchmark.effective_latency_us * 0.05);
-        const double trace_bias = observations >= kLearningWarmupSamples ? (trace_weight + 2.0) : trace_weight;
-        const double trace_objective =
-            observations == 0
-                ? learned_objective
-                : ((historical_latency_us * trace_bias) + learned_objective) / (trace_bias + 1.0);
+        benchmark.operation_name = operation.name;
+        benchmark.config_signature = candidate.signature;
+        benchmark.shape_bucket = shape_bucket;
+        benchmark.predicted_latency_us = graph.predicted_latency_us;
+        benchmark.surrogate_latency_us = surrogate_latency_us;
+        benchmark.calibrated_prediction_us = surrogate_latency_us;
+        benchmark.calibration_ratio = calibration_ratio;
+        benchmark.calibration_confidence = observations == 0 ? 0.15 : 0.35;
+        benchmark.candidate_spread_us = validation_spread_us;
+        benchmark.reference_spread_us = validation_spread_us * 0.5;
+        benchmark.validation_samples = observations == 0 ? 1u : std::min(5u, observations + 1u);
+        benchmark.effective_latency_us = std::max(0.01, surrogate_latency_us);
+        benchmark.system_penalty_us = system_penalty_us;
+        benchmark.relative_error = graph.expected_relative_error;
+        benchmark.accuracy_within_tolerance =
+            graph.expected_relative_error <= (candidate.target_error_tolerance + 1.0e-12);
+        benchmark.simulated = true;
+        benchmark.speedup_vs_reference = 1.0;
+        benchmark.reference_latency_us = historical_latency_us;
         log_observation_budget += static_cast<double>(observations + 1u);
-        const double exploration_bonus =
-            learned_objective * 0.35 *
-            std::sqrt(std::log(log_observation_budget + 1.0) / static_cast<double>(observations + 1u));
-        const double explore_objective = std::max(0.01, learned_objective - exploration_bonus);
-        const double preference_scale = std::exp(std::clamp(average_reward, -1.5, 1.5));
-        const double reinforce_objective = learned_objective / std::max(0.20, preference_scale);
 
-        benchmark.trace_weight = trace_weight;
         evaluations.push_back(CandidateEvaluation{
             std::move(candidate),
             std::move(graph),
             std::move(benchmark),
             OptimizationPolicy::heuristic_greedy,
             !spsa_signature.empty() && candidate.signature == spsa_signature,
-            heuristic_objective,
-            learned_objective,
-            trace_objective,
-            explore_objective,
-            reinforce_objective,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            historical_latency_us,
+            average_reward,
             observations});
+        refresh_candidate_objectives(
+            evaluations.back(),
+            trace_weight,
+            evaluations.back().historical_latency_us,
+            evaluations.back().average_reward,
+            log_observation_budget);
     }
 
     if (evaluations.empty()) {
@@ -2811,6 +2921,22 @@ OperationOptimizationResult optimize_operation(
                        evaluation.config.participating_devices == accelerators;
             });
         if (forced != evaluations.end()) {
+            if (allow_validation) {
+                forced->benchmark = benchmark_operation(
+                    operation,
+                    forced->config,
+                    forced->graph,
+                    graph_lookup,
+                    shape_bucket,
+                    forced->benchmark.surrogate_latency_us,
+                    forced->benchmark.system_penalty_us);
+                refresh_candidate_objectives(
+                    *forced,
+                    trace_weight,
+                    forced->historical_latency_us,
+                    forced->average_reward,
+                    static_cast<double>(forced->observations + 1u));
+            }
             OperationOptimizationResult best;
             best.operation = operation;
             best.config = forced->config;
@@ -2823,6 +2949,37 @@ OperationOptimizationResult optimize_operation(
     }
 
     const auto selected_policy = select_policy_for_workload(workload, evaluations);
+    if (allow_validation) {
+        std::vector<std::size_t> ranked_indices(evaluations.size());
+        for (std::size_t index = 0; index < ranked_indices.size(); ++index) {
+            ranked_indices[index] = index;
+        }
+        std::sort(
+            ranked_indices.begin(),
+            ranked_indices.end(),
+            [&](const std::size_t left, const std::size_t right) {
+                return objective_for_policy(evaluations[left], selected_policy) <
+                       objective_for_policy(evaluations[right], selected_policy);
+            });
+        const auto shortlist = choose_validation_shortlist_size(evaluations, selected_policy);
+        for (std::size_t rank = 0; rank < shortlist; ++rank) {
+            auto& candidate = evaluations[ranked_indices[rank]];
+            candidate.benchmark = benchmark_operation(
+                operation,
+                candidate.config,
+                candidate.graph,
+                graph_lookup,
+                shape_bucket,
+                candidate.benchmark.surrogate_latency_us,
+                candidate.benchmark.system_penalty_us);
+            refresh_candidate_objectives(
+                candidate,
+                trace_weight,
+                candidate.historical_latency_us,
+                candidate.average_reward,
+                static_cast<double>(candidate.observations + 1u));
+        }
+    }
     const auto winner = std::min_element(
         evaluations.begin(),
         evaluations.end(),
@@ -3254,9 +3411,9 @@ ExecutionOptimizer::ExecutionOptimizer(std::filesystem::path cache_path)
 
 std::filesystem::path ExecutionOptimizer::default_cache_path() {
     try {
-        return std::filesystem::temp_directory_path() / "gpu_runtime_execution_cache.tsv";
+        return std::filesystem::temp_directory_path() / "jakal_core_execution_cache.tsv";
     } catch (const std::exception&) {
-        return std::filesystem::path("gpu_runtime_execution_cache.tsv");
+        return std::filesystem::path("jakal_core_execution_cache.tsv");
     }
 }
 
@@ -3682,4 +3839,5 @@ void ExecutionOptimizer::persist_cache() const {
     }
 }
 
-}  // namespace gpu
+}  // namespace jakal
+

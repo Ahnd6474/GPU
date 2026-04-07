@@ -1,4 +1,4 @@
-#include "gpu/device.hpp"
+#include "jakal/device.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-namespace gpu {
+namespace jakal {
 namespace {
 
 constexpr double kBytesPerGb = 1.0e9;
@@ -476,4 +476,5 @@ std::string structural_fingerprint(const HardwareGraph& graph) {
     return stream.str();
 }
 
-}  // namespace gpu
+}  // namespace jakal
+
