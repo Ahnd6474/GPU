@@ -2407,6 +2407,7 @@ WorkloadManifest load_workload_source(const std::filesystem::path& path) {
         none,
         source,
         workload,
+        asset,
         tensor,
         operation,
         dependency,
@@ -2442,6 +2443,38 @@ WorkloadManifest load_workload_source(const std::filesystem::path& path) {
         }
         case Section::workload: {
             apply_workload_fields(fields, manifest.workload);
+            break;
+        }
+        case Section::asset: {
+            WorkloadAsset asset;
+            asset.id = fields.at("id");
+            if (const auto it = fields.find("path"); it != fields.end()) {
+                asset.path = std::filesystem::path(it->second);
+                if (asset.path.is_relative()) {
+                    asset.path = manifest.source_path.parent_path() / asset.path;
+                }
+            }
+            if (const auto it = fields.find("tensors"); it != fields.end()) {
+                asset.tensor_ids = split_csv_strings(it->second);
+            }
+            if (const auto it = fields.find("tensor_ids"); it != fields.end()) {
+                asset.tensor_ids = split_csv_strings(it->second);
+            }
+            if (const auto it = fields.find("bytes"); it != fields.end()) {
+                asset.bytes = static_cast<std::uint64_t>(std::stoull(it->second));
+            } else if (!asset.path.empty()) {
+                std::error_code ec;
+                asset.bytes = std::filesystem::is_regular_file(asset.path, ec)
+                                  ? static_cast<std::uint64_t>(std::filesystem::file_size(asset.path, ec))
+                                  : 0u;
+            }
+            asset.persistent = parse_bool_string(fields["persistent"], true);
+            asset.host_visible = parse_bool_string(fields["host_visible"], false);
+            asset.preload_required = parse_bool_string(fields["preload_required"], true);
+            if (const auto it = fields.find("preferred_residency"); it != fields.end()) {
+                asset.preferred_residency = lowercase_copy(it->second);
+            }
+            manifest.assets.push_back(std::move(asset));
             break;
         }
         case Section::tensor: {
@@ -2619,6 +2652,8 @@ WorkloadManifest load_workload_source(const std::filesystem::path& path) {
                 current_section = Section::source;
             } else if (section_name == "workload") {
                 current_section = Section::workload;
+            } else if (section_name == "asset" || section_name == "weights" || section_name == "bundle") {
+                current_section = Section::asset;
             } else if (section_name == "tensor") {
                 current_section = Section::tensor;
             } else if (section_name == "operation") {
@@ -2654,6 +2689,30 @@ WorkloadManifest load_workload_source(const std::filesystem::path& path) {
             imported_source,
             imported_values,
             imported_nodes);
+    }
+    if (!manifest.assets.empty()) {
+        std::unordered_map<std::string, WorkloadTensor*> tensors_by_id;
+        tensors_by_id.reserve(manifest.graph.tensors.size());
+        for (auto& tensor : manifest.graph.tensors) {
+            tensors_by_id.emplace(tensor.id, &tensor);
+        }
+        std::uint64_t asset_bytes = 0u;
+        for (const auto& asset : manifest.assets) {
+            asset_bytes += asset.bytes;
+            if (asset.tensor_ids.size() == 1u && asset.bytes > 0u) {
+                if (const auto it = tensors_by_id.find(asset.tensor_ids.front()); it != tensors_by_id.end() &&
+                    it->second->bytes == 0u) {
+                    it->second->bytes = asset.bytes;
+                    it->second->persistent = it->second->persistent || asset.persistent;
+                    it->second->host_visible = it->second->host_visible || asset.host_visible;
+                }
+            }
+        }
+        if (manifest.workload.working_set_bytes == 0u) {
+            manifest.workload.working_set_bytes = asset_bytes;
+        } else {
+            manifest.workload.working_set_bytes += asset_bytes;
+        }
     }
     if (manifest.has_graph) {
         manifest.graph.signature = manifest.workload.name + "|" + to_string(manifest.workload.kind) + "|" +

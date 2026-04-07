@@ -21,9 +21,21 @@ struct CpuDeepLearningExplorationPreset {
     std::string success_signal;
 };
 
+struct WorkloadAsset {
+    std::string id;
+    std::filesystem::path path;
+    std::vector<std::string> tensor_ids;
+    std::uint64_t bytes = 0;
+    bool persistent = true;
+    bool host_visible = false;
+    bool preload_required = true;
+    std::string preferred_residency = "auto";
+};
+
 struct WorkloadManifest {
     WorkloadSpec workload;
     WorkloadGraph graph;
+    std::vector<WorkloadAsset> assets;
     bool has_graph = false;
     std::filesystem::path source_path;
     std::string source_format = "manifest";

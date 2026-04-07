@@ -86,10 +86,47 @@ struct StrategySafetyDecision {
     std::string summary;
 };
 
+struct KernelCoverageIssue {
+    std::string operation_name;
+    std::string device_uid;
+    std::string backend_name;
+    OperationClass op_class = OperationClass::elementwise_map;
+    bool supported = true;
+    std::string reason;
+};
+
+struct KernelCoverageReport {
+    std::vector<KernelCoverageIssue> issues;
+    bool all_supported = true;
+    bool forced_auto = false;
+    std::string summary;
+};
+
+struct AssetPrefetchEntry {
+    std::string asset_id;
+    std::filesystem::path path;
+    std::string tensor_id;
+    std::string device_uid;
+    std::uint64_t bytes = 0;
+    bool exists_on_disk = false;
+    bool preload_required = true;
+    bool persistent = true;
+    bool host_visible = false;
+};
+
+struct AssetPrefetchReport {
+    std::vector<AssetPrefetchEntry> entries;
+    std::uint64_t total_prefetch_bytes = 0;
+    bool missing_required_assets = false;
+    std::string summary;
+};
+
 struct ManagedExecutionReport {
     DirectExecutionReport execution;
     MemoryPreflightReport memory_preflight;
     StrategySafetyDecision safety;
+    KernelCoverageReport kernel_coverage;
+    AssetPrefetchReport asset_prefetch;
     std::filesystem::path telemetry_path;
     bool executed = false;
 };
@@ -122,6 +159,10 @@ private:
     void record_strategy_failure(const WorkloadSpec& workload, PartitionStrategy strategy);
     void record_strategy_success(const WorkloadSpec& workload, PartitionStrategy strategy);
     [[nodiscard]] MemoryPreflightReport build_memory_preflight(const OptimizationReport& optimization) const;
+    [[nodiscard]] KernelCoverageReport build_kernel_coverage(const OptimizationReport& optimization) const;
+    [[nodiscard]] AssetPrefetchReport build_asset_prefetch(
+        const WorkloadManifest& manifest,
+        const OptimizationReport& optimization) const;
     [[nodiscard]] DirectExecutionReport execute_with_feedback(
         const WorkloadSpec& workload,
         const OptimizationReport& optimization,
