@@ -83,6 +83,11 @@ if(JAKAL_CORE_BUILD_EXAMPLES)
 
     add_executable(jakal_profile_manifest examples/profile_manifest.cpp)
     target_link_libraries(jakal_profile_manifest PRIVATE jakal::core)
+
+    if(WIN32)
+        add_executable(jakal_directml_manifest_bench examples/directml_manifest_bench.cpp)
+        target_link_libraries(jakal_directml_manifest_bench PRIVATE jakal::core d3d12 dxgi dxguid directml)
+    endif()
 endif()
 
 if(JAKAL_CORE_BUILD_TESTS)
