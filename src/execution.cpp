@@ -12,7 +12,6 @@
 #include <fstream>
 #include <functional>
 #include <iomanip>
-#include <iostream>
 #include <limits>
 #include <numeric>
 #include <sstream>
@@ -104,6 +103,8 @@ std::string performance_key(
     stream << graph_set_signature << '|'
            << to_string(workload.kind) << '|'
            << workload.dataset_tag << '|'
+           << to_string(canonical_workload_phase(workload)) << '|'
+           << canonical_workload_shape_bucket(workload) << '|'
            << to_string(workload.partition_strategy) << '|'
            << shape_bucket << '|'
            << system.low_spec_mode << '|'
@@ -141,6 +142,8 @@ std::string backend_penalty_key(
     stream << graph_set_signature << '|'
            << to_string(workload.kind) << '|'
            << workload.dataset_tag << '|'
+           << to_string(canonical_workload_phase(workload)) << '|'
+           << canonical_workload_shape_bucket(workload) << '|'
            << to_string(workload.partition_strategy) << '|'
            << operation_name << '|'
            << config.primary_device_uid << '|'
@@ -148,6 +151,15 @@ std::string backend_penalty_key(
            << to_string(config.strategy) << '|'
            << config.logical_partitions;
     return stream.str();
+}
+
+WorkloadSpec effective_workload_for_placement(const WorkloadSpec& workload, const ExecutionPlan& placement) {
+    auto effective = workload;
+    if (placement.resolved_partition_strategy != PartitionStrategy::auto_balanced ||
+        workload.partition_strategy == PartitionStrategy::auto_balanced) {
+        effective.partition_strategy = placement.resolved_partition_strategy;
+    }
+    return effective;
 }
 
 double preset_trace_weight(const WorkloadSpec& workload) {
@@ -650,6 +662,8 @@ std::string build_report_signature(
     stream << placement.signature << '|'
            << workload.name << '|'
            << to_string(workload.kind) << '|'
+           << to_string(canonical_workload_phase(workload)) << '|'
+           << canonical_workload_shape_bucket(workload) << '|'
            << to_string(workload.partition_strategy) << '|'
            << operations.size();
     for (const auto& operation : operations) {
@@ -3668,24 +3682,24 @@ OptimizationReport ExecutionOptimizer::optimize(
     const WorkloadSpec& workload,
     const ExecutionPlan& placement,
     const std::vector<HardwareGraph>& graphs) {
+    const auto effective_workload = effective_workload_for_placement(workload, placement);
     bootstrap_optimizer_.load_cache();
     adaptive_optimizer_.load_cache();
 
     OptimizationReport report;
-    report.workload_kind = workload.kind;
-    report.dataset_tag = workload.dataset_tag;
-    report.partition_strategy = workload.partition_strategy;
+    report.workload_kind = effective_workload.kind;
+    report.workload_phase = canonical_workload_phase(effective_workload);
+    report.workload_shape_bucket = canonical_workload_shape_bucket(effective_workload);
+    report.dataset_tag = effective_workload.dataset_tag;
+    report.partition_strategy = effective_workload.partition_strategy;
     report.placement = placement;
-    report.system_profile = capture_system_profile(workload, graphs);
+    report.system_profile = capture_system_profile(effective_workload, graphs);
     adaptive_optimizer_.apply_runtime_state(report.system_profile, graphs);
 
-    report.workload_graph = default_workload_graph(workload);
+    report.workload_graph = default_workload_graph(effective_workload);
     const auto& operations = report.workload_graph.operations;
-    report.signature = build_report_signature(workload, placement, operations);
+    report.signature = build_report_signature(effective_workload, placement, operations);
     const auto graph_set_signature = summarize_graph_set(graphs);
-    std::cerr << "[optimizer] route-setup sig=" << report.signature
-              << " ops=" << operations.size()
-              << " dataset=" << report.dataset_tag << '\n';
 
     std::unordered_map<std::string, const HardwareGraph*> graph_lookup;
     graph_lookup.reserve(graphs.size());
@@ -3708,7 +3722,7 @@ OptimizationReport ExecutionOptimizer::optimize(
     std::unordered_map<std::string, ExecutionConfig> cache_input = cached_by_operation;
     report.graph_optimization = optimize_graph_continuous_state(
         report.signature,
-        workload,
+        effective_workload,
         report.workload_graph,
         placement,
         operations,
@@ -3721,11 +3735,6 @@ OptimizationReport ExecutionOptimizer::optimize(
         (fully_cached && !runtime_sensitive_path) ? &cache_input : nullptr,
         lightweight_path || runtime_sensitive_path);
     report.graph_optimization.optimizer_name = optimizer_route + ":" + report.graph_optimization.optimizer_name;
-    std::cerr << "[optimizer] graph route=" << optimizer_route
-              << " cached=" << fully_cached
-              << " runtime_sensitive=" << runtime_sensitive_path
-              << " lightweight=" << lightweight_path
-              << " passes=" << report.graph_optimization.passes.size() << '\n';
 
     std::unordered_map<std::string, ExecutionConfig> selected_configs;
     for (const auto& operation : operations) {
@@ -3738,7 +3747,7 @@ OptimizationReport ExecutionOptimizer::optimize(
             report.signature,
             report.workload_graph,
             operation,
-            workload,
+            effective_workload,
             placement,
             graph_lookup,
             selected_configs,
@@ -3751,15 +3760,10 @@ OptimizationReport ExecutionOptimizer::optimize(
             &report.graph_optimization.final_state,
             !lightweight_path || operation_needs_fast_recovery);
         if (result.config.signature.empty()) {
-            std::cerr << "[optimizer] op-empty name=" << operation.name << '\n';
             continue;
         }
 
         result.benchmark.optimizer_name = optimizer_route + ":" + result.benchmark.optimizer_name;
-        std::cerr << "[optimizer] op name=" << operation.name
-                  << " strategy=" << to_string(result.config.strategy)
-                  << " policy=" << result.benchmark.optimizer_name
-                  << " partitions=" << result.config.logical_partitions << '\n';
         persisted_configs.push_back(CachedExecutionConfig{
             operation.name,
             result.config});
@@ -3770,9 +3774,6 @@ OptimizationReport ExecutionOptimizer::optimize(
 
     bootstrap_optimizer_.store_configs(report.signature, std::move(persisted_configs));
     report.loaded_from_cache = fully_cached && !runtime_sensitive_path;
-    std::cerr << "[optimizer] done sig=" << report.signature
-              << " cached=" << report.loaded_from_cache
-              << " ops=" << report.operations.size() << '\n';
     return report;
 }
 
@@ -4027,9 +4028,6 @@ void AdaptiveExecutionOptimizer::ingest_execution_feedback(
     }
 
     load_cache();
-    std::cerr << "[runtime-opt] feedback sig=" << report.signature
-              << " ops=" << report.operations.size()
-              << " samples=" << feedback.size() << '\n';
 
     std::unordered_map<std::string, const ExecutionFeedbackRecord*> feedback_by_operation;
     feedback_by_operation.reserve(feedback.size());
@@ -4137,8 +4135,6 @@ void AdaptiveExecutionOptimizer::ingest_execution_feedback(
         reoptimization_pressure_[report.signature] = report_pressure;
     }
 
-    std::cerr << "[runtime-opt] feedback-done sig=" << report.signature
-              << " pressure=" << report_pressure << '\n';
     persist_cache();
 }
 

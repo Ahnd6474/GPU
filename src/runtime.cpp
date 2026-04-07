@@ -71,6 +71,56 @@ bool selection_changed(const OptimizationReport& left, const OptimizationReport&
     return false;
 }
 
+double head_runtime_us(const WorkloadSpec& workload, const DirectExecutionReport& report) {
+    if (report.operations.empty()) {
+        return std::max(report.total_runtime_us, 0.0);
+    }
+    if (!workload.latency_sensitive) {
+        return std::max(report.total_runtime_us, 0.0);
+    }
+
+    const std::size_t lead_operations =
+        std::min<std::size_t>(3u, std::max<std::size_t>(1u, (report.operations.size() + 2u) / 3u));
+    return std::accumulate(
+        report.operations.begin(),
+        report.operations.begin() + static_cast<std::ptrdiff_t>(lead_operations),
+        0.0,
+        [](const double total, const OperationExecutionRecord& operation) {
+            return total + std::max(operation.runtime_us, 0.0);
+        });
+}
+
+double successful_operation_ratio(const DirectExecutionReport& report) {
+    if (report.operations.empty()) {
+        return report.all_succeeded ? 1.0 : 0.0;
+    }
+
+    const auto successful = static_cast<double>(std::count_if(
+        report.operations.begin(),
+        report.operations.end(),
+        [](const OperationExecutionRecord& operation) {
+            return operation.backend_error.empty() && operation.verified;
+        }));
+    return successful / static_cast<double>(report.operations.size());
+}
+
+void record_partition_strategy_feedback(
+    Planner& planner,
+    const WorkloadSpec& requested_workload,
+    const std::vector<HardwareGraph>& graphs,
+    const DirectExecutionReport& report) {
+    planner.ingest_strategy_feedback(
+        requested_workload,
+        graphs,
+        StrategyFeedbackSample{
+            report.optimization.partition_strategy,
+            report.total_runtime_us,
+            head_runtime_us(requested_workload, report),
+            report.speedup_vs_reference,
+            successful_operation_ratio(report),
+            report.all_succeeded});
+}
+
 }  // namespace
 
 Runtime::Runtime(RuntimeOptions options)
@@ -171,11 +221,13 @@ DirectExecutionReport Runtime::execute(const WorkloadSpec& workload) {
         devices_);
 
     if (!should_retry_execution(initial_report)) {
+        record_partition_strategy_feedback(planner_, workload, devices_, initial_report);
         return initial_report;
     }
 
     const auto refined_optimization = optimize(workload);
     if (!selection_changed(initial_report.optimization, refined_optimization)) {
+        record_partition_strategy_feedback(planner_, workload, devices_, initial_report);
         return initial_report;
     }
 
@@ -186,14 +238,18 @@ DirectExecutionReport Runtime::execute(const WorkloadSpec& workload) {
         devices_);
 
     if (!refined_report.all_succeeded) {
+        record_partition_strategy_feedback(planner_, workload, devices_, initial_report);
         return initial_report;
     }
     if (!initial_report.all_succeeded) {
+        record_partition_strategy_feedback(planner_, workload, devices_, refined_report);
         return refined_report;
     }
     if (total_runtime_us(refined_report) < (total_runtime_us(initial_report) * 0.95)) {
+        record_partition_strategy_feedback(planner_, workload, devices_, refined_report);
         return refined_report;
     }
+    record_partition_strategy_feedback(planner_, workload, devices_, initial_report);
     return initial_report;
 }
 

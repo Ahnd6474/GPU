@@ -1,9 +1,11 @@
 #include "jakal/planner.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
@@ -17,6 +19,11 @@ constexpr double kMinShardRatio = 0.05;
 constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 constexpr double kMiB = 1024.0 * 1024.0;
 constexpr double kKiB = 1024.0;
+constexpr double kLearnedStrategyMargin = 0.03;
+constexpr double kLearnedFamilyStrategyMargin = 0.05;
+constexpr std::uint32_t kMinimumAutoBaselineObservations = 1u;
+constexpr std::uint32_t kMinimumFamilyAutoBaselineObservations = 2u;
+constexpr std::uint32_t kStrategyExplorationTargetObservations = 1u;
 
 struct PartitionAllocationBias {
     double host_ratio = 0.0;
@@ -41,6 +48,51 @@ std::vector<std::string> split_tab(const std::string& line) {
     return fields;
 }
 
+std::string ascii_lower_copy(const std::string& input) {
+    std::string lowered = input;
+    std::transform(
+        lowered.begin(),
+        lowered.end(),
+        lowered.begin(),
+        [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+    return lowered;
+}
+
+bool contains_phase_token(const std::string& haystack, const std::string& needle) {
+    return !needle.empty() && haystack.find(needle) != std::string::npos;
+}
+
+std::uint64_t next_power_of_two(const std::uint64_t value) {
+    if (value <= 1ull) {
+        return 1ull;
+    }
+    std::uint64_t bucket = 1ull;
+    while (bucket < value && bucket < (std::numeric_limits<std::uint64_t>::max() >> 1u)) {
+        bucket <<= 1u;
+    }
+    return bucket;
+}
+
+std::uint64_t bucket_bytes_mib(const std::uint64_t bytes) {
+    if (bytes == 0ull) {
+        return 0ull;
+    }
+    const std::uint64_t mib = (bytes + static_cast<std::uint64_t>(kMiB) - 1ull) / static_cast<std::uint64_t>(kMiB);
+    return next_power_of_two(std::max<std::uint64_t>(1ull, mib));
+}
+
+std::uint64_t bucket_flops_giga(const double flops) {
+    if (!(flops > 0.0)) {
+        return 0ull;
+    }
+    const auto giga = static_cast<std::uint64_t>(std::ceil(flops / 1.0e9));
+    return next_power_of_two(std::max<std::uint64_t>(1ull, giga));
+}
+
+std::string topology_family_token(const HardwareGraph& graph);
+
 std::string build_signature(const WorkloadSpec& workload, const std::vector<HardwareGraph>& graphs) {
     std::vector<std::string> fingerprints;
     fingerprints.reserve(graphs.size());
@@ -53,6 +105,8 @@ std::string build_signature(const WorkloadSpec& workload, const std::vector<Hard
     signature << workload.name << '|'
               << to_string(workload.kind) << '|'
               << workload.dataset_tag << '|'
+              << to_string(canonical_workload_phase(workload)) << '|'
+              << canonical_workload_shape_bucket(workload) << '|'
               << workload.working_set_bytes << '|'
               << workload.host_exchange_bytes << '|'
               << std::fixed << std::setprecision(3) << workload.estimated_flops << '|'
@@ -69,12 +123,149 @@ std::string build_signature(const WorkloadSpec& workload, const std::vector<Hard
     return signature.str();
 }
 
+std::string build_learning_key(const WorkloadSpec& workload, const std::vector<HardwareGraph>& graphs) {
+    std::vector<std::string> fingerprints;
+    fingerprints.reserve(graphs.size());
+    for (const auto& graph : graphs) {
+        fingerprints.push_back(graph.uid + ":" + structural_fingerprint(graph));
+    }
+    std::sort(fingerprints.begin(), fingerprints.end());
+
+    std::ostringstream key;
+    key << workload.name << '|'
+        << to_string(workload.kind) << '|'
+        << workload.dataset_tag << '|'
+        << to_string(canonical_workload_phase(workload)) << '|'
+        << canonical_workload_shape_bucket(workload) << '|'
+        << workload.working_set_bytes << '|'
+        << workload.host_exchange_bytes << '|'
+        << std::fixed << std::setprecision(3) << workload.estimated_flops << '|'
+        << workload.batch_size << '|'
+        << workload.latency_sensitive << '|'
+        << workload.prefer_unified_memory << '|'
+        << workload.matrix_friendly;
+    for (const auto& fingerprint : fingerprints) {
+        key << '|' << fingerprint;
+    }
+    return key.str();
+}
+
+std::string build_family_learning_key(const WorkloadSpec& workload, const std::vector<HardwareGraph>& graphs) {
+    std::vector<std::string> family_tokens;
+    family_tokens.reserve(graphs.size());
+    for (const auto& graph : graphs) {
+        family_tokens.push_back(topology_family_token(graph));
+    }
+    std::sort(family_tokens.begin(), family_tokens.end());
+
+    std::ostringstream key;
+    key << workload.name << '|'
+        << to_string(workload.kind) << '|'
+        << workload.dataset_tag << '|'
+        << to_string(canonical_workload_phase(workload)) << '|'
+        << canonical_workload_shape_bucket(workload) << '|'
+        << workload.working_set_bytes << '|'
+        << workload.host_exchange_bytes << '|'
+        << std::fixed << std::setprecision(3) << workload.estimated_flops << '|'
+        << workload.batch_size << '|'
+        << workload.latency_sensitive << '|'
+        << workload.prefer_unified_memory << '|'
+        << workload.matrix_friendly;
+    for (const auto& token : family_tokens) {
+        key << '|' << token;
+    }
+    return key.str();
+}
+
+std::filesystem::path strategy_cache_path_for(const std::filesystem::path& cache_path) {
+    auto path = cache_path;
+    path += ".strategy";
+    return path;
+}
+
+std::filesystem::path family_strategy_cache_path_for(const std::filesystem::path& cache_path) {
+    auto path = cache_path;
+    path += ".strategy_family";
+    return path;
+}
+
 bool is_host_graph(const HardwareGraph& graph) {
     return graph.probe == "host";
 }
 
+bool has_partitionable_topology(const std::vector<HardwareGraph>& graphs) {
+    bool saw_host = false;
+    bool saw_accelerator = false;
+    for (const auto& graph : graphs) {
+        if (is_host_graph(graph)) {
+            saw_host = true;
+        } else {
+            saw_accelerator = true;
+        }
+        if (saw_host && saw_accelerator) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool uses_explicit_partition_strategy(const WorkloadSpec& workload) {
     return workload.partition_strategy != PartitionStrategy::auto_balanced;
+}
+
+std::vector<PartitionStrategy> exploration_order_for(const WorkloadSpec& workload) {
+    if (workload.kind == WorkloadKind::inference && workload.latency_sensitive && workload.matrix_friendly) {
+        return {
+            PartitionStrategy::role_split,
+            PartitionStrategy::tpu_like,
+            PartitionStrategy::reduce_on_gpu,
+            PartitionStrategy::projection_sharded,
+            PartitionStrategy::blind_sharded};
+    }
+    if (workload.matrix_friendly) {
+        return {
+            PartitionStrategy::projection_sharded,
+            PartitionStrategy::reduce_on_gpu,
+            PartitionStrategy::role_split,
+            PartitionStrategy::tpu_like,
+            PartitionStrategy::blind_sharded};
+    }
+    return {
+        PartitionStrategy::role_split,
+        PartitionStrategy::reduce_on_gpu,
+        PartitionStrategy::blind_sharded,
+        PartitionStrategy::projection_sharded,
+        PartitionStrategy::tpu_like};
+}
+
+std::uint64_t bucket_positive_u32(const std::uint32_t value) {
+    return next_power_of_two(std::max<std::uint32_t>(1u, value));
+}
+
+std::uint64_t bucket_bandwidth_gbps(const double bandwidth) {
+    if (!(bandwidth > 0.0)) {
+        return 0ull;
+    }
+    return next_power_of_two(std::max<std::uint64_t>(1ull, static_cast<std::uint64_t>(std::ceil(bandwidth))));
+}
+
+std::string topology_family_token(const HardwareGraph& graph) {
+    const auto summary = summarize_graph(graph);
+    std::ostringstream token;
+    token << (is_host_graph(graph) ? "host" : "accel") << ':'
+          << graph.probe << ':'
+          << bucket_positive_u32(summary.execution_objects) << ':'
+          << bucket_positive_u32(summary.lanes_per_object) << ':'
+          << bucket_positive_u32(summary.matrix_units == 0u ? 1u : summary.matrix_units) << ':'
+          << bucket_bytes_mib(summary.directly_attached_bytes) << ':'
+          << bucket_bytes_mib(summary.shared_host_bytes) << ':'
+          << bucket_bandwidth_gbps(std::max(summary.host_read_gbps, summary.host_write_gbps)) << ':'
+          << (summary.unified_address_space ? 'u' : 'd')
+          << (summary.coherent_with_host ? 'c' : 'n')
+          << (summary.supports_fp16 ? 'h' : 'n')
+          << (summary.supports_bf16 ? 'b' : 'n')
+          << (summary.supports_int8 ? 'i' : 'n');
+    return token.str();
 }
 
 PartitionAllocationBias partition_allocation_bias(const PartitionStrategy strategy) {
@@ -93,6 +284,42 @@ PartitionAllocationBias partition_allocation_bias(const PartitionStrategy strate
     default:
         return {0.0, 1.0};
     }
+}
+
+double strategy_selection_score(
+    const WorkloadSpec& workload,
+    const std::uint32_t observations,
+    const std::uint32_t successful_observations,
+    const double average_runtime_us,
+    const double average_head_runtime_us,
+    const double average_speedup_vs_reference,
+    const double average_successful_operation_ratio,
+    const double baseline_runtime_us,
+    const double baseline_head_runtime_us) {
+    if (observations == 0u) {
+        return 0.0;
+    }
+    const double success_rate =
+        static_cast<double>(successful_observations) / static_cast<double>(observations);
+    const double operation_success = std::clamp(average_successful_operation_ratio, 0.0, 1.0);
+    const double reliability = std::clamp((success_rate * 0.70) + (operation_success * 0.30), 0.0, 1.0);
+    const double confidence = std::min(1.0, static_cast<double>(observations) / 3.0);
+    const double runtime_gain =
+        std::clamp((std::max(baseline_runtime_us, 1.0) / std::max(average_runtime_us, 1.0)) - 1.0, -0.40, 0.60);
+    const double head_gain = std::clamp(
+        (std::max(baseline_head_runtime_us, 1.0) / std::max(average_head_runtime_us, 1.0)) - 1.0,
+        -0.45,
+        0.75);
+    const double centered_speedup = std::clamp(average_speedup_vs_reference - 1.0, -0.35, 0.50);
+
+    double metric_gain = 0.0;
+    if (workload.latency_sensitive) {
+        metric_gain = (head_gain * 0.55) + (runtime_gain * 0.25) + (centered_speedup * 0.20);
+    } else {
+        metric_gain = (centered_speedup * 0.45) + (runtime_gain * 0.35) + (head_gain * 0.20);
+    }
+
+    return reliability * (1.0 + (metric_gain * confidence));
 }
 
 double compute_weight_from_workload(const WorkloadSpec& workload) {
@@ -251,6 +478,24 @@ std::string to_string(WorkloadKind kind) {
     }
 }
 
+std::string to_string(const WorkloadPhase phase) {
+    switch (phase) {
+    case WorkloadPhase::prefill:
+        return "prefill";
+    case WorkloadPhase::decode:
+        return "decode";
+    case WorkloadPhase::cache_update:
+        return "cache_update";
+    case WorkloadPhase::dequantize:
+        return "dequantize";
+    case WorkloadPhase::training_step:
+        return "training_step";
+    case WorkloadPhase::unknown:
+    default:
+        return "unknown";
+    }
+}
+
 std::string to_string(const PartitionStrategy strategy) {
     switch (strategy) {
     case PartitionStrategy::blind_sharded:
@@ -269,8 +514,184 @@ std::string to_string(const PartitionStrategy strategy) {
     }
 }
 
+WorkloadPhase canonical_workload_phase(const WorkloadSpec& workload) {
+    if (workload.phase != WorkloadPhase::unknown) {
+        return workload.phase;
+    }
+
+    const auto phase_hint = ascii_lower_copy(workload.dataset_tag + "|" + workload.name);
+    if (contains_phase_token(phase_hint, "prefill")) {
+        return WorkloadPhase::prefill;
+    }
+    if (contains_phase_token(phase_hint, "decode")) {
+        return WorkloadPhase::decode;
+    }
+    if (contains_phase_token(phase_hint, "kv-cache") ||
+        contains_phase_token(phase_hint, "cache-update") ||
+        contains_phase_token(phase_hint, "cache_update")) {
+        return WorkloadPhase::cache_update;
+    }
+    if (contains_phase_token(phase_hint, "dequant") ||
+        contains_phase_token(phase_hint, "int4") ||
+        contains_phase_token(phase_hint, "quant")) {
+        return WorkloadPhase::dequantize;
+    }
+    if (workload.kind == WorkloadKind::training ||
+        contains_phase_token(phase_hint, "train") ||
+        contains_phase_token(phase_hint, "backward") ||
+        contains_phase_token(phase_hint, "optimizer")) {
+        return WorkloadPhase::training_step;
+    }
+    return WorkloadPhase::unknown;
+}
+
+std::string canonical_workload_shape_bucket(const WorkloadSpec& workload) {
+    if (!workload.shape_bucket.empty()) {
+        return workload.shape_bucket;
+    }
+
+    std::ostringstream stream;
+    stream << "phase=" << to_string(canonical_workload_phase(workload))
+           << "|b=" << next_power_of_two(std::max<std::uint32_t>(1u, workload.batch_size))
+           << "|ws_mib=" << bucket_bytes_mib(workload.working_set_bytes)
+           << "|hx_mib=" << bucket_bytes_mib(workload.host_exchange_bytes)
+           << "|flops_g=" << bucket_flops_giga(workload.estimated_flops);
+    return stream.str();
+}
+
 Planner::Planner(std::filesystem::path cache_path)
     : cache_path_(std::move(cache_path)) {}
+
+PartitionStrategy Planner::resolve_partition_strategy(
+    const WorkloadSpec& workload,
+    const std::vector<HardwareGraph>& graphs) const {
+    if (workload.partition_strategy != PartitionStrategy::auto_balanced) {
+        return workload.partition_strategy;
+    }
+
+    struct StrategyResolution {
+        PartitionStrategy strategy = PartitionStrategy::auto_balanced;
+        bool has_baseline = false;
+    };
+
+    const auto exact_it = strategy_stats_.find(build_learning_key(workload, graphs));
+    const auto family_it = family_strategy_stats_.find(build_family_learning_key(workload, graphs));
+
+    const auto resolve_from_bucket =
+        [&](const auto* bucket,
+            const bool allow_exploration,
+            const std::uint32_t minimum_auto_baseline_observations,
+            const double margin) -> StrategyResolution {
+        if (bucket == nullptr) {
+            return {};
+        }
+
+        const auto auto_it = bucket->find(to_string(PartitionStrategy::auto_balanced));
+        const std::uint32_t auto_observations = auto_it == bucket->end() ? 0u : auto_it->second.observations;
+        if (auto_observations < minimum_auto_baseline_observations) {
+            return {};
+        }
+
+        if (allow_exploration && has_partitionable_topology(graphs)) {
+            for (const auto strategy : exploration_order_for(workload)) {
+                const auto strategy_it = bucket->find(to_string(strategy));
+                const std::uint32_t observations =
+                    strategy_it == bucket->end() ? 0u : strategy_it->second.observations;
+                if (observations < kStrategyExplorationTargetObservations) {
+                    return {strategy, true};
+                }
+            }
+        }
+
+        const double auto_score =
+            auto_it == bucket->end()
+                ? 1.0
+                : strategy_selection_score(
+                      workload,
+                      auto_it->second.observations,
+                      auto_it->second.successful_observations,
+                      auto_it->second.average_runtime_us,
+                      auto_it->second.average_head_runtime_us,
+                      auto_it->second.average_speedup_vs_reference,
+                      auto_it->second.average_successful_operation_ratio,
+                      auto_it->second.average_runtime_us,
+                      auto_it->second.average_head_runtime_us);
+
+        PartitionStrategy best_strategy = PartitionStrategy::auto_balanced;
+        double best_score = auto_score;
+        double best_speedup = 1.0;
+        std::uint32_t best_observations = 0u;
+
+        for (const auto strategy : {
+                 PartitionStrategy::blind_sharded,
+                 PartitionStrategy::role_split,
+                 PartitionStrategy::reduce_on_gpu,
+                 PartitionStrategy::projection_sharded,
+                 PartitionStrategy::tpu_like}) {
+            const auto strategy_it = bucket->find(to_string(strategy));
+            if (strategy_it == bucket->end()) {
+                continue;
+            }
+
+            const auto& stats = strategy_it->second;
+            const double baseline_runtime_us =
+                auto_it == bucket->end() ? stats.average_runtime_us : auto_it->second.average_runtime_us;
+            const double baseline_head_runtime_us =
+                auto_it == bucket->end() ? stats.average_head_runtime_us : auto_it->second.average_head_runtime_us;
+            const double score = strategy_selection_score(
+                workload,
+                stats.observations,
+                stats.successful_observations,
+                stats.average_runtime_us,
+                stats.average_head_runtime_us,
+                stats.average_speedup_vs_reference,
+                stats.average_successful_operation_ratio,
+                baseline_runtime_us,
+                baseline_head_runtime_us);
+            if (score > best_score ||
+                (score == best_score && stats.average_speedup_vs_reference > best_speedup)) {
+                best_strategy = strategy;
+                best_score = score;
+                best_speedup = stats.average_speedup_vs_reference;
+                best_observations = stats.observations;
+            }
+        }
+
+        if (best_strategy == PartitionStrategy::auto_balanced) {
+            return {PartitionStrategy::auto_balanced, true};
+        }
+        if (best_score <= (auto_score + margin)) {
+            return {PartitionStrategy::auto_balanced, true};
+        }
+        if (best_observations == 0u) {
+            return {PartitionStrategy::auto_balanced, true};
+        }
+        return {best_strategy, true};
+    };
+
+    const auto exact_resolution = resolve_from_bucket(
+        exact_it == strategy_stats_.end() ? nullptr : &exact_it->second,
+        true,
+        kMinimumAutoBaselineObservations,
+        kLearnedStrategyMargin);
+    if (exact_resolution.strategy != PartitionStrategy::auto_balanced) {
+        return exact_resolution.strategy;
+    }
+
+    const auto family_resolution = resolve_from_bucket(
+        family_it == family_strategy_stats_.end() ? nullptr : &family_it->second,
+        false,
+        kMinimumFamilyAutoBaselineObservations,
+        kLearnedFamilyStrategyMargin);
+    if (family_resolution.strategy != PartitionStrategy::auto_balanced) {
+        return family_resolution.strategy;
+    }
+
+    if (exact_resolution.has_baseline || family_resolution.has_baseline) {
+        return PartitionStrategy::auto_balanced;
+    }
+    return PartitionStrategy::auto_balanced;
+}
 
 std::filesystem::path Planner::default_cache_path() {
     try {
@@ -283,8 +704,13 @@ std::filesystem::path Planner::default_cache_path() {
 ExecutionPlan Planner::build_plan(const WorkloadSpec& workload, const std::vector<HardwareGraph>& graphs) {
     load_cache();
 
+    const auto effective_strategy = resolve_partition_strategy(workload, graphs);
+    auto effective_workload = workload;
+    effective_workload.partition_strategy = effective_strategy;
+
     ExecutionPlan plan;
-    plan.signature = build_signature(workload, graphs);
+    plan.signature = build_signature(effective_workload, graphs);
+    plan.resolved_partition_strategy = effective_strategy;
 
     std::unordered_map<std::string, HardwareGraph> graph_lookup;
     for (const auto& graph : graphs) {
@@ -321,17 +747,17 @@ ExecutionPlan Planner::build_plan(const WorkloadSpec& workload, const std::vecto
     std::vector<Candidate> candidates;
     candidates.reserve(graphs.size());
 
-    const double compute_weight = compute_weight_from_workload(workload);
-    const double transfer_weight = workload.latency_sensitive ? 0.25 : 0.12;
+    const double compute_weight = compute_weight_from_workload(effective_workload);
+    const double transfer_weight = effective_workload.latency_sensitive ? 0.25 : 0.12;
     const double memory_weight = std::max(0.10, 1.0 - compute_weight - transfer_weight);
 
     for (const auto& graph : graphs) {
-        const auto components = score_graph(graph, workload);
+        const auto components = score_graph(graph, effective_workload);
 
         double score = (components.parallel_score * compute_weight) +
                        (components.memory_score * memory_weight);
         score *= components.graph_bonus;
-        score /= (1.0 + (components.transfer_penalty * (workload.latency_sensitive ? 1.4 : 0.8)));
+        score /= (1.0 + (components.transfer_penalty * (effective_workload.latency_sensitive ? 1.4 : 0.8)));
 
         if (components.memory_fit_cap < 0.05) {
             score *= components.memory_fit_cap;
@@ -364,7 +790,7 @@ ExecutionPlan Planner::build_plan(const WorkloadSpec& workload, const std::vecto
 
     const Candidate fallback_candidate = candidates.front();
 
-    if (workload.latency_sensitive && candidates.size() > 2) {
+    if (effective_workload.latency_sensitive && candidates.size() > 2) {
         candidates.resize(2);
     }
 
@@ -419,7 +845,7 @@ ExecutionPlan Planner::build_plan(const WorkloadSpec& workload, const std::vecto
         }
     }
 
-    if (uses_explicit_partition_strategy(workload)) {
+    if (uses_explicit_partition_strategy(effective_workload)) {
         const auto host_graph_it = std::find_if(graphs.begin(), graphs.end(), [](const HardwareGraph& graph) {
             return is_host_graph(graph);
         });
@@ -435,18 +861,18 @@ ExecutionPlan Planner::build_plan(const WorkloadSpec& workload, const std::vecto
                     return std::max(candidate_it->score, candidate_it->cap);
                 }
 
-                const auto components = score_graph(graph, workload);
+                const auto components = score_graph(graph, effective_workload);
                 double score = (components.parallel_score * compute_weight) +
                                (components.memory_score * memory_weight);
                 score *= components.graph_bonus;
-                score /= (1.0 + (components.transfer_penalty * (workload.latency_sensitive ? 1.4 : 0.8)));
+                score /= (1.0 + (components.transfer_penalty * (effective_workload.latency_sensitive ? 1.4 : 0.8)));
                 if (components.memory_fit_cap < 0.05) {
                     score *= components.memory_fit_cap;
                 }
                 return std::max(score, components.memory_fit_cap);
             };
 
-            const auto bias = partition_allocation_bias(workload.partition_strategy);
+            const auto bias = partition_allocation_bias(effective_workload.partition_strategy);
             const double total = std::max(1.0e-9, bias.host_ratio + bias.accelerator_ratio);
             const double host_score = score_for_graph(*host_graph_it);
             const double accelerator_score = score_for_graph(*accelerator_graph_it);
@@ -484,6 +910,38 @@ ExecutionPlan Planner::build_plan(const WorkloadSpec& workload, const std::vecto
     return plan;
 }
 
+void Planner::ingest_strategy_feedback(
+    const WorkloadSpec& workload,
+    const std::vector<HardwareGraph>& graphs,
+    const StrategyFeedbackSample& feedback) {
+    load_cache();
+
+    const auto ingest_into = [&](auto& store, const std::string& key) {
+        auto& stats = store[key][to_string(feedback.strategy)];
+        ++stats.observations;
+        if (feedback.all_succeeded) {
+            ++stats.successful_observations;
+        }
+
+        const double sample_count = static_cast<double>(stats.observations);
+        const double runtime_sample = std::max(feedback.total_runtime_us, 0.0);
+        const double head_runtime_sample =
+            feedback.head_runtime_us > 0.0 ? feedback.head_runtime_us : std::max(feedback.total_runtime_us, 0.0);
+        stats.average_runtime_us += (runtime_sample - stats.average_runtime_us) / sample_count;
+        stats.average_head_runtime_us += (head_runtime_sample - stats.average_head_runtime_us) / sample_count;
+        stats.average_speedup_vs_reference +=
+            (feedback.speedup_vs_reference - stats.average_speedup_vs_reference) / sample_count;
+        const double operation_success_ratio = std::clamp(feedback.successful_operation_ratio, 0.0, 1.0);
+        stats.average_successful_operation_ratio +=
+            (operation_success_ratio - stats.average_successful_operation_ratio) / sample_count;
+    };
+
+    ingest_into(strategy_stats_, build_learning_key(workload, graphs));
+    ingest_into(family_strategy_stats_, build_family_learning_key(workload, graphs));
+
+    persist_cache();
+}
+
 void Planner::load_cache() {
     if (cache_loaded_) {
         return;
@@ -515,6 +973,56 @@ void Planner::load_cache() {
             continue;
         }
     }
+
+    std::ifstream strategy_input(strategy_cache_path_for(cache_path_));
+    if (!strategy_input.is_open()) {
+        strategy_input.clear();
+    }
+
+    const auto load_strategy_store = [&](std::ifstream& stream, auto& store) {
+        std::string strategy_line;
+        while (std::getline(stream, strategy_line)) {
+            if (strategy_line.empty() || strategy_line[0] == '#') {
+                continue;
+            }
+
+            const auto fields = split_tab(strategy_line);
+            if (fields.size() != 6 && fields.size() != 8) {
+                continue;
+            }
+
+            try {
+                StrategyStats stats;
+                stats.observations = static_cast<std::uint32_t>(std::stoul(fields[2]));
+                stats.successful_observations = static_cast<std::uint32_t>(std::stoul(fields[3]));
+                stats.average_runtime_us = std::stod(fields[4]);
+                if (fields.size() == 8) {
+                    stats.average_head_runtime_us = std::stod(fields[5]);
+                    stats.average_speedup_vs_reference = std::stod(fields[6]);
+                    stats.average_successful_operation_ratio = std::stod(fields[7]);
+                } else {
+                    stats.average_head_runtime_us = stats.average_runtime_us;
+                    stats.average_speedup_vs_reference = std::stod(fields[5]);
+                    stats.average_successful_operation_ratio =
+                        stats.observations == 0u
+                            ? 1.0
+                            : static_cast<double>(stats.successful_observations) / static_cast<double>(stats.observations);
+                }
+                store[fields[0]][fields[1]] = stats;
+            } catch (const std::exception&) {
+                continue;
+            }
+        }
+    };
+
+    if (strategy_input.is_open()) {
+        load_strategy_store(strategy_input, strategy_stats_);
+    }
+
+    std::ifstream family_strategy_input(family_strategy_cache_path_for(cache_path_));
+    if (family_strategy_input.is_open()) {
+        load_strategy_store(family_strategy_input, family_strategy_stats_);
+    }
 }
 
 void Planner::persist_cache() const {
@@ -538,6 +1046,36 @@ void Planner::persist_cache() const {
                    << allocation.score << '\n';
         }
     }
+
+    std::ofstream strategy_output(strategy_cache_path_for(cache_path_), std::ios::trunc);
+    if (!strategy_output.is_open()) {
+        return;
+    }
+
+    const auto persist_strategy_store = [](std::ofstream& output, const auto& store) {
+        output
+            << "# learning_key\tstrategy\tobservations\tsuccesses\tavg_runtime_us\tavg_head_runtime_us\tavg_speedup\tavg_operation_success\n";
+        for (const auto& [learning_key, strategies] : store) {
+            for (const auto& [strategy, stats] : strategies) {
+                output << learning_key << '\t'
+                       << strategy << '\t'
+                       << stats.observations << '\t'
+                       << stats.successful_observations << '\t'
+                       << stats.average_runtime_us << '\t'
+                       << stats.average_head_runtime_us << '\t'
+                       << stats.average_speedup_vs_reference << '\t'
+                       << stats.average_successful_operation_ratio << '\n';
+            }
+        }
+    };
+
+    persist_strategy_store(strategy_output, strategy_stats_);
+
+    std::ofstream family_strategy_output(family_strategy_cache_path_for(cache_path_), std::ios::trunc);
+    if (!family_strategy_output.is_open()) {
+        return;
+    }
+    persist_strategy_store(family_strategy_output, family_strategy_stats_);
 }
 
 }  // namespace jakal

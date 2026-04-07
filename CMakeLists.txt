@@ -95,6 +95,20 @@ if(JAKAL_CORE_BUILD_TESTS)
 
     add_test(NAME jakal_optimization COMMAND jakal_optimization)
 
+    add_executable(jakal_planner_learning
+        tests/planner_strategy_learning.cpp
+        src/device.cpp
+        src/planner.cpp)
+    target_include_directories(jakal_planner_learning PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_features(jakal_planner_learning PRIVATE cxx_std_20)
+    if(MSVC)
+        target_compile_options(jakal_planner_learning PRIVATE /W4 /permissive-)
+        target_compile_definitions(jakal_planner_learning PRIVATE NOMINMAX)
+    else()
+        target_compile_options(jakal_planner_learning PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME jakal_planner_learning COMMAND jakal_planner_learning)
+
     add_executable(jakal_partition_strategies tests/partition_strategies.cpp)
     target_link_libraries(jakal_partition_strategies PRIVATE jakal::core)
 

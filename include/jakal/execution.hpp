@@ -286,6 +286,8 @@ struct OperationOptimizationResult {
 struct OptimizationReport {
     std::string signature;
     WorkloadKind workload_kind = WorkloadKind::custom;
+    WorkloadPhase workload_phase = WorkloadPhase::unknown;
+    std::string workload_shape_bucket;
     std::string dataset_tag;
     PartitionStrategy partition_strategy = PartitionStrategy::auto_balanced;
     WorkloadGraph workload_graph;

@@ -545,6 +545,10 @@ int main() {
         std::cerr << "Expected graph-level optimization passes.\n";
         return 1;
     }
+    if (first.graph_optimization.optimizer_name.find("bootstrap_general_optimizer:") != 0) {
+        std::cerr << "Expected bootstrap optimizer route on first optimize.\n";
+        return 1;
+    }
     if (first.graph_optimization.final_objective_us <= 0.0) {
         std::cerr << "Expected graph-level objective.\n";
         return 1;
@@ -618,6 +622,14 @@ int main() {
     std::cerr << "stage: second-optimize\n";
     if (!second.loaded_from_cache) {
         std::cerr << "Expected cached execution settings on second optimize call.\n";
+        return 1;
+    }
+    if (second.graph_optimization.optimizer_name.find("runtime_sensitive_optimizer:") != 0) {
+        std::cerr << "Expected runtime-sensitive optimizer route on cached optimize.\n";
+        return 1;
+    }
+    if (!second.graph_optimization.passes.empty()) {
+        std::cerr << "Expected lightweight runtime path to skip heavy graph passes.\n";
         return 1;
     }
     if (second.system_profile.readiness_score <= 0.0) {

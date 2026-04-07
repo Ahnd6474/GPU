@@ -348,7 +348,9 @@ std::vector<CpuDeepLearningExplorationPreset> cpu_deep_learning_exploration_pres
 
 WorkloadGraph default_workload_graph(const WorkloadSpec& workload) {
     WorkloadGraph graph;
-    graph.signature = workload.name + "|" + to_string(workload.kind) + "|" + workload.dataset_tag;
+    graph.signature = workload.name + "|" + to_string(workload.kind) + "|" + workload.dataset_tag +
+                      "|" + to_string(canonical_workload_phase(workload)) +
+                      "|" + canonical_workload_shape_bucket(workload);
 
     const std::uint64_t working_set =
         workload.working_set_bytes == 0 ? (32ull * kMiB) : workload.working_set_bytes;
