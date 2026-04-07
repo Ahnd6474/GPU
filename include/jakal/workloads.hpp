@@ -26,10 +26,14 @@ struct WorkloadManifest {
     WorkloadGraph graph;
     bool has_graph = false;
     std::filesystem::path source_path;
+    std::string source_format = "manifest";
+    std::string source_entry;
+    bool imported = false;
 };
 
 [[nodiscard]] std::vector<CanonicalWorkloadPreset> canonical_workload_presets();
 [[nodiscard]] std::vector<CpuDeepLearningExplorationPreset> cpu_deep_learning_exploration_presets();
+[[nodiscard]] WorkloadManifest load_workload_source(const std::filesystem::path& path);
 [[nodiscard]] WorkloadManifest load_workload_manifest(const std::filesystem::path& path);
 void normalize_workload_graph(WorkloadGraph& graph);
 

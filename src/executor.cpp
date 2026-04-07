@@ -98,6 +98,17 @@ std::string sanitize_id_fragment(const std::string& text) {
     return result;
 }
 
+std::string format_extents(const std::vector<std::uint64_t>& extents) {
+    std::ostringstream stream;
+    for (std::size_t index = 0; index < extents.size(); ++index) {
+        if (index > 0u) {
+            stream << 'x';
+        }
+        stream << extents[index];
+    }
+    return stream.str();
+}
+
 using executors::BackendRunResult;
 using executors::DeviceAssignment;
 using executors::OperationData;
@@ -1396,214 +1407,184 @@ DirectExecutionReport DirectExecutor::execute(
     bool all_succeeded = true;
 
     for (const auto& optimized : optimization.operations) {
-        const auto assignments =
-            scheduler.make_assignments(optimization, optimized, graphs, shardable_items(optimized.operation));
-        if (assignments.empty()) {
-            all_succeeded = false;
-            continue;
-        }
-
-        const auto operation_data = make_operation_data(optimized.operation);
-        OperationExecutionRecord record;
-        record.operation_name = optimized.operation.name;
-        record.backend_name = actual_backend_name(assignments, jakal_toolkit_index, optimized.operation);
-        record.participating_devices = optimized.config.participating_devices;
-        record.used_multiple_devices = assignments.size() > 1;
-        record.logical_partitions_used = optimized.config.logical_partitions;
-        for (const auto& assignment : assignments) {
-            if (assignment.graph->probe == "host") {
+        try {
+            const auto assignments =
+                scheduler.make_assignments(optimization, optimized, graphs, shardable_items(optimized.operation));
+            if (assignments.empty()) {
+                all_succeeded = false;
                 continue;
             }
-            const auto* preferred_gpu_variant =
-                find_preferred_gpu_variant(assignment, jakal_toolkit_index, optimized.operation);
-            if (preferred_gpu_variant != nullptr) {
-                record.requested_gpu_vendor = to_string(preferred_gpu_variant->binding.vendor);
-                record.requested_gpu_backend = to_string(preferred_gpu_variant->binding.backend);
-                break;
-            }
-        }
 
-        const bool reference_low_precision = false;
-        std::vector<float> reference_vector;
-        double reference_scalar = 0.0;
-
-        switch (optimized.operation.op_class) {
-        case OperationClass::elementwise_map: {
-            const auto reference =
-                host_backend->run_elementwise(HardwareGraph{}, operation_data.input0, operation_data.input1, reference_low_precision);
-            record.reference_runtime_us = reference.runtime_us;
-            reference_vector = reference.output;
-            break;
-        }
-        case OperationClass::reduction: {
-            const auto reference = host_backend->run_reduction(HardwareGraph{}, operation_data.input0, reference_low_precision);
-            record.reference_runtime_us = reference.runtime_us;
-            reference_scalar = reference.scalar_output;
-            break;
-        }
-        case OperationClass::matmul: {
-            const auto reference = host_backend->run_matmul(
-                HardwareGraph{},
-                operation_data.input0,
-                operation_data.input1,
-                static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
-                static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
-                static_cast<std::uint32_t>(optimized.operation.extents.at(2)),
-                reference_low_precision);
-            record.reference_runtime_us = reference.runtime_us;
-            reference_vector = reference.output;
-            break;
-        }
-        case OperationClass::convolution_2d: {
-            const auto reference = host_backend->run_conv3x3(
-                HardwareGraph{},
-                operation_data.input0,
-                static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
-                static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
-                reference_low_precision);
-            record.reference_runtime_us = reference.runtime_us;
-            reference_vector = reference.output;
-            break;
-        }
-        case OperationClass::resample_2d:
-        default: {
-            const auto reference = host_backend->run_resample(
-                HardwareGraph{},
-                operation_data.input0,
-                static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
-                static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
-                static_cast<std::uint32_t>(optimized.operation.extents.at(2)),
-                static_cast<std::uint32_t>(optimized.operation.extents.at(3)),
-                0,
-                static_cast<std::uint32_t>(optimized.operation.extents.at(2)),
-                reference_low_precision);
-            record.reference_runtime_us = reference.runtime_us;
-            reference_vector = reference.output;
-            break;
-        }
-        }
-
-        std::vector<float> merged_output;
-        double merged_scalar = 0.0;
-        if (optimized.operation.op_class != OperationClass::reduction) {
-            switch (optimized.operation.op_class) {
-            case OperationClass::elementwise_map:
-            case OperationClass::reduction:
-                break;
-            case OperationClass::matmul:
-                merged_output.resize(
-                    static_cast<std::size_t>(optimized.operation.extents.at(0) * optimized.operation.extents.at(1)),
-                    0.0f);
-                break;
-            case OperationClass::convolution_2d:
-                merged_output.resize(
-                    static_cast<std::size_t>((optimized.operation.extents.at(0) - 2u) * (optimized.operation.extents.at(1) - 2u)),
-                    0.0f);
-                break;
-            case OperationClass::resample_2d:
-            default:
-                merged_output.resize(
-                    static_cast<std::size_t>(optimized.operation.extents.at(2) * optimized.operation.extents.at(3)),
-                    0.0f);
-                break;
-            }
-            if (optimized.operation.op_class == OperationClass::elementwise_map) {
-                merged_output.resize(static_cast<std::size_t>(optimized.operation.extents.at(0)), 0.0f);
-            }
-        }
-
-        std::vector<std::future<BackendRunResult>> futures;
-        futures.reserve(assignments.size());
-        double simulated_runtime_us = 0.0;
-        const auto wall_runtime_us = measure_us([&]() {
-            const auto merge_shard = [&](const BackendRunResult& shard, const DeviceAssignment& assignment) {
-                record.used_host = record.used_host || shard.used_host;
-                record.used_opencl = record.used_opencl || shard.used_opencl;
-                if (!shard.error.empty()) {
-                    if (!record.backend_error.empty()) {
-                        record.backend_error += "; ";
-                    }
-                    record.backend_error += shard.error;
+            const auto operation_data = make_operation_data(optimized.operation);
+            OperationExecutionRecord record;
+            record.operation_name = optimized.operation.name;
+            record.backend_name = actual_backend_name(assignments, jakal_toolkit_index, optimized.operation);
+            record.participating_devices = optimized.config.participating_devices;
+            record.used_multiple_devices = assignments.size() > 1;
+            record.logical_partitions_used = optimized.config.logical_partitions;
+            for (const auto& assignment : assignments) {
+                if (assignment.graph->probe == "host") {
+                    continue;
                 }
-                simulated_runtime_us = std::max(simulated_runtime_us, shard.runtime_us);
+                const auto* preferred_gpu_variant =
+                    find_preferred_gpu_variant(assignment, jakal_toolkit_index, optimized.operation);
+                if (preferred_gpu_variant != nullptr) {
+                    record.requested_gpu_vendor = to_string(preferred_gpu_variant->binding.vendor);
+                    record.requested_gpu_backend = to_string(preferred_gpu_variant->binding.backend);
+                    break;
+                }
+            }
+
+            const bool reference_low_precision = false;
+            std::vector<float> reference_vector;
+            double reference_scalar = 0.0;
+
+            switch (optimized.operation.op_class) {
+            case OperationClass::elementwise_map: {
+                const auto reference = host_backend->run_elementwise(
+                    HardwareGraph{},
+                    operation_data.input0,
+                    operation_data.input1,
+                    reference_low_precision);
+                record.reference_runtime_us = reference.runtime_us;
+                reference_vector = reference.output;
+                break;
+            }
+            case OperationClass::reduction: {
+                const auto reference = host_backend->run_reduction(HardwareGraph{}, operation_data.input0, reference_low_precision);
+                record.reference_runtime_us = reference.runtime_us;
+                reference_scalar = reference.scalar_output;
+                break;
+            }
+            case OperationClass::matmul: {
+                const auto reference = host_backend->run_matmul(
+                    HardwareGraph{},
+                    operation_data.input0,
+                    operation_data.input1,
+                    static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
+                    static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
+                    static_cast<std::uint32_t>(optimized.operation.extents.at(2)),
+                    reference_low_precision);
+                record.reference_runtime_us = reference.runtime_us;
+                reference_vector = reference.output;
+                break;
+            }
+            case OperationClass::convolution_2d: {
+                const auto reference = host_backend->run_conv3x3(
+                    HardwareGraph{},
+                    operation_data.input0,
+                    static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
+                    static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
+                    reference_low_precision);
+                record.reference_runtime_us = reference.runtime_us;
+                reference_vector = reference.output;
+                break;
+            }
+            case OperationClass::resample_2d:
+            default: {
+                const auto reference = host_backend->run_resample(
+                    HardwareGraph{},
+                    operation_data.input0,
+                    static_cast<std::uint32_t>(optimized.operation.extents.at(0)),
+                    static_cast<std::uint32_t>(optimized.operation.extents.at(1)),
+                    static_cast<std::uint32_t>(optimized.operation.extents.at(2)),
+                    static_cast<std::uint32_t>(optimized.operation.extents.at(3)),
+                    0,
+                    static_cast<std::uint32_t>(optimized.operation.extents.at(2)),
+                    reference_low_precision);
+                record.reference_runtime_us = reference.runtime_us;
+                reference_vector = reference.output;
+                break;
+            }
+            }
+
+            std::vector<float> merged_output;
+            double merged_scalar = 0.0;
+            if (optimized.operation.op_class != OperationClass::reduction) {
                 switch (optimized.operation.op_class) {
                 case OperationClass::elementwise_map:
-                    std::copy(
-                        shard.output.begin(),
-                        shard.output.end(),
-                        merged_output.begin() + static_cast<std::ptrdiff_t>(assignment.shard.start));
-                    break;
                 case OperationClass::reduction:
-                    merged_scalar += shard.scalar_output;
                     break;
-                case OperationClass::matmul: {
-                    const auto columns = static_cast<std::size_t>(optimized.operation.extents.at(1));
-                    std::copy(
-                        shard.output.begin(),
-                        shard.output.end(),
-                        merged_output.begin() + static_cast<std::ptrdiff_t>(assignment.shard.start * columns));
+                case OperationClass::matmul:
+                    merged_output.resize(
+                        static_cast<std::size_t>(optimized.operation.extents.at(0) * optimized.operation.extents.at(1)),
+                        0.0f);
                     break;
-                }
-                case OperationClass::convolution_2d: {
-                    const auto out_width = static_cast<std::size_t>(optimized.operation.extents.at(1) - 2u);
-                    std::copy(
-                        shard.output.begin(),
-                        shard.output.end(),
-                        merged_output.begin() + static_cast<std::ptrdiff_t>(assignment.shard.start * out_width));
+                case OperationClass::convolution_2d:
+                    merged_output.resize(
+                        static_cast<std::size_t>((optimized.operation.extents.at(0) - 2u) * (optimized.operation.extents.at(1) - 2u)),
+                        0.0f);
                     break;
-                }
                 case OperationClass::resample_2d:
-                default: {
-                    const auto out_width = static_cast<std::size_t>(optimized.operation.extents.at(3));
-                    std::copy(
-                        shard.output.begin(),
-                        shard.output.end(),
-                        merged_output.begin() + static_cast<std::ptrdiff_t>(assignment.shard.start * out_width));
+                default:
+                    merged_output.resize(
+                        static_cast<std::size_t>(optimized.operation.extents.at(2) * optimized.operation.extents.at(3)),
+                        0.0f);
                     break;
                 }
+                if (optimized.operation.op_class == OperationClass::elementwise_map) {
+                    merged_output.resize(static_cast<std::size_t>(optimized.operation.extents.at(0)), 0.0f);
                 }
-            };
-
-            if (assignments.size() == 1) {
-                const auto* preferred_gpu_variant =
-                    find_preferred_gpu_variant(assignments.front(), jakal_toolkit_index, optimized.operation);
-                const auto shard =
-                    dispatch_backend(
-                        assignments.front(),
-                        optimized,
-                        operation_data,
-                        *host_backend,
-                        opencl_backend,
-                        *level_zero_backend,
-                        *cuda_backend,
-                        *rocm_backend,
-                        *vulkan_backend,
-                        preferred_gpu_variant);
-                if (!shard.success) {
-                    all_succeeded = false;
-                    return;
-                }
-                merge_shard(shard, assignments.front());
-                return;
             }
 
-            for (const auto& assignment : assignments) {
-                futures.push_back(std::async(
-                    std::launch::async,
-                    [&optimized,
-                     &operation_data,
-                     &host_backend,
-                     &opencl_backend,
-                     &level_zero_backend,
-                     &cuda_backend,
-                     &rocm_backend,
-                     &vulkan_backend,
-                     &jakal_toolkit_index,
-                     assignment]() {
-                        const auto* preferred_gpu_variant =
-                            find_preferred_gpu_variant(assignment, jakal_toolkit_index, optimized.operation);
-                        return dispatch_backend(
-                            assignment,
+            std::vector<std::future<BackendRunResult>> futures;
+            futures.reserve(assignments.size());
+            double simulated_runtime_us = 0.0;
+            const auto wall_runtime_us = measure_us([&]() {
+                const auto merge_shard = [&](const BackendRunResult& shard, const DeviceAssignment& assignment) {
+                    record.used_host = record.used_host || shard.used_host;
+                    record.used_opencl = record.used_opencl || shard.used_opencl;
+                    if (!shard.error.empty()) {
+                        if (!record.backend_error.empty()) {
+                            record.backend_error += "; ";
+                        }
+                        record.backend_error += shard.error;
+                    }
+                    simulated_runtime_us = std::max(simulated_runtime_us, shard.runtime_us);
+                    switch (optimized.operation.op_class) {
+                    case OperationClass::elementwise_map:
+                        std::copy(
+                            shard.output.begin(),
+                            shard.output.end(),
+                            merged_output.begin() + static_cast<std::ptrdiff_t>(assignment.shard.start));
+                        break;
+                    case OperationClass::reduction:
+                        merged_scalar += shard.scalar_output;
+                        break;
+                    case OperationClass::matmul: {
+                        const auto columns = static_cast<std::size_t>(optimized.operation.extents.at(1));
+                        std::copy(
+                            shard.output.begin(),
+                            shard.output.end(),
+                            merged_output.begin() + static_cast<std::ptrdiff_t>(assignment.shard.start * columns));
+                        break;
+                    }
+                    case OperationClass::convolution_2d: {
+                        const auto out_width = static_cast<std::size_t>(optimized.operation.extents.at(1) - 2u);
+                        std::copy(
+                            shard.output.begin(),
+                            shard.output.end(),
+                            merged_output.begin() + static_cast<std::ptrdiff_t>(assignment.shard.start * out_width));
+                        break;
+                    }
+                    case OperationClass::resample_2d:
+                    default: {
+                        const auto out_width = static_cast<std::size_t>(optimized.operation.extents.at(3));
+                        std::copy(
+                            shard.output.begin(),
+                            shard.output.end(),
+                            merged_output.begin() + static_cast<std::ptrdiff_t>(assignment.shard.start * out_width));
+                        break;
+                    }
+                    }
+                };
+
+                if (assignments.size() == 1) {
+                    const auto* preferred_gpu_variant =
+                        find_preferred_gpu_variant(assignments.front(), jakal_toolkit_index, optimized.operation);
+                    const auto shard =
+                        dispatch_backend(
+                            assignments.front(),
                             optimized,
                             operation_data,
                             *host_backend,
@@ -1613,33 +1594,74 @@ DirectExecutionReport DirectExecutor::execute(
                             *rocm_backend,
                             *vulkan_backend,
                             preferred_gpu_variant);
-                    }));
-            }
-
-            for (std::size_t index = 0; index < assignments.size(); ++index) {
-                auto shard = futures[index].get();
-                if (!shard.success) {
-                    all_succeeded = false;
-                    continue;
+                    if (!shard.success) {
+                        all_succeeded = false;
+                        return;
+                    }
+                    merge_shard(shard, assignments.front());
+                    return;
                 }
 
-                merge_shard(shard, assignments[index]);
-            }
-        });
+                for (const auto& assignment : assignments) {
+                    futures.push_back(std::async(
+                        std::launch::async,
+                        [&optimized,
+                         &operation_data,
+                         &host_backend,
+                         &opencl_backend,
+                         &level_zero_backend,
+                         &cuda_backend,
+                         &rocm_backend,
+                         &vulkan_backend,
+                         &jakal_toolkit_index,
+                         assignment]() {
+                            const auto* preferred_gpu_variant =
+                                find_preferred_gpu_variant(assignment, jakal_toolkit_index, optimized.operation);
+                            return dispatch_backend(
+                                assignment,
+                                optimized,
+                                operation_data,
+                                *host_backend,
+                                opencl_backend,
+                                *level_zero_backend,
+                                *cuda_backend,
+                                *rocm_backend,
+                                *vulkan_backend,
+                                preferred_gpu_variant);
+                        }));
+                }
 
-        record.runtime_us = simulated_runtime_us > 0.0 ? simulated_runtime_us : wall_runtime_us;
-        record.speedup_vs_reference =
-            record.runtime_us > 0.0 ? (record.reference_runtime_us / record.runtime_us) : 1.0;
-        if (optimized.operation.op_class == OperationClass::reduction) {
-            record.relative_error = scalar_relative_error(reference_scalar, merged_scalar);
-        } else {
-            record.relative_error = relative_l2_error(reference_vector, merged_output);
+                for (std::size_t index = 0; index < assignments.size(); ++index) {
+                    auto shard = futures[index].get();
+                    if (!shard.success) {
+                        all_succeeded = false;
+                        continue;
+                    }
+
+                    merge_shard(shard, assignments[index]);
+                }
+            });
+
+            record.runtime_us = simulated_runtime_us > 0.0 ? simulated_runtime_us : wall_runtime_us;
+            record.speedup_vs_reference =
+                record.runtime_us > 0.0 ? (record.reference_runtime_us / record.runtime_us) : 1.0;
+            if (optimized.operation.op_class == OperationClass::reduction) {
+                record.relative_error = scalar_relative_error(reference_scalar, merged_scalar);
+            } else {
+                record.relative_error = relative_l2_error(reference_vector, merged_output);
+            }
+            record.verified = record.relative_error <= optimized.operation.max_relative_error;
+            all_succeeded = all_succeeded && record.verified;
+            report.total_runtime_us += record.runtime_us;
+            report.total_reference_runtime_us += record.reference_runtime_us;
+            report.operations.push_back(std::move(record));
+        } catch (const std::exception& error) {
+            std::ostringstream message;
+            message << "direct execution failed for operation '" << optimized.operation.name << "' ("
+                    << to_string(optimized.operation.op_class) << ", extents=" << format_extents(optimized.operation.extents)
+                    << "): " << error.what();
+            throw std::runtime_error(message.str());
         }
-        record.verified = record.relative_error <= optimized.operation.max_relative_error;
-        all_succeeded = all_succeeded && record.verified;
-        report.total_runtime_us += record.runtime_us;
-        report.total_reference_runtime_us += record.reference_runtime_us;
-        report.operations.push_back(std::move(record));
     }
 
     report.speedup_vs_reference =

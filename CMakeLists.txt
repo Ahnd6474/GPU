@@ -118,5 +118,10 @@ if(JAKAL_CORE_BUILD_TESTS)
     target_link_libraries(jakal_runtime_product PRIVATE jakal::core)
 
     add_test(NAME jakal_runtime_product COMMAND jakal_runtime_product)
+
+    add_executable(jakal_workload_import_adapters tests/workload_import_adapters.cpp)
+    target_link_libraries(jakal_workload_import_adapters PRIVATE jakal::core)
+
+    add_test(NAME jakal_workload_import_adapters COMMAND jakal_workload_import_adapters)
 endif()
 
