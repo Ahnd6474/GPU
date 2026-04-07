@@ -505,7 +505,10 @@ std::string get_platform_string(cl_get_platform_info_fn getter, cl_platform_id p
 
 constexpr const char* kOpenClProgramSource = R"CLC(
 inline float q(float value, int low_precision) {
-  return low_precision ? rint(value * 1024.0f) / 1024.0f : value;
+  if (!low_precision) return value;
+  float scaled = value * 1024.0f;
+  float rounded = scaled >= 0.0f ? floor(scaled + 0.5f) : -floor((-scaled) + 0.5f);
+  return rounded / 1024.0f;
 }
 
 __kernel void elementwise_map(

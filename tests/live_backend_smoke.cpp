@@ -46,11 +46,22 @@ jakal::RuntimeOptions parse_options(int argc, char** argv) {
     return options;
 }
 
+bool parse_low_precision(int argc, char** argv) {
+    for (int index = 1; index < argc; ++index) {
+        const std::string arg = argv[index];
+        if (arg == "--highp") {
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     try {
         const auto options = parse_options(argc, argv);
+        const bool low_precision = parse_low_precision(argc, argv);
         std::cout << "runtime-init\n" << std::flush;
         jakal::Runtime runtime(options);
         print_devices(runtime);
@@ -65,7 +76,7 @@ int main(int argc, char** argv) {
             4,
             false,
             false,
-            true};
+            low_precision};
 
         std::cout << "plan\n" << std::flush;
         const auto plan = runtime.plan(workload);

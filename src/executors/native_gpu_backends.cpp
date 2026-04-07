@@ -176,7 +176,10 @@ int run_command(const std::string& command) {
 
 constexpr const char* kCudaLikeProgramSource = R"GPU(
 extern "C" __device__ __forceinline__ float q(float value, int low_precision) {
-  return low_precision ? rintf(value * 1024.0f) / 1024.0f : value;
+  if (!low_precision) return value;
+  const float scaled = value * 1024.0f;
+  const float rounded = scaled >= 0.0f ? floorf(scaled + 0.5f) : -floorf((-scaled) + 0.5f);
+  return rounded / 1024.0f;
 }
 extern "C" __global__ void elementwise_map(const float* lhs,const float* rhs,float* out,unsigned int count,int low_precision) {
   const unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -252,7 +255,12 @@ extern "C" __global__ void bilinear_resample(const float* input,float* output,un
 )GPU";
 
 constexpr const char* kOpenClProgramSource = R"CLC(
-inline float q(float value, int low_precision) { return low_precision ? rint(value * 1024.0f) / 1024.0f : value; }
+inline float q(float value, int low_precision) {
+  if (!low_precision) return value;
+  float scaled = value * 1024.0f;
+  float rounded = scaled >= 0.0f ? floor(scaled + 0.5f) : -floor((-scaled) + 0.5f);
+  return rounded / 1024.0f;
+}
 __kernel void elementwise_map(__global const float* lhs,__global const float* rhs,__global float* out,uint count,int low_precision) {
   uint gid = get_global_id(0); if (gid >= count) return;
   float left = q(lhs[gid] * 1.125f, low_precision); float right = q(rhs[gid] * 0.25f, low_precision);

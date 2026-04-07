@@ -2,7 +2,7 @@
 
 Graph-first heterogeneous compute runtime skeleton for C++20.
 
-This repository is `Jakal-Core`. The CMake project, library target, and public headers now use the `Jakal-Core` naming scheme consistently.
+This repository builds the `jakal_core` library target, publishes headers under `include/jakal`, and includes runnable examples and tests around the runtime skeleton.
 
 Jakal-Core is not a production runtime yet. It is a small CMake library with examples and tests that:
 
@@ -21,6 +21,7 @@ Jakal-Core is not a production runtime yet. It is a small CMake library with exa
 - [API](#api)
   - [C++ entry points](#c-entry-points)
   - [Workload helpers](#workload-helpers)
+  - [Managed execution and manifests](#managed-execution-and-manifests)
   - [C API](#c-api)
   - [Cache files](#cache-files)
 - [Examples](#examples)
@@ -49,14 +50,10 @@ cmake -S . -B build
 cmake --build build
 ```
 
-The default build produces:
+The default build produces the `jakal_core` library plus these executables when examples and tests are enabled:
 
-- `jakal_core`
-- `jakal_inspect`
-- `jakal_profile_workloads`
-- `jakal_explore_cpu_dl`
-- `jakal_smoke`
-- `jakal_optimization`
+- examples: `jakal_inspect`, `jakal_profile_workloads`, `jakal_explore_cpu_dl`, `jakal_partition_roles`
+- test binaries: `jakal_smoke`, `jakal_optimization`, `jakal_planner_learning`, `jakal_partition_strategies`, `jakal_runtime_product`, `jakal_workload_import_adapters`, `jakal_backend_contracts`, `jakal_live_backend_smoke`, `jakal_preset_execution_diag`
 
 Useful CMake switches:
 
@@ -164,12 +161,14 @@ This is where the repository actually stands today:
 - Discovery can use host, OpenCL, Level Zero, CUDA, and ROCm probes when the matching runtime libraries are present.
 - Planning and optimization work across those discovered graphs.
 - The direct executor can run host kernels, OpenCL kernels, and some native Level Zero, CUDA, and ROCm kernels.
+- The managed execution layer can run native workload manifests, do memory preflight checks, emit residency and asset-prefetch plans, and write TSV telemetry.
+- `load_workload_source(...)` can build workload graphs from native manifests and imported model descriptions such as ONNX and GGUF.
 - Native backend coverage is uneven. Missing native kernels fall back to host execution rather than pretending the backend is complete.
 - The toolkit-ranking layer and planner can reason about more backend variants than the direct executor can run end to end.
 
 What is still missing:
 
-- real tensor residency management and allocators
+- real tensor allocators and residency movement beyond the current planning and diagnostics layer
 - framework bridges for PyTorch, TensorFlow, or similar runtimes
 - packaging and install rules for downstream consumers
 - a stable production execution stack with mature backend coverage
@@ -195,13 +194,19 @@ The main public headers are:
 | `jakal_toolkit_index()` | Returns ranked backend variants per discovered device |
 | `plan(workload)` | Builds or loads a cached placement plan |
 | `optimize(workload)` | Builds workload and execution graphs, then picks execution settings |
+| `optimize(workload, workload_graph)` | Optimizes an explicit workload graph instead of generating the default one |
 | `execute(workload)` | Runs the selected execution path and feeds the results back into the optimizer |
+| `execute_managed(workload)` | Runs placement, optimization, safety gates, and direct execution with extra diagnostics |
+| `execute_managed(workload, workload_graph)` | Managed execution for a caller-supplied workload graph |
+| `execute_manifest(path)` | Loads a manifest or imported workload source, then runs the managed path |
 
 `jakal::RuntimeOptions` lets you:
 
 - enable or disable host, OpenCL, Level Zero, CUDA, and ROCm probes
+- prefer Level Zero over OpenCL when both match the same hardware
 - override the plan cache path
 - override the execution cache path
+- tune memory, safety, and observability policy through `RuntimeProductPolicy`
 
 `jakal::WorkloadSpec` is the main planning input.
 
@@ -217,6 +222,9 @@ The main public headers are:
 | `latency_sensitive` | `bool` | Whether latency should be favored over throughput |
 | `prefer_unified_memory` | `bool` | Whether unified memory should get extra weight |
 | `matrix_friendly` | `bool` | Whether the workload looks friendly to GEMM-style hardware |
+| `partition_strategy` | `jakal::PartitionStrategy` | Optional explicit strategy override such as `role_split` or `projection_sharded` |
+| `phase` | `jakal::WorkloadPhase` | Phase hint such as `prefill`, `decode`, or `training_step` |
+| `shape_bucket` | `std::string` | Optional bucket used for cache reuse and planning families |
 
 ### Workload helpers
 
@@ -226,6 +234,93 @@ If you do not want to invent workloads by hand, [`include/jakal/workloads.hpp`](
 - `cpu_deep_learning_exploration_presets()` for host-heavy inference cases such as decode, KV-cache maintenance, and dequant pipelines
 
 `default_workload_graph(workload)` expands a `WorkloadSpec` into a `WorkloadGraph` with tensors, lifetimes, dependencies, and operation metadata.
+
+The same header also exposes:
+
+- `load_workload_source(path)` to load a native manifest or an imported source file
+- `load_workload_manifest(path)` as the explicit manifest entry point
+- `normalize_workload_graph(graph)` to rebuild tensor lifetimes and dependency bookkeeping after manual edits
+
+The adapter tests currently cover:
+
+- native `.workload` manifests with optional `[asset]`, `[tensor]`, `[operation]`, and `[dependency]` sections
+- `.onnx` graphs, including external data blobs
+- `.gguf` weights, including shard discovery
+- text-based imported descriptions used for PyTorch-export and GGML-style inputs
+
+### Managed execution and manifests
+
+`jakal::RuntimeProductPolicy` is the part of `RuntimeOptions` that controls:
+
+- memory reserve ratios and preflight blocking
+- planner confidence and rollback gates
+- telemetry persistence
+
+`ManagedExecutionReport` adds these diagnostics on top of the direct execution report:
+
+- resolved placement plan and planner confidence
+- memory preflight and spill predictions
+- kernel coverage checks
+- asset prefetch entries
+- residency sequence actions
+- telemetry output path
+
+If you want to run a manifest directly, `execute_manifest(...)` accepts both a spec-only manifest and a graph-backed manifest. A minimal graph-backed example looks like this:
+
+```ini
+[workload]
+name=manifest-exec
+kind=inference
+dataset_tag=manifest-exec-lite
+phase=decode
+working_set_bytes=8388608
+host_exchange_bytes=1048576
+estimated_flops=12000000
+batch_size=1
+latency_sensitive=true
+prefer_unified_memory=true
+
+[asset]
+id=weights-shard
+path=weights.bin
+tensor_ids=weights
+preload_required=true
+persistent=true
+host_visible=true
+
+[tensor]
+id=input
+bytes=16384
+consumers=normalize
+host_visible=true
+
+[tensor]
+id=weights
+bytes=16384
+consumers=normalize
+persistent=true
+host_visible=true
+
+[tensor]
+id=hidden
+bytes=16384
+producer=normalize
+consumers=score
+
+[operation]
+name=normalize
+class=elementwise_map
+extents=4096
+input_bytes=32768
+output_bytes=16384
+estimated_flops=8192
+parallelizable=true
+streaming_friendly=true
+inputs=input,weights
+outputs=hidden
+```
+
+If `weights.bin` is required and missing, `execute_manifest(...)` returns a managed report with `asset_prefetch.missing_required_assets=true`, marks the run as not executed, and still writes telemetry.
 
 ### C API
 
@@ -249,6 +344,8 @@ Planning, optimization, and execution:
 - `jakal_core_runtime_optimize`
 - `jakal_core_runtime_execute`
 
+The C API currently stops at the direct execution layer. Managed execution, manifest loading, asset-prefetch planning, and telemetry controls are C++-only for now.
+
 Accepted `jakal_core_workload_spec.kind` strings are:
 
 - `custom`
@@ -267,6 +364,7 @@ By default the runtime writes lightweight TSV caches to the system temp director
 - `jakal_core_plan_cache.tsv`
 - `jakal_core_execution_cache.tsv`
 - `jakal_core_execution_cache.tsv.perf`
+- `jakal_core_runtime_telemetry.tsv`
 
 You can redirect those files through `jakal::RuntimeOptions`.
 
@@ -328,6 +426,22 @@ The output includes:
 - per-operation strategy and partition counts
 - backend counts when execution is enabled
 
+### Compare role-aware partition strategies
+
+This example needs both a host device and at least one accelerator:
+
+```powershell
+.\build\Debug\jakal_partition_roles.exe
+```
+
+You can also pass a CPU-deep-learning preset name or dataset tag:
+
+```powershell
+.\build\Debug\jakal_partition_roles.exe llm-decode-token-lite
+```
+
+It replays the same workload through several hand-picked strategies such as `role-split`, `reduce-on-gpu`, and `projection-sharded-4`, then prints per-operation device placement, partition counts, backend choices, and runtime comparisons.
+
 ### Run the tests
 
 For multi-config generators such as Visual Studio:
@@ -349,14 +463,27 @@ You can also run the binaries directly:
 .\build\Debug\jakal_optimization.exe
 ```
 
+Other useful standalone test binaries include:
+
+- `jakal_planner_learning` for strategy-learning cache behavior
+- `jakal_partition_strategies` for explicit partition strategy coverage
+- `jakal_runtime_product` for managed execution, memory gates, manifests, and telemetry
+- `jakal_workload_import_adapters` for ONNX, GGUF, GGML-style, and PyTorch-export import coverage
+- `jakal_backend_contracts` and `jakal_live_backend_smoke` for backend probing and execution checks
+
+`jakal_preset_execution_diag` is built with tests enabled, but it is not currently registered with `ctest`.
+
 ## Further reading
 
 - [`examples/inspect_runtime.cpp`](./examples/inspect_runtime.cpp) for a fuller C++ walkthrough
 - [`examples/profile_workloads.cpp`](./examples/profile_workloads.cpp) for preset profiling
 - [`examples/explore_cpu_dl.cpp`](./examples/explore_cpu_dl.cpp) for host-versus-accelerator experiments
+- [`examples/partition_roles.cpp`](./examples/partition_roles.cpp) for role-aware host/GPU partition experiments
 - [`examples/compare_host_workloads.cpp`](./examples/compare_host_workloads.cpp) for an extra profiling utility that is present in the source tree but not wired into the default CMake targets
 - [`tests/smoke.cpp`](./tests/smoke.cpp) for the smallest end-to-end path
 - [`tests/optimization.cpp`](./tests/optimization.cpp) for graph, cache, and backend coverage checks
+- [`tests/runtime_product.cpp`](./tests/runtime_product.cpp) for managed execution, manifest parsing, asset prefetch, and telemetry behavior
+- [`tests/workload_import_adapters.cpp`](./tests/workload_import_adapters.cpp) for imported workload-source coverage
 
 ## License
 
