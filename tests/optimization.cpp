@@ -603,6 +603,301 @@ bool verify_aggressive_graph_rewrites() {
     return true;
 }
 
+jakal::WorkloadGraph make_runtime_signal_meta_graph() {
+    jakal::WorkloadGraph graph;
+    graph.signature = "runtime-meta-signal";
+    graph.tensors = {
+        {"signal-in", "signal-in", "", {"analysis", "gate"}, 32ull * 1024ull * sizeof(float), false, false, true},
+        {"analysis-w", "analysis-w", "", {"analysis"}, 1024ull * 512ull * sizeof(float), true, false, false},
+        {"spectrum", "spectrum", "analysis", {"relu"}, 32ull * 512ull * sizeof(float), false, true, false},
+        {"activated", "activated", "relu", {"synthesis"}, 32ull * 512ull * sizeof(float), false, true, false},
+        {"synthesis-w", "synthesis-w", "", {"synthesis"}, 512ull * 256ull * sizeof(float), true, false, false},
+        {"bank", "bank", "synthesis", {"mix"}, 32ull * 256ull * sizeof(float), false, true, false},
+        {"gate-w", "gate-w", "", {"gate"}, 1024ull * 256ull * sizeof(float), true, false, false},
+        {"gate-raw", "gate-raw", "gate", {"sigmoid"}, 32ull * 256ull * sizeof(float), false, true, false},
+        {"gains", "gains", "sigmoid", {"mix"}, 32ull * 256ull * sizeof(float), false, true, false},
+        {"mixed", "mixed", "mix", {"energy"}, 32ull * 256ull * sizeof(float), false, true, false},
+        {"energy-out", "energy-out", "energy", {}, 32ull * sizeof(float), false, false, true}};
+
+    jakal::OperationSpec analysis;
+    analysis.name = "analysis";
+    analysis.op_class = jakal::OperationClass::matmul;
+    analysis.extents = {32, 512, 1024};
+    analysis.input_bytes = (32ull * 1024ull + 1024ull * 512ull) * sizeof(float);
+    analysis.output_bytes = 32ull * 512ull * sizeof(float);
+    analysis.estimated_flops = 2.0 * 32.0 * 512.0 * 1024.0;
+    analysis.matrix_friendly = true;
+    analysis.input_tensor_ids = {"signal-in", "analysis-w"};
+    analysis.output_tensor_ids = {"spectrum"};
+
+    jakal::OperationSpec relu;
+    relu.name = "relu";
+    relu.op_class = jakal::OperationClass::elementwise_map;
+    relu.extents = {32ull * 512ull};
+    relu.input_bytes = 32ull * 512ull * sizeof(float);
+    relu.output_bytes = 32ull * 512ull * sizeof(float);
+    relu.estimated_flops = 3.0 * 32.0 * 512.0;
+    relu.input_tensor_ids = {"spectrum"};
+    relu.output_tensor_ids = {"activated"};
+
+    jakal::OperationSpec synthesis;
+    synthesis.name = "synthesis";
+    synthesis.op_class = jakal::OperationClass::matmul;
+    synthesis.extents = {32, 256, 512};
+    synthesis.input_bytes = (32ull * 512ull + 512ull * 256ull) * sizeof(float);
+    synthesis.output_bytes = 32ull * 256ull * sizeof(float);
+    synthesis.estimated_flops = 2.0 * 32.0 * 256.0 * 512.0;
+    synthesis.matrix_friendly = true;
+    synthesis.input_tensor_ids = {"activated", "synthesis-w"};
+    synthesis.output_tensor_ids = {"bank"};
+
+    jakal::OperationSpec gate;
+    gate.name = "gate";
+    gate.op_class = jakal::OperationClass::matmul;
+    gate.extents = {32, 256, 1024};
+    gate.input_bytes = (32ull * 1024ull + 1024ull * 256ull) * sizeof(float);
+    gate.output_bytes = 32ull * 256ull * sizeof(float);
+    gate.estimated_flops = 2.0 * 32.0 * 256.0 * 1024.0;
+    gate.matrix_friendly = true;
+    gate.input_tensor_ids = {"signal-in", "gate-w"};
+    gate.output_tensor_ids = {"gate-raw"};
+
+    jakal::OperationSpec sigmoid;
+    sigmoid.name = "sigmoid";
+    sigmoid.op_class = jakal::OperationClass::elementwise_map;
+    sigmoid.extents = {32ull * 256ull};
+    sigmoid.input_bytes = 32ull * 256ull * sizeof(float);
+    sigmoid.output_bytes = 32ull * 256ull * sizeof(float);
+    sigmoid.estimated_flops = 4.0 * 32.0 * 256.0;
+    sigmoid.input_tensor_ids = {"gate-raw"};
+    sigmoid.output_tensor_ids = {"gains"};
+
+    jakal::OperationSpec mix;
+    mix.name = "mix";
+    mix.op_class = jakal::OperationClass::elementwise_map;
+    mix.extents = {32ull * 256ull};
+    mix.input_bytes = 2ull * 32ull * 256ull * sizeof(float);
+    mix.output_bytes = 32ull * 256ull * sizeof(float);
+    mix.estimated_flops = 3.0 * 32.0 * 256.0;
+    mix.input_tensor_ids = {"bank", "gains"};
+    mix.output_tensor_ids = {"mixed"};
+
+    jakal::OperationSpec energy;
+    energy.name = "energy";
+    energy.op_class = jakal::OperationClass::reduction;
+    energy.extents = {32ull * 256ull};
+    energy.input_bytes = 32ull * 256ull * sizeof(float);
+    energy.output_bytes = 32ull * sizeof(float);
+    energy.estimated_flops = 32.0 * 256.0;
+    energy.reduction_like = true;
+    energy.input_tensor_ids = {"mixed"};
+    energy.output_tensor_ids = {"energy-out"};
+
+    graph.operations = {analysis, relu, synthesis, gate, sigmoid, mix, energy};
+    jakal::normalize_workload_graph(graph);
+    return graph;
+}
+
+jakal::WorkloadGraph make_runtime_reduce_meta_graph() {
+    jakal::WorkloadGraph graph;
+    graph.signature = "runtime-meta-reduce";
+    graph.tensors = {
+        {"features", "features", "", {"norm"}, 64ull * 256ull * sizeof(float), false, false, true},
+        {"normalized", "normalized", "norm", {"projection"}, 64ull * 256ull * sizeof(float), false, true, false},
+        {"proj-w", "proj-w", "", {"projection"}, 256ull * 512ull * sizeof(float), true, false, false},
+        {"projected", "projected", "projection", {"gelu"}, 64ull * 512ull * sizeof(float), false, true, false},
+        {"activated", "activated", "gelu", {"scenario"}, 64ull * 512ull * sizeof(float), false, true, false},
+        {"scenario-w", "scenario-w", "", {"scenario"}, 512ull * 128ull * sizeof(float), true, false, false},
+        {"scores", "scores", "scenario", {"softmax"}, 64ull * 128ull * sizeof(float), false, true, false},
+        {"probabilities", "probabilities", "softmax", {"portfolio-sum"}, 64ull * 128ull * sizeof(float), false, true, false},
+        {"portfolio-out", "portfolio-out", "portfolio-sum", {}, 64ull * sizeof(float), false, false, true}};
+
+    jakal::OperationSpec norm;
+    norm.name = "norm";
+    norm.op_class = jakal::OperationClass::elementwise_map;
+    norm.extents = {64ull * 256ull};
+    norm.input_bytes = 64ull * 256ull * sizeof(float);
+    norm.output_bytes = 64ull * 256ull * sizeof(float);
+    norm.estimated_flops = 5.0 * 64.0 * 256.0;
+    norm.input_tensor_ids = {"features"};
+    norm.output_tensor_ids = {"normalized"};
+
+    jakal::OperationSpec projection;
+    projection.name = "projection";
+    projection.op_class = jakal::OperationClass::matmul;
+    projection.extents = {64, 512, 256};
+    projection.input_bytes = (64ull * 256ull + 256ull * 512ull) * sizeof(float);
+    projection.output_bytes = 64ull * 512ull * sizeof(float);
+    projection.estimated_flops = 2.0 * 64.0 * 512.0 * 256.0;
+    projection.matrix_friendly = true;
+    projection.input_tensor_ids = {"normalized", "proj-w"};
+    projection.output_tensor_ids = {"projected"};
+
+    jakal::OperationSpec gelu;
+    gelu.name = "gelu";
+    gelu.op_class = jakal::OperationClass::elementwise_map;
+    gelu.extents = {64ull * 512ull};
+    gelu.input_bytes = 64ull * 512ull * sizeof(float);
+    gelu.output_bytes = 64ull * 512ull * sizeof(float);
+    gelu.estimated_flops = 6.0 * 64.0 * 512.0;
+    gelu.input_tensor_ids = {"projected"};
+    gelu.output_tensor_ids = {"activated"};
+
+    jakal::OperationSpec scenario;
+    scenario.name = "scenario";
+    scenario.op_class = jakal::OperationClass::matmul;
+    scenario.extents = {64, 128, 512};
+    scenario.input_bytes = (64ull * 512ull + 512ull * 128ull) * sizeof(float);
+    scenario.output_bytes = 64ull * 128ull * sizeof(float);
+    scenario.estimated_flops = 2.0 * 64.0 * 128.0 * 512.0;
+    scenario.matrix_friendly = true;
+    scenario.input_tensor_ids = {"activated", "scenario-w"};
+    scenario.output_tensor_ids = {"scores"};
+
+    jakal::OperationSpec softmax;
+    softmax.name = "softmax";
+    softmax.op_class = jakal::OperationClass::reduction;
+    softmax.extents = {64ull * 128ull};
+    softmax.input_bytes = 64ull * 128ull * sizeof(float);
+    softmax.output_bytes = 64ull * 128ull * sizeof(float);
+    softmax.estimated_flops = 3.0 * 64.0 * 128.0;
+    softmax.reduction_like = true;
+    softmax.input_tensor_ids = {"scores"};
+    softmax.output_tensor_ids = {"probabilities"};
+
+    jakal::OperationSpec portfolio_sum;
+    portfolio_sum.name = "portfolio-sum";
+    portfolio_sum.op_class = jakal::OperationClass::reduction;
+    portfolio_sum.extents = {64ull * 128ull};
+    portfolio_sum.input_bytes = 64ull * 128ull * sizeof(float);
+    portfolio_sum.output_bytes = 64ull * sizeof(float);
+    portfolio_sum.estimated_flops = 64.0 * 128.0;
+    portfolio_sum.reduction_like = true;
+    portfolio_sum.input_tensor_ids = {"probabilities"};
+    portfolio_sum.output_tensor_ids = {"portfolio-out"};
+
+    graph.operations = {norm, projection, gelu, scenario, softmax, portfolio_sum};
+    jakal::normalize_workload_graph(graph);
+    return graph;
+}
+
+bool verify_runtime_graph_aware_meta_policy() {
+    const auto plan_cache = unique_temp_file("runtime-meta-plan");
+    const auto exec_cache = unique_temp_file("runtime-meta-exec");
+
+    jakal::RuntimeOptions options;
+    options.cache_path = plan_cache;
+    options.execution_cache_path = exec_cache;
+    options.enable_opencl_probe = false;
+    options.product.observability.persist_telemetry = false;
+    jakal::Runtime runtime(options);
+
+    bool saw_host = false;
+    bool saw_accelerator = false;
+    for (const auto& device : runtime.devices()) {
+        saw_host = saw_host || device.probe == "host";
+        saw_accelerator = saw_accelerator || device.probe != "host";
+    }
+    if (!(saw_host && saw_accelerator)) {
+        std::error_code ec;
+        std::filesystem::remove(plan_cache, ec);
+        std::filesystem::remove(plan_cache.string() + ".strategy", ec);
+        std::filesystem::remove(plan_cache.string() + ".strategy_family", ec);
+        std::filesystem::remove(plan_cache.string() + ".confidence", ec);
+        std::filesystem::remove(exec_cache, ec);
+        std::filesystem::remove(exec_cache.string() + ".perf", ec);
+        return true;
+    }
+
+    const jakal::WorkloadSpec projection_workload{
+        "llm-decode-token-lite",
+        jakal::WorkloadKind::inference,
+        "llm-decode-token-lite",
+        640ull * 1024ull * 1024ull,
+        12ull * 1024ull * 1024ull,
+        3.8e10,
+        1,
+        true,
+        true,
+        true,
+        jakal::PartitionStrategy::auto_balanced,
+        jakal::WorkloadPhase::decode,
+        "decode-small"};
+    const auto projection_graph = jakal::default_workload_graph(projection_workload);
+    const auto projection_report = runtime.optimize(projection_workload, projection_graph);
+    if (projection_report.partition_strategy != jakal::PartitionStrategy::projection_sharded) {
+        std::cerr << "runtime-meta: expected projection_sharded for decode projection graph, got "
+                  << jakal::to_string(projection_report.partition_strategy) << '\n';
+        return false;
+    }
+    if (projection_report.graph_optimization.passes.size() != 4u) {
+        std::cerr << "runtime-meta: expected 4 graph passes for projection graph, got "
+                  << projection_report.graph_optimization.passes.size() << '\n';
+        return false;
+    }
+
+    const jakal::WorkloadSpec signal_workload{
+        "signal-filterbank-meta",
+        jakal::WorkloadKind::tensor,
+        "signal-filterbank-meta",
+        96ull * 1024ull * 1024ull,
+        20ull * 1024ull * 1024ull,
+        4.2e7,
+        32,
+        true,
+        true,
+        true,
+        jakal::PartitionStrategy::auto_balanced,
+        jakal::WorkloadPhase::unknown,
+        "b32-f1024-c256"};
+    const auto signal_report = runtime.optimize(signal_workload, make_runtime_signal_meta_graph());
+    if (signal_report.partition_strategy != jakal::PartitionStrategy::auto_balanced) {
+        std::cerr << "runtime-meta: expected cooperative auto_balanced for signal graph, got "
+                  << jakal::to_string(signal_report.partition_strategy) << '\n';
+        return false;
+    }
+    if (signal_report.graph_optimization.passes.size() != 2u) {
+        std::cerr << "runtime-meta: expected 2 graph passes for signal graph, got "
+                  << signal_report.graph_optimization.passes.size() << '\n';
+        return false;
+    }
+
+    const jakal::WorkloadSpec reduce_workload{
+        "finance-factor-meta",
+        jakal::WorkloadKind::tensor,
+        "finance-factor-meta",
+        256ull * 1024ull * 1024ull,
+        16ull * 1024ull * 1024ull,
+        6.0e8,
+        64,
+        false,
+        false,
+        true,
+        jakal::PartitionStrategy::auto_balanced,
+        jakal::WorkloadPhase::unknown,
+        "b64-f256-s128"};
+    const auto reduce_report = runtime.optimize(reduce_workload, make_runtime_reduce_meta_graph());
+    if (reduce_report.partition_strategy != jakal::PartitionStrategy::reduce_on_gpu) {
+        std::cerr << "runtime-meta: expected reduce_on_gpu for reduction-tail graph, got "
+                  << jakal::to_string(reduce_report.partition_strategy) << '\n';
+        return false;
+    }
+    if (reduce_report.graph_optimization.passes.size() != 4u) {
+        std::cerr << "runtime-meta: expected 4 graph passes for reduction-tail graph, got "
+                  << reduce_report.graph_optimization.passes.size() << '\n';
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(plan_cache, ec);
+    std::filesystem::remove(plan_cache.string() + ".strategy", ec);
+    std::filesystem::remove(plan_cache.string() + ".strategy_family", ec);
+    std::filesystem::remove(plan_cache.string() + ".confidence", ec);
+    std::filesystem::remove(exec_cache, ec);
+    std::filesystem::remove(exec_cache.string() + ".perf", ec);
+    return true;
+}
+
 bool verify_cache_aware_tiling_for_inference() {
     const auto weak_cache = unique_temp_file("tiling-weak-exec");
     const auto strong_cache = unique_temp_file("tiling-strong-exec");
@@ -1344,6 +1639,11 @@ int main() {
         return 1;
     }
     std::cerr << "stage: rewrites\n";
+    if (!verify_runtime_graph_aware_meta_policy()) {
+        std::cerr << "Runtime graph-aware meta-policy check failed.\n";
+        return 1;
+    }
+    std::cerr << "stage: runtime-meta\n";
     if (!verify_cache_aware_tiling_for_inference()) {
         std::cerr << "Inference cache-aware tiling check failed.\n";
         return 1;

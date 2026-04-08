@@ -48,6 +48,8 @@ struct RuntimeProductPolicy {
 
 struct RuntimeOptimizationPolicy {
     std::optional<PartitionStrategy> forced_partition_strategy;
+    bool enable_graph_aware_strategy_hints = true;
+    bool enable_graph_aware_execution_tuning = true;
     ExecutionTuningOverrides execution;
 };
 

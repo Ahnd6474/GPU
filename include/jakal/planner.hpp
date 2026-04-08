@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -59,6 +60,11 @@ struct WorkloadSpec {
     PartitionStrategy partition_strategy = PartitionStrategy::auto_balanced;
     WorkloadPhase phase = WorkloadPhase::unknown;
     std::string shape_bucket;
+    std::optional<PartitionStrategy> heuristic_partition_hint;
+    double heuristic_partition_hint_confidence = 0.0;
+    std::string heuristic_partition_hint_reason;
+    bool disable_heuristic_partition_hint = false;
+    bool disable_automatic_execution_tuning = false;
 };
 
 struct PlanAllocation {

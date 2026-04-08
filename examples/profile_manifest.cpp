@@ -391,6 +391,9 @@ void print_pass_summary(const std::uint32_t pass, const jakal::ManagedExecutionR
               << " layout_cache=" << report.asset_prefetch.total_layout_cache_bytes
               << " telemetry=" << report.telemetry_path.string()
               << '\n';
+    if (!report.safety.summary.empty()) {
+        std::cout << "  summary " << report.safety.summary << '\n';
+    }
 }
 
 void print_operation_details(const jakal::ManagedExecutionReport& report) {

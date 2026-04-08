@@ -22,11 +22,369 @@ bool runtime_regressed(
     const DirectExecutionReport& report,
     const double max_runtime_regression_ratio);
 
-WorkloadSpec apply_runtime_optimization_overrides(const RuntimeOptions& options, WorkloadSpec workload) {
-    if (options.optimization.forced_partition_strategy.has_value()) {
-        workload.partition_strategy = *options.optimization.forced_partition_strategy;
+struct GraphWorkloadMetrics {
+    std::size_t operation_count = 0;
+    std::size_t matmul_count = 0;
+    std::size_t reduction_count = 0;
+    std::size_t elementwise_count = 0;
+    std::size_t host_visible_tensor_count = 0;
+    double total_flops = 0.0;
+    double total_bytes = 0.0;
+    double matmul_flops = 0.0;
+    double reduction_flops = 0.0;
+    double elementwise_flops = 0.0;
+    double reduction_bytes = 0.0;
+    double host_visible_bytes = 0.0;
+    double small_op_ratio = 0.0;
+    double matmul_flops_ratio = 0.0;
+    double reduction_flops_ratio = 0.0;
+    double host_visible_tensor_ratio = 0.0;
+    double average_flops_per_operation = 0.0;
+    double dispatch_bound_score = 0.0;
+    bool has_terminal_reduction = false;
+};
+
+struct GraphAwareMetaPolicy {
+    std::optional<PartitionStrategy> strategy_hint;
+    double strategy_confidence = 0.0;
+    std::string strategy_reason;
+    std::optional<ContinuousExecutionState> tuning_state;
+    std::optional<std::uint32_t> tuning_graph_passes;
+    std::uint32_t tuning_graph_rewrite_level = 1u;
+    std::string tuning_reason;
+};
+
+struct RuntimeOptimizationContext {
+    WorkloadSpec requested_workload;
+    WorkloadSpec effective_workload;
+    ExecutionTuningOverrides execution_tuning;
+    std::string meta_summary;
+};
+
+bool is_host_graph(const HardwareGraph& graph) {
+    return graph.probe == "host";
+}
+
+double workload_host_exchange_ratio(const WorkloadSpec& workload) {
+    const auto working_set = std::max<std::uint64_t>(workload.working_set_bytes, 1ull);
+    return std::clamp(
+        static_cast<double>(workload.host_exchange_bytes) / static_cast<double>(working_set),
+        0.0,
+        4.0);
+}
+
+bool has_partitionable_topology(const std::vector<HardwareGraph>& graphs) {
+    bool saw_host = false;
+    bool saw_accelerator = false;
+    for (const auto& graph : graphs) {
+        if (is_host_graph(graph)) {
+            saw_host = true;
+        } else {
+            saw_accelerator = true;
+        }
+        if (saw_host && saw_accelerator) {
+            return true;
+        }
     }
-    return workload;
+    return false;
+}
+
+bool has_manual_execution_tuning(const ExecutionTuningOverrides& tuning) {
+    return tuning.initial_state_override.has_value() ||
+           tuning.graph_optimization_passes_override.has_value() ||
+           tuning.graph_rewrite_level > 1u;
+}
+
+ContinuousExecutionState tuning_profile_state(const std::string& profile_name) {
+    ContinuousExecutionState state;
+    if (profile_name == "host-latency") {
+        state.queue_depth_raw = -0.8;
+        state.stage_raw = -0.6;
+        state.tile_raw = -0.1;
+        state.overlap_raw = -0.7;
+        state.partition_raw = -1.2;
+        state.precision_raw = -0.4;
+        state.single_device_logit = 1.6;
+        state.sharded_logit = -1.5;
+        state.streaming_logit = -0.2;
+        state.overlapped_logit = 0.0;
+        return state;
+    }
+    if (profile_name == "hybrid-balanced") {
+        state.queue_depth_raw = 0.0;
+        state.stage_raw = 0.1;
+        state.tile_raw = 0.3;
+        state.overlap_raw = -0.1;
+        state.partition_raw = -0.5;
+        state.precision_raw = 0.1;
+        state.single_device_logit = 0.9;
+        state.sharded_logit = -0.2;
+        state.streaming_logit = 0.2;
+        state.overlapped_logit = 0.3;
+        return state;
+    }
+    if (profile_name == "accelerator-throughput") {
+        state.queue_depth_raw = 0.7;
+        state.stage_raw = 0.6;
+        state.tile_raw = 0.9;
+        state.overlap_raw = 0.5;
+        state.partition_raw = 0.5;
+        state.precision_raw = 0.5;
+        state.single_device_logit = 0.1;
+        state.sharded_logit = 0.8;
+        state.streaming_logit = 0.1;
+        state.overlapped_logit = 0.8;
+        return state;
+    }
+
+    state.queue_depth_raw = -0.1;
+    state.stage_raw = -0.2;
+    state.tile_raw = 0.5;
+    state.overlap_raw = -0.2;
+    state.partition_raw = 0.2;
+    state.precision_raw = 0.2;
+    state.single_device_logit = 0.4;
+    state.sharded_logit = 0.7;
+    state.streaming_logit = 0.0;
+    state.overlapped_logit = 0.2;
+    return state;
+}
+
+GraphWorkloadMetrics analyze_workload_graph(const WorkloadSpec& workload, const WorkloadGraph& workload_graph) {
+    GraphWorkloadMetrics metrics;
+    metrics.operation_count = workload_graph.operations.size();
+    metrics.host_visible_tensor_count = std::count_if(
+        workload_graph.tensors.begin(),
+        workload_graph.tensors.end(),
+        [](const WorkloadTensor& tensor) {
+            return tensor.host_visible;
+        });
+    for (const auto& tensor : workload_graph.tensors) {
+        if (tensor.host_visible) {
+            metrics.host_visible_bytes += static_cast<double>(tensor.bytes);
+        }
+    }
+
+    for (std::size_t index = 0; index < workload_graph.operations.size(); ++index) {
+        const auto& operation = workload_graph.operations[index];
+        const double bytes = static_cast<double>(
+            std::max<std::uint64_t>(
+                operation.input_bytes + operation.output_bytes + operation.temporary_bytes,
+                1ull));
+        const double flops = std::max(operation.estimated_flops, 0.0);
+        metrics.total_bytes += bytes;
+        metrics.total_flops += flops;
+
+        switch (operation.op_class) {
+        case OperationClass::matmul:
+            ++metrics.matmul_count;
+            metrics.matmul_flops += flops;
+            break;
+        case OperationClass::reduction:
+            ++metrics.reduction_count;
+            metrics.reduction_flops += flops;
+            metrics.reduction_bytes += bytes;
+            if (index + 2u >= workload_graph.operations.size()) {
+                metrics.has_terminal_reduction = true;
+            }
+            break;
+        case OperationClass::elementwise_map:
+            ++metrics.elementwise_count;
+            metrics.elementwise_flops += flops;
+            break;
+        default:
+            break;
+        }
+    }
+
+    const double op_count = static_cast<double>(std::max<std::size_t>(metrics.operation_count, 1u));
+    const double total_flops = std::max(metrics.total_flops, 1.0);
+    const double total_bytes = std::max(metrics.total_bytes, 1.0);
+    metrics.small_op_ratio =
+        static_cast<double>(metrics.elementwise_count + metrics.reduction_count) / op_count;
+    metrics.matmul_flops_ratio = metrics.matmul_flops / total_flops;
+    metrics.reduction_flops_ratio = metrics.reduction_flops / total_flops;
+    metrics.host_visible_tensor_ratio =
+        static_cast<double>(metrics.host_visible_tensor_count) /
+        static_cast<double>(std::max<std::size_t>(workload_graph.tensors.size(), 1u));
+    metrics.average_flops_per_operation = metrics.total_flops / op_count;
+
+    double dispatch_bound_score = 0.0;
+    dispatch_bound_score += std::clamp(metrics.small_op_ratio * 0.42, 0.0, 0.32);
+    dispatch_bound_score += std::clamp(workload_host_exchange_ratio(workload) * 0.18, 0.0, 0.18);
+    dispatch_bound_score += std::clamp(metrics.host_visible_bytes / total_bytes, 0.0, 0.14);
+    if (workload.latency_sensitive) {
+        dispatch_bound_score += workload.batch_size <= 4u ? 0.10 : 0.06;
+    }
+    if (workload.prefer_unified_memory) {
+        dispatch_bound_score += 0.10;
+    }
+    if (metrics.average_flops_per_operation < 3.0e6) {
+        dispatch_bound_score += 0.12;
+    } else if (metrics.average_flops_per_operation < 1.0e7) {
+        dispatch_bound_score += 0.06;
+    }
+    if (metrics.matmul_flops_ratio > 0.75 && canonical_workload_phase(workload) == WorkloadPhase::decode) {
+        dispatch_bound_score -= 0.10;
+    }
+    metrics.dispatch_bound_score = std::clamp(dispatch_bound_score, 0.0, 1.0);
+    return metrics;
+}
+
+GraphAwareMetaPolicy derive_graph_aware_meta_policy(
+    const WorkloadSpec& workload,
+    const WorkloadGraph& workload_graph) {
+    GraphAwareMetaPolicy policy;
+    if (workload_graph.operations.empty()) {
+        return policy;
+    }
+
+    const auto metrics = analyze_workload_graph(workload, workload_graph);
+    const auto phase = canonical_workload_phase(workload);
+    const bool cooperative_auto =
+        workload.latency_sensitive &&
+        metrics.small_op_ratio >= 0.55 &&
+        (workload.prefer_unified_memory ||
+         workload_host_exchange_ratio(workload) >= 0.18 ||
+         metrics.host_visible_tensor_ratio >= 0.25);
+    const bool projection_sharded =
+        workload.matrix_friendly &&
+        metrics.matmul_flops_ratio >= 0.55 &&
+        !cooperative_auto &&
+        (phase == WorkloadPhase::decode || phase == WorkloadPhase::prefill || workload.latency_sensitive);
+    const bool reduce_on_gpu =
+        workload.matrix_friendly &&
+        metrics.has_terminal_reduction &&
+        !cooperative_auto &&
+        !workload.latency_sensitive &&
+        metrics.matmul_flops_ratio >= 0.35;
+
+    std::ostringstream summary;
+    if (projection_sharded) {
+        policy.strategy_hint = PartitionStrategy::projection_sharded;
+        policy.strategy_confidence =
+            phase == WorkloadPhase::decode ? 0.72 : (metrics.dispatch_bound_score < 0.35 ? 0.64 : 0.58);
+        summary << "graph-aware heuristic projection_sharded matmul=" << metrics.matmul_flops_ratio
+                << " dispatch=" << metrics.dispatch_bound_score
+                << " tail_reduce=" << (metrics.has_terminal_reduction ? "yes" : "no");
+    } else if (reduce_on_gpu) {
+        policy.strategy_hint = PartitionStrategy::reduce_on_gpu;
+        policy.strategy_confidence = metrics.reduction_count >= 2u ? 0.70 : 0.62;
+        summary << "graph-aware heuristic reduce_on_gpu matmul=" << metrics.matmul_flops_ratio
+                << " reductions=" << metrics.reduction_count
+                << " dispatch=" << metrics.dispatch_bound_score;
+    } else if (cooperative_auto) {
+        summary << "graph-aware heuristic kept auto_balanced cooperative dispatch=" << metrics.dispatch_bound_score
+                << " small_ops=" << metrics.small_op_ratio;
+    } else {
+        summary << "graph-aware heuristic kept auto_balanced balanced dispatch=" << metrics.dispatch_bound_score
+                << " matmul=" << metrics.matmul_flops_ratio;
+    }
+    policy.strategy_reason = summary.str();
+
+    const auto tuning_target = workload.partition_strategy != PartitionStrategy::auto_balanced
+                                   ? workload.partition_strategy
+                                   : policy.strategy_hint.value_or(PartitionStrategy::auto_balanced);
+    if (cooperative_auto) {
+        policy.tuning_state = tuning_profile_state("cooperative-split");
+        policy.tuning_graph_rewrite_level = 2u;
+        policy.tuning_graph_passes = 2u;
+        policy.tuning_reason = "cooperative-split";
+        return policy;
+    }
+
+    if (tuning_target == PartitionStrategy::projection_sharded ||
+        tuning_target == PartitionStrategy::reduce_on_gpu) {
+        auto state = tuning_profile_state("accelerator-throughput");
+        if (tuning_target == PartitionStrategy::projection_sharded &&
+            metrics.operation_count <= 6u &&
+            workload.estimated_flops > 0.0 &&
+            workload.estimated_flops < 3.0e7) {
+            state.sharded_logit = 0.35;
+        }
+        if (tuning_target == PartitionStrategy::reduce_on_gpu &&
+            metrics.has_terminal_reduction &&
+            metrics.reduction_count >= 2u) {
+            state.single_device_logit = -0.35;
+        }
+        policy.tuning_state = state;
+        policy.tuning_graph_rewrite_level = 2u;
+        policy.tuning_graph_passes = 4u;
+        policy.tuning_reason = "accelerator-throughput";
+        return policy;
+    }
+
+    if (workload.matrix_friendly && workload_graph.operations.size() >= 4u) {
+        policy.tuning_state = tuning_profile_state("hybrid-balanced");
+        policy.tuning_graph_rewrite_level = 2u;
+        policy.tuning_graph_passes = 2u;
+        policy.tuning_reason = "hybrid-balanced";
+    }
+    return policy;
+}
+
+RuntimeOptimizationContext resolve_runtime_optimization_context(
+    const RuntimeOptions& options,
+    const WorkloadSpec& workload,
+    const WorkloadGraph* workload_graph) {
+    RuntimeOptimizationContext context;
+    context.requested_workload = workload;
+    if (options.optimization.forced_partition_strategy.has_value()) {
+        context.requested_workload.partition_strategy = *options.optimization.forced_partition_strategy;
+    }
+    context.effective_workload = context.requested_workload;
+    context.execution_tuning = options.optimization.execution;
+
+    if (workload_graph == nullptr) {
+        return context;
+    }
+
+    const auto meta = derive_graph_aware_meta_policy(context.requested_workload, *workload_graph);
+    if (options.optimization.enable_graph_aware_strategy_hints &&
+        !context.requested_workload.disable_heuristic_partition_hint &&
+        !options.optimization.forced_partition_strategy.has_value() &&
+        context.requested_workload.partition_strategy == PartitionStrategy::auto_balanced &&
+        meta.strategy_hint.has_value()) {
+        context.effective_workload.heuristic_partition_hint = meta.strategy_hint;
+        context.effective_workload.heuristic_partition_hint_confidence = meta.strategy_confidence;
+        context.effective_workload.heuristic_partition_hint_reason = meta.strategy_reason;
+    }
+
+    if (options.optimization.enable_graph_aware_execution_tuning &&
+        !context.requested_workload.disable_automatic_execution_tuning &&
+        !has_manual_execution_tuning(options.optimization.execution)) {
+        if (meta.tuning_state.has_value()) {
+            context.execution_tuning.initial_state_override = meta.tuning_state;
+        }
+        if (meta.tuning_graph_passes.has_value()) {
+            context.execution_tuning.graph_optimization_passes_override = meta.tuning_graph_passes;
+        }
+        context.execution_tuning.graph_rewrite_level =
+            std::max(context.execution_tuning.graph_rewrite_level, meta.tuning_graph_rewrite_level);
+    }
+
+    if (!meta.strategy_reason.empty() || !meta.tuning_reason.empty()) {
+        std::ostringstream summary;
+        if (!meta.strategy_reason.empty()) {
+            summary << meta.strategy_reason;
+        }
+        if (!meta.tuning_reason.empty()) {
+            if (summary.tellp() > 0) {
+                summary << "; ";
+            }
+            summary << "execution tuning " << meta.tuning_reason
+                    << " rewrite=" << context.execution_tuning.graph_rewrite_level
+                    << " passes=";
+            if (context.execution_tuning.graph_optimization_passes_override.has_value()) {
+                summary << *context.execution_tuning.graph_optimization_passes_override;
+            } else {
+                summary << "auto";
+            }
+        }
+        context.meta_summary = summary.str();
+    }
+
+    return context;
 }
 
 std::vector<ExecutionFeedbackRecord> make_feedback_records(const DirectExecutionReport& report) {
@@ -771,7 +1129,9 @@ ExecutionPlan Runtime::plan(const WorkloadSpec& workload) {
         refresh_hardware();
     }
 
-    return planner_.build_plan(apply_runtime_optimization_overrides(options_, workload), devices_);
+    const auto workload_graph = default_workload_graph(workload);
+    const auto context = resolve_runtime_optimization_context(options_, workload, &workload_graph);
+    return planner_.build_plan(context.effective_workload, devices_);
 }
 
 OptimizationReport Runtime::optimize(const WorkloadSpec& workload) {
@@ -779,14 +1139,15 @@ OptimizationReport Runtime::optimize(const WorkloadSpec& workload) {
         refresh_hardware();
     }
 
-    const auto effective_workload = apply_runtime_optimization_overrides(options_, workload);
-    const auto placement = planner_.build_plan(effective_workload, devices_);
+    const auto workload_graph = default_workload_graph(workload);
+    const auto context = resolve_runtime_optimization_context(options_, workload, &workload_graph);
+    const auto placement = planner_.build_plan(context.effective_workload, devices_);
     return execution_optimizer_.optimize(
-        effective_workload,
+        context.effective_workload,
         placement,
         devices_,
-        nullptr,
-        &options_.optimization.execution);
+        &workload_graph,
+        &context.execution_tuning);
 }
 
 OptimizationReport Runtime::optimize(const WorkloadSpec& workload, const WorkloadGraph& workload_graph) {
@@ -794,14 +1155,14 @@ OptimizationReport Runtime::optimize(const WorkloadSpec& workload, const Workloa
         refresh_hardware();
     }
 
-    const auto effective_workload = apply_runtime_optimization_overrides(options_, workload);
-    const auto placement = planner_.build_plan(effective_workload, devices_);
+    const auto context = resolve_runtime_optimization_context(options_, workload, &workload_graph);
+    const auto placement = planner_.build_plan(context.effective_workload, devices_);
     return execution_optimizer_.optimize(
-        effective_workload,
+        context.effective_workload,
         placement,
         devices_,
         &workload_graph,
-        &options_.optimization.execution);
+        &context.execution_tuning);
 }
 
 DirectExecutionReport Runtime::execute_with_feedback(
@@ -857,16 +1218,22 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
 
     ++execution_epoch_;
 
-    const auto requested_workload = apply_runtime_optimization_overrides(options_, workload);
+    const auto context = resolve_runtime_optimization_context(options_, workload, &workload_graph);
+    const auto requested_workload = context.requested_workload;
     ManagedExecutionReport managed;
     managed.telemetry_path = telemetry_path();
     managed.safety.requested_strategy = requested_workload.partition_strategy;
 
     std::ostringstream safety_summary;
-    auto effective_workload = requested_workload;
+    auto effective_workload = context.effective_workload;
     if (requested_workload.partition_strategy != PartitionStrategy::auto_balanced &&
         is_strategy_blacklisted(requested_workload, requested_workload.partition_strategy)) {
         effective_workload.partition_strategy = PartitionStrategy::auto_balanced;
+        effective_workload.heuristic_partition_hint.reset();
+        effective_workload.heuristic_partition_hint_confidence = 0.0;
+        effective_workload.heuristic_partition_hint_reason.clear();
+        effective_workload.disable_heuristic_partition_hint = true;
+        effective_workload.disable_automatic_execution_tuning = true;
         managed.safety.blacklisted_before_run = true;
         safety_summary << "strategy blacklisted -> auto";
     }
@@ -884,7 +1251,7 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
         planned,
         devices_,
         &workload_graph,
-        &options_.optimization.execution);
+        &context.execution_tuning);
     managed.safety.selected_strategy = optimization.partition_strategy;
     managed.memory_preflight = build_memory_preflight(optimization);
     managed.kernel_coverage = build_kernel_coverage(optimization);
@@ -908,13 +1275,18 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
         }
         auto fallback_workload = requested_workload;
         fallback_workload.partition_strategy = PartitionStrategy::auto_balanced;
+        fallback_workload.heuristic_partition_hint.reset();
+        fallback_workload.heuristic_partition_hint_confidence = 0.0;
+        fallback_workload.heuristic_partition_hint_reason.clear();
+        fallback_workload.disable_heuristic_partition_hint = true;
+        fallback_workload.disable_automatic_execution_tuning = true;
         auto fallback_plan = planner_.build_plan(fallback_workload, devices_);
         auto fallback_optimization = execution_optimizer_.optimize(
             fallback_workload,
             fallback_plan,
             devices_,
             &workload_graph,
-            &options_.optimization.execution);
+            &context.execution_tuning);
         auto fallback_memory = build_memory_preflight(fallback_optimization);
         if (fallback_memory.safe_to_run || !managed.memory_preflight.safe_to_run) {
             effective_workload = fallback_workload;
@@ -1004,6 +1376,11 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
         if (options_.product.safety.enable_strategy_rollback) {
             auto fallback_workload = requested_workload;
             fallback_workload.partition_strategy = PartitionStrategy::auto_balanced;
+            fallback_workload.heuristic_partition_hint.reset();
+            fallback_workload.heuristic_partition_hint_confidence = 0.0;
+            fallback_workload.heuristic_partition_hint_reason.clear();
+            fallback_workload.disable_heuristic_partition_hint = true;
+            fallback_workload.disable_automatic_execution_tuning = true;
             auto fallback_optimization = optimize(fallback_workload, workload_graph);
             auto fallback_memory = build_memory_preflight(fallback_optimization);
             if (fallback_memory.safe_to_run || !options_.product.memory.enforce_preflight) {
@@ -1036,6 +1413,12 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
             safety_summary << "; ";
         }
         safety_summary << managed.memory_preflight.summary;
+    }
+    if (!context.meta_summary.empty()) {
+        if (safety_summary.tellp() > 0) {
+            safety_summary << "; ";
+        }
+        safety_summary << "meta=" << context.meta_summary;
     }
     if (!managed.planning.strategy_reason.empty()) {
         if (safety_summary.tellp() > 0) {

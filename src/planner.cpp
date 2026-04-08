@@ -241,29 +241,51 @@ bool uses_explicit_partition_strategy(const WorkloadSpec& workload) {
     return workload.partition_strategy != PartitionStrategy::auto_balanced;
 }
 
+bool append_strategy_once(std::vector<PartitionStrategy>& strategies, const PartitionStrategy strategy) {
+    if (std::find(strategies.begin(), strategies.end(), strategy) != strategies.end()) {
+        return false;
+    }
+    strategies.push_back(strategy);
+    return true;
+}
+
 std::vector<PartitionStrategy> exploration_order_for(const WorkloadSpec& workload) {
+    std::vector<PartitionStrategy> order;
+    if (workload.heuristic_partition_hint.has_value()) {
+        append_strategy_once(order, *workload.heuristic_partition_hint);
+    }
+
     if (workload.kind == WorkloadKind::inference && workload.latency_sensitive && workload.matrix_friendly) {
-        return {
-            PartitionStrategy::role_split,
-            PartitionStrategy::tpu_like,
-            PartitionStrategy::reduce_on_gpu,
-            PartitionStrategy::projection_sharded,
-            PartitionStrategy::blind_sharded};
+        for (const auto strategy : {
+                 PartitionStrategy::role_split,
+                 PartitionStrategy::tpu_like,
+                 PartitionStrategy::reduce_on_gpu,
+                 PartitionStrategy::projection_sharded,
+                 PartitionStrategy::blind_sharded}) {
+            append_strategy_once(order, strategy);
+        }
+        return order;
     }
     if (workload.matrix_friendly) {
-        return {
-            PartitionStrategy::projection_sharded,
-            PartitionStrategy::reduce_on_gpu,
-            PartitionStrategy::role_split,
-            PartitionStrategy::tpu_like,
-            PartitionStrategy::blind_sharded};
+        for (const auto strategy : {
+                 PartitionStrategy::projection_sharded,
+                 PartitionStrategy::reduce_on_gpu,
+                 PartitionStrategy::role_split,
+                 PartitionStrategy::tpu_like,
+                 PartitionStrategy::blind_sharded}) {
+            append_strategy_once(order, strategy);
+        }
+        return order;
     }
-    return {
-        PartitionStrategy::role_split,
-        PartitionStrategy::reduce_on_gpu,
-        PartitionStrategy::blind_sharded,
-        PartitionStrategy::projection_sharded,
-        PartitionStrategy::tpu_like};
+    for (const auto strategy : {
+             PartitionStrategy::role_split,
+             PartitionStrategy::reduce_on_gpu,
+             PartitionStrategy::blind_sharded,
+             PartitionStrategy::projection_sharded,
+             PartitionStrategy::tpu_like}) {
+        append_strategy_once(order, strategy);
+    }
+    return order;
 }
 
 std::uint64_t bucket_positive_u32(const std::uint32_t value) {
@@ -981,6 +1003,40 @@ Planner::ResolvedStrategyDecision Planner::resolve_partition_strategy(
             family_resolution.reason};
     }
 
+    const auto resolve_from_heuristic_hint = [&]() -> std::optional<ResolvedStrategyDecision> {
+        if (!has_partitionable_topology(graphs) ||
+            !workload.heuristic_partition_hint.has_value() ||
+            *workload.heuristic_partition_hint == PartitionStrategy::auto_balanced) {
+            return std::nullopt;
+        }
+
+        const double confidence = std::clamp(
+            workload.heuristic_partition_hint_confidence > 0.0 ? workload.heuristic_partition_hint_confidence : 0.58,
+            0.35,
+            0.88);
+        return ResolvedStrategyDecision{
+            *workload.heuristic_partition_hint,
+            PlanStrategySource::heuristic_auto,
+            confidence,
+            workload.heuristic_partition_hint_reason.empty()
+                ? ("graph-aware heuristic favored " + to_string(*workload.heuristic_partition_hint))
+                : workload.heuristic_partition_hint_reason};
+    };
+
+    if (!exact_resolution.has_baseline && family_resolution.has_baseline) {
+        if (const auto hinted = resolve_from_heuristic_hint(); hinted.has_value()) {
+            return {
+                hinted->strategy,
+                hinted->source,
+                apply_confidence_calibration(
+                    confidence_calibration_stats_,
+                    workload,
+                    hinted->source,
+                    hinted->confidence),
+                hinted->reason};
+        }
+    }
+
     if (exact_resolution.has_baseline || family_resolution.has_baseline) {
         if (exact_resolution.has_baseline) {
             return {
@@ -1003,6 +1059,19 @@ Planner::ResolvedStrategyDecision Planner::resolve_partition_strategy(
                 family_resolution.confidence),
             family_resolution.reason};
     }
+
+    if (const auto hinted = resolve_from_heuristic_hint(); hinted.has_value()) {
+        return {
+            hinted->strategy,
+            hinted->source,
+            apply_confidence_calibration(
+                confidence_calibration_stats_,
+                workload,
+                hinted->source,
+                hinted->confidence),
+            hinted->reason};
+    }
+
     return {
         PartitionStrategy::auto_balanced,
         PlanStrategySource::heuristic_auto,
