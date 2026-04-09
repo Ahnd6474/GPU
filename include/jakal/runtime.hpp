@@ -58,6 +58,8 @@ struct RuntimeOptions {
     bool enable_host_probe = true;
     bool enable_opencl_probe = true;
     bool enable_level_zero_probe = true;
+    bool enable_vulkan_probe = true;
+    bool enable_vulkan_status = true;
     bool enable_cuda_probe = true;
     bool enable_rocm_probe = true;
     bool prefer_level_zero_over_opencl = true;
@@ -66,6 +68,37 @@ struct RuntimeOptions {
     std::filesystem::path execution_cache_path;
     RuntimeProductPolicy product;
     RuntimeOptimizationPolicy optimization;
+};
+
+struct RuntimeInstallPaths {
+    std::filesystem::path install_root;
+    std::filesystem::path writable_root;
+    std::filesystem::path config_dir;
+    std::filesystem::path cache_dir;
+    std::filesystem::path logs_dir;
+    std::filesystem::path telemetry_path;
+    std::filesystem::path planner_cache_path;
+    std::filesystem::path execution_cache_path;
+    std::filesystem::path python_dir;
+};
+
+enum class RuntimeBackendStatusCode {
+    disabled,
+    unavailable,
+    no_devices,
+    ready_direct,
+    ready_modeled
+};
+
+struct RuntimeBackendStatus {
+    std::string backend_name;
+    std::string device_uid;
+    std::string detail;
+    RuntimeBackendStatusCode code = RuntimeBackendStatusCode::unavailable;
+    bool enabled = false;
+    bool available = false;
+    bool direct_execution = false;
+    bool modeled_fallback = false;
 };
 
 struct DeviceMemoryReservation {
@@ -205,6 +238,9 @@ public:
 
     void refresh_hardware();
 
+    [[nodiscard]] const RuntimeOptions& options() const;
+    [[nodiscard]] const RuntimeInstallPaths& install_paths() const;
+    [[nodiscard]] const std::vector<RuntimeBackendStatus>& backend_statuses() const;
     [[nodiscard]] const std::vector<HardwareGraph>& devices() const;
     [[nodiscard]] const std::vector<JakalToolkitIndexEntry>& jakal_toolkit_index() const;
     [[nodiscard]] ExecutionPlan plan(const WorkloadSpec& workload);
@@ -240,14 +276,17 @@ private:
     void persist_telemetry(
         const WorkloadSpec& workload,
         const ManagedExecutionReport& report) const;
+    void rebuild_backend_statuses();
 
     RuntimeOptions options_;
+    RuntimeInstallPaths install_paths_;
     Planner planner_;
     ExecutionOptimizer execution_optimizer_;
     DirectExecutor direct_executor_;
     JakalToolkit jakal_toolkit_;
     std::vector<std::unique_ptr<IDeviceProbe>> probes_;
     std::vector<HardwareGraph> devices_;
+    std::vector<RuntimeBackendStatus> backend_statuses_;
     std::vector<JakalToolkitIndexEntry> jakal_toolkit_index_;
     bool hardware_refreshed_ = false;
     std::uint64_t execution_epoch_ = 0;
@@ -257,6 +296,9 @@ private:
 
 [[nodiscard]] std::string runtime_backend_name_for_graph(const HardwareGraph& graph);
 [[nodiscard]] std::string runtime_backend_cache_tag_for_graph(const HardwareGraph& graph);
+[[nodiscard]] std::string to_string(RuntimeBackendStatusCode code);
+[[nodiscard]] RuntimeInstallPaths resolve_runtime_install_paths(const std::filesystem::path& install_root = {});
+[[nodiscard]] RuntimeOptions make_runtime_options_for_install(const std::filesystem::path& install_root = {});
 [[nodiscard]] bool runtime_backend_supports_operation(
     const HardwareGraph& graph,
     OperationClass op_class,

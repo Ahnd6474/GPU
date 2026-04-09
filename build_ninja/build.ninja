@@ -225,17 +225,6 @@ build CMakeFiles\jakal_core.dir\src\runtime.cpp.obj: CXX_COMPILER__jakal_core_un
   TARGET_PDB = jakal_core.pdb
   TARGET_SUPPORT_DIR = CMakeFiles\jakal_core.dir
 
-build CMakeFiles\jakal_core.dir\src\c_api.cpp.obj: CXX_COMPILER__jakal_core_unscanned_Debug D$:\GitHub\Jakal-Core\src\c_api.cpp || cmake_object_order_depends_target_jakal_core
-  CONFIG = Debug
-  DEFINES = -DNOMINMAX
-  FLAGS = -std:c++20 -MDd /W4 /permissive-
-  INCLUDES = -ID:\GitHub\Jakal-Core\include -ID:\GitHub\Jakal-Core\build_ninja\_deps\vulkan_headers-src\include
-  OBJECT_DIR = CMakeFiles\jakal_core.dir
-  OBJECT_FILE_DIR = CMakeFiles\jakal_core.dir\src
-  TARGET_COMPILE_PDB = CMakeFiles\jakal_core.dir\jakal_core.pdb
-  TARGET_PDB = jakal_core.pdb
-  TARGET_SUPPORT_DIR = CMakeFiles\jakal_core.dir
-
 build CMakeFiles\jakal_core.dir\src\backends\cpu_backend.cpp.obj: CXX_COMPILER__jakal_core_unscanned_Debug D$:\GitHub\Jakal-Core\src\backends\cpu_backend.cpp || cmake_object_order_depends_target_jakal_core
   CONFIG = Debug
   DEFINES = -DNOMINMAX
@@ -277,7 +266,7 @@ build CMakeFiles\jakal_core.dir\src\backends\opencl_backend.cpp.obj: CXX_COMPILE
 #############################################
 # Link the static library jakal_core.lib
 
-build jakal_core.lib: CXX_STATIC_LIBRARY_LINKER__jakal_core_Debug CMakeFiles\jakal_core.dir\src\device.cpp.obj CMakeFiles\jakal_core.dir\src\execution.cpp.obj CMakeFiles\jakal_core.dir\src\executor.cpp.obj CMakeFiles\jakal_core.dir\src\jakal_l0.cpp.obj CMakeFiles\jakal_core.dir\src\jakal_toolkit.cpp.obj CMakeFiles\jakal_core.dir\src\operation_variant_registry.cpp.obj CMakeFiles\jakal_core.dir\src\executors\common_scheduler.cpp.obj CMakeFiles\jakal_core.dir\src\executors\direct_backends.cpp.obj CMakeFiles\jakal_core.dir\src\executors\host_native_kernels.cpp.obj CMakeFiles\jakal_core.dir\src\executors\host_native_kernels_avx512.cpp.obj CMakeFiles\jakal_core.dir\src\executors\host_native_kernels_bf16.cpp.obj CMakeFiles\jakal_core.dir\src\executors\native_gpu_backends.cpp.obj CMakeFiles\jakal_core.dir\src\executors\vulkan_direct_backend.cpp.obj CMakeFiles\jakal_core.dir\src\planner.cpp.obj CMakeFiles\jakal_core.dir\src\workloads.cpp.obj CMakeFiles\jakal_core.dir\src\runtime.cpp.obj CMakeFiles\jakal_core.dir\src\c_api.cpp.obj CMakeFiles\jakal_core.dir\src\backends\cpu_backend.cpp.obj CMakeFiles\jakal_core.dir\src\backends\native_gpu_probes.cpp.obj CMakeFiles\jakal_core.dir\src\backends\opencl_backend.cpp.obj
+build jakal_core.lib: CXX_STATIC_LIBRARY_LINKER__jakal_core_Debug CMakeFiles\jakal_core.dir\src\device.cpp.obj CMakeFiles\jakal_core.dir\src\execution.cpp.obj CMakeFiles\jakal_core.dir\src\executor.cpp.obj CMakeFiles\jakal_core.dir\src\jakal_l0.cpp.obj CMakeFiles\jakal_core.dir\src\jakal_toolkit.cpp.obj CMakeFiles\jakal_core.dir\src\operation_variant_registry.cpp.obj CMakeFiles\jakal_core.dir\src\executors\common_scheduler.cpp.obj CMakeFiles\jakal_core.dir\src\executors\direct_backends.cpp.obj CMakeFiles\jakal_core.dir\src\executors\host_native_kernels.cpp.obj CMakeFiles\jakal_core.dir\src\executors\host_native_kernels_avx512.cpp.obj CMakeFiles\jakal_core.dir\src\executors\host_native_kernels_bf16.cpp.obj CMakeFiles\jakal_core.dir\src\executors\native_gpu_backends.cpp.obj CMakeFiles\jakal_core.dir\src\executors\vulkan_direct_backend.cpp.obj CMakeFiles\jakal_core.dir\src\planner.cpp.obj CMakeFiles\jakal_core.dir\src\workloads.cpp.obj CMakeFiles\jakal_core.dir\src\runtime.cpp.obj CMakeFiles\jakal_core.dir\src\backends\cpu_backend.cpp.obj CMakeFiles\jakal_core.dir\src\backends\native_gpu_probes.cpp.obj CMakeFiles\jakal_core.dir\src\backends\opencl_backend.cpp.obj
   CONFIG = Debug
   LANGUAGE_COMPILE_FLAGS = -MDd
   OBJECT_DIR = CMakeFiles\jakal_core.dir
@@ -287,6 +276,89 @@ build jakal_core.lib: CXX_STATIC_LIBRARY_LINKER__jakal_core_Debug CMakeFiles\jak
   TARGET_FILE = jakal_core.lib
   TARGET_PDB = jakal_core.pdb
   TARGET_SUPPORT_DIR = CMakeFiles\jakal_core.dir
+
+# =============================================================================
+# Object build statements for SHARED_LIBRARY target jakal_runtime
+
+
+#############################################
+# Order-only phony target for jakal_runtime
+
+build cmake_object_order_depends_target_jakal_runtime: phony || cmake_object_order_depends_target_jakal_core
+
+build CMakeFiles\jakal_runtime.dir\src\c_api.cpp.obj: CXX_COMPILER__jakal_runtime_unscanned_Debug D$:\GitHub\Jakal-Core\src\c_api.cpp || cmake_object_order_depends_target_jakal_runtime
+  CONFIG = Debug
+  DEFINES = -DJAKAL_CORE_C_API_EXPORTS -DNOMINMAX -Djakal_runtime_EXPORTS
+  FLAGS = -std:c++20 -MDd /W4 /permissive-
+  INCLUDES = -ID:\GitHub\Jakal-Core\include
+  OBJECT_DIR = CMakeFiles\jakal_runtime.dir
+  OBJECT_FILE_DIR = CMakeFiles\jakal_runtime.dir\src
+  TARGET_COMPILE_PDB = CMakeFiles\jakal_runtime.dir\
+  TARGET_PDB = jakal_runtime.pdb
+  TARGET_SUPPORT_DIR = CMakeFiles\jakal_runtime.dir
+
+
+# =============================================================================
+# Link build statements for SHARED_LIBRARY target jakal_runtime
+
+
+#############################################
+# Link the shared library jakal_runtime.dll
+
+build jakal_runtime.dll jakal_runtime.lib: CXX_SHARED_LIBRARY_LINKER__jakal_runtime_Debug CMakeFiles\jakal_runtime.dir\src\c_api.cpp.obj | jakal_core.lib || jakal_core.lib
+  CONFIG = Debug
+  LANGUAGE_COMPILE_FLAGS = -MDd
+  LINK_LIBRARIES = jakal_core.lib  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib
+  OBJECT_DIR = CMakeFiles\jakal_runtime.dir
+  POST_BUILD = cd .
+  PRE_LINK = cd .
+  RESTAT = 1
+  TARGET_COMPILE_PDB = CMakeFiles\jakal_runtime.dir\
+  TARGET_FILE = jakal_runtime.dll
+  TARGET_IMPLIB = jakal_runtime.lib
+  TARGET_PDB = jakal_runtime.pdb
+  TARGET_SUPPORT_DIR = CMakeFiles\jakal_runtime.dir
+
+# =============================================================================
+# Object build statements for EXECUTABLE target jakal_core_cli
+
+
+#############################################
+# Order-only phony target for jakal_core_cli
+
+build cmake_object_order_depends_target_jakal_core_cli: phony || cmake_object_order_depends_target_jakal_core
+
+build CMakeFiles\jakal_core_cli.dir\src\jakal_core_cli.cpp.obj: CXX_COMPILER__jakal_core_cli_unscanned_Debug D$:\GitHub\Jakal-Core\src\jakal_core_cli.cpp || cmake_object_order_depends_target_jakal_core_cli
+  CONFIG = Debug
+  FLAGS = -std:c++20 -MDd
+  INCLUDES = -ID:\GitHub\Jakal-Core\include
+  OBJECT_DIR = CMakeFiles\jakal_core_cli.dir
+  OBJECT_FILE_DIR = CMakeFiles\jakal_core_cli.dir\src
+  TARGET_COMPILE_PDB = CMakeFiles\jakal_core_cli.dir\
+  TARGET_PDB = jakal_core_cli.pdb
+  TARGET_SUPPORT_DIR = CMakeFiles\jakal_core_cli.dir
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target jakal_core_cli
+
+
+#############################################
+# Link the executable jakal_core_cli.exe
+
+build jakal_core_cli.exe: CXX_EXECUTABLE_LINKER__jakal_core_cli_Debug CMakeFiles\jakal_core_cli.dir\src\jakal_core_cli.cpp.obj | jakal_core.lib || jakal_core.lib
+  CONFIG = Debug
+  FLAGS = -MDd
+  LINK_FLAGS = /subsystem:console
+  LINK_LIBRARIES = jakal_core.lib  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib
+  OBJECT_DIR = CMakeFiles\jakal_core_cli.dir
+  POST_BUILD = cd .
+  PRE_LINK = cd .
+  TARGET_COMPILE_PDB = CMakeFiles\jakal_core_cli.dir\
+  TARGET_FILE = jakal_core_cli.exe
+  TARGET_IMPLIB = jakal_core_cli.lib
+  TARGET_PDB = jakal_core_cli.pdb
+  TARGET_SUPPORT_DIR = CMakeFiles\jakal_core_cli.dir
 
 # =============================================================================
 # Object build statements for EXECUTABLE target jakal_bootstrap
@@ -582,10 +654,11 @@ build jakal_directml_manifest_bench.exe: CXX_EXECUTABLE_LINKER__jakal_directml_m
 #############################################
 # Order-only phony target for jakal_smoke
 
-build cmake_object_order_depends_target_jakal_smoke: phony || cmake_object_order_depends_target_jakal_core
+build cmake_object_order_depends_target_jakal_smoke: phony || cmake_object_order_depends_target_jakal_core cmake_object_order_depends_target_jakal_runtime
 
 build CMakeFiles\jakal_smoke.dir\tests\smoke.cpp.obj: CXX_COMPILER__jakal_smoke_unscanned_Debug D$:\GitHub\Jakal-Core\tests\smoke.cpp || cmake_object_order_depends_target_jakal_smoke
   CONFIG = Debug
+  DEFINES = -DJAKAL_CORE_C_API_IMPORTS
   FLAGS = -std:c++20 -MDd
   INCLUDES = -ID:\GitHub\Jakal-Core\include
   OBJECT_DIR = CMakeFiles\jakal_smoke.dir
@@ -602,11 +675,11 @@ build CMakeFiles\jakal_smoke.dir\tests\smoke.cpp.obj: CXX_COMPILER__jakal_smoke_
 #############################################
 # Link the executable jakal_smoke.exe
 
-build jakal_smoke.exe: CXX_EXECUTABLE_LINKER__jakal_smoke_Debug CMakeFiles\jakal_smoke.dir\tests\smoke.cpp.obj | jakal_core.lib || jakal_core.lib
+build jakal_smoke.exe: CXX_EXECUTABLE_LINKER__jakal_smoke_Debug CMakeFiles\jakal_smoke.dir\tests\smoke.cpp.obj | jakal_core.lib jakal_runtime.lib jakal_core.lib || jakal_core.lib jakal_runtime.dll
   CONFIG = Debug
   FLAGS = -MDd
   LINK_FLAGS = /subsystem:console
-  LINK_LIBRARIES = jakal_core.lib  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib
+  LINK_LIBRARIES = jakal_core.lib  jakal_runtime.lib  jakal_core.lib  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib
   OBJECT_DIR = CMakeFiles\jakal_smoke.dir
   POST_BUILD = cd .
   PRE_LINK = cd .
@@ -967,6 +1040,48 @@ build jakal_preset_execution_diag.exe: CXX_EXECUTABLE_LINKER__jakal_preset_execu
   TARGET_PDB = jakal_preset_execution_diag.pdb
   TARGET_SUPPORT_DIR = CMakeFiles\jakal_preset_execution_diag.dir
 
+# =============================================================================
+# Object build statements for EXECUTABLE target jakal_runtime_install_smoke
+
+
+#############################################
+# Order-only phony target for jakal_runtime_install_smoke
+
+build cmake_object_order_depends_target_jakal_runtime_install_smoke: phony || cmake_object_order_depends_target_jakal_core cmake_object_order_depends_target_jakal_runtime
+
+build CMakeFiles\jakal_runtime_install_smoke.dir\tests\runtime_install_smoke.cpp.obj: CXX_COMPILER__jakal_runtime_install_smoke_unscanned_Debug D$:\GitHub\Jakal-Core\tests\runtime_install_smoke.cpp || cmake_object_order_depends_target_jakal_runtime_install_smoke
+  CONFIG = Debug
+  DEFINES = -DJAKAL_CORE_C_API_IMPORTS
+  FLAGS = -std:c++20 -MDd
+  INCLUDES = -ID:\GitHub\Jakal-Core\include
+  OBJECT_DIR = CMakeFiles\jakal_runtime_install_smoke.dir
+  OBJECT_FILE_DIR = CMakeFiles\jakal_runtime_install_smoke.dir\tests
+  TARGET_COMPILE_PDB = CMakeFiles\jakal_runtime_install_smoke.dir\
+  TARGET_PDB = jakal_runtime_install_smoke.pdb
+  TARGET_SUPPORT_DIR = CMakeFiles\jakal_runtime_install_smoke.dir
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target jakal_runtime_install_smoke
+
+
+#############################################
+# Link the executable jakal_runtime_install_smoke.exe
+
+build jakal_runtime_install_smoke.exe: CXX_EXECUTABLE_LINKER__jakal_runtime_install_smoke_Debug CMakeFiles\jakal_runtime_install_smoke.dir\tests\runtime_install_smoke.cpp.obj | jakal_runtime.lib jakal_core.lib || jakal_core.lib jakal_runtime.dll
+  CONFIG = Debug
+  FLAGS = -MDd
+  LINK_FLAGS = /subsystem:console
+  LINK_LIBRARIES = jakal_runtime.lib  jakal_core.lib  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib
+  OBJECT_DIR = CMakeFiles\jakal_runtime_install_smoke.dir
+  POST_BUILD = cd .
+  PRE_LINK = cd .
+  TARGET_COMPILE_PDB = CMakeFiles\jakal_runtime_install_smoke.dir\
+  TARGET_FILE = jakal_runtime_install_smoke.exe
+  TARGET_IMPLIB = jakal_runtime_install_smoke.lib
+  TARGET_PDB = jakal_runtime_install_smoke.pdb
+  TARGET_SUPPORT_DIR = CMakeFiles\jakal_runtime_install_smoke.dir
+
 
 #############################################
 # Utility command for uninstall
@@ -1174,6 +1289,8 @@ build jakal_bootstrap: phony jakal_bootstrap.exe
 
 build jakal_core: phony jakal_core.lib
 
+build jakal_core_cli: phony jakal_core_cli.exe
+
 build jakal_directml_manifest_bench: phony jakal_directml_manifest_bench.exe
 
 build jakal_explore_cpu_dl: phony jakal_explore_cpu_dl.exe
@@ -1196,6 +1313,10 @@ build jakal_profile_manifest: phony jakal_profile_manifest.exe
 
 build jakal_profile_workloads: phony jakal_profile_workloads.exe
 
+build jakal_runtime: phony jakal_runtime.dll
+
+build jakal_runtime_install_smoke: phony jakal_runtime_install_smoke.exe
+
 build jakal_runtime_product: phony jakal_runtime_product.exe
 
 build jakal_smoke: phony jakal_smoke.exe
@@ -1210,7 +1331,7 @@ build jakal_workload_import_adapters: phony jakal_workload_import_adapters.exe
 #############################################
 # Folder: D:/GitHub/Jakal-Core/build_ninja
 
-build all: phony jakal_core.lib jakal_bootstrap.exe jakal_inspect.exe jakal_profile_workloads.exe jakal_explore_cpu_dl.exe jakal_partition_roles.exe jakal_profile_manifest.exe jakal_directml_manifest_bench.exe jakal_smoke.exe jakal_optimization.exe jakal_planner_learning.exe jakal_partition_strategies.exe jakal_runtime_product.exe jakal_workload_import_adapters.exe jakal_backend_contracts.exe jakal_live_backend_smoke.exe jakal_preset_execution_diag.exe _deps\vulkan_headers-build\all
+build all: phony jakal_core.lib jakal_runtime.dll jakal_core_cli.exe jakal_bootstrap.exe jakal_inspect.exe jakal_profile_workloads.exe jakal_explore_cpu_dl.exe jakal_partition_roles.exe jakal_profile_manifest.exe jakal_directml_manifest_bench.exe jakal_smoke.exe jakal_optimization.exe jakal_planner_learning.exe jakal_partition_strategies.exe jakal_runtime_product.exe jakal_workload_import_adapters.exe jakal_backend_contracts.exe jakal_live_backend_smoke.exe jakal_preset_execution_diag.exe jakal_runtime_install_smoke.exe _deps\vulkan_headers-build\all
 
 # =============================================================================
 

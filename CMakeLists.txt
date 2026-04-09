@@ -35,13 +35,11 @@ add_library(jakal_core
     src/planner.cpp
     src/workloads.cpp
     src/runtime.cpp
-    src/c_api.cpp
     src/backends/cpu_backend.cpp
     src/backends/native_gpu_probes.cpp
     src/backends/opencl_backend.cpp)
 
 add_library(jakal::core ALIAS jakal_core)
-add_library(jakal::runtime ALIAS jakal_core)
 
 target_include_directories(jakal_core
     PUBLIC
@@ -124,6 +122,27 @@ if(UNIX AND NOT APPLE)
     target_link_libraries(jakal_core PRIVATE dl)
 endif()
 
+add_library(jakal_runtime SHARED src/c_api.cpp)
+add_library(jakal::runtime ALIAS jakal_runtime)
+target_link_libraries(jakal_runtime PUBLIC jakal_core)
+target_include_directories(jakal_runtime
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+target_compile_features(jakal_runtime PUBLIC cxx_std_20)
+target_compile_definitions(jakal_runtime PRIVATE JAKAL_CORE_C_API_EXPORTS)
+target_compile_definitions(jakal_runtime INTERFACE JAKAL_CORE_C_API_IMPORTS)
+if(MSVC)
+    target_compile_options(jakal_runtime PRIVATE /W4 /permissive-)
+    target_compile_definitions(jakal_runtime PRIVATE NOMINMAX)
+else()
+    target_compile_options(jakal_runtime PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(jakal_core_cli src/jakal_core_cli.cpp)
+target_link_libraries(jakal_core_cli PRIVATE jakal_core)
+jakal_enable_codesign(jakal_core_cli)
+
 if(JAKAL_CORE_BUILD_PRODUCT_TOOLS)
     add_executable(jakal_bootstrap examples/bootstrap_runtime.cpp)
     target_link_libraries(jakal_bootstrap PRIVATE jakal::core)
@@ -161,7 +180,7 @@ if(JAKAL_CORE_BUILD_TESTS)
     endif()
 
     add_executable(jakal_smoke tests/smoke.cpp)
-    target_link_libraries(jakal_smoke PRIVATE jakal::core)
+    target_link_libraries(jakal_smoke PRIVATE jakal::core jakal::runtime)
 
     add_test(NAME jakal_smoke COMMAND jakal_smoke)
 
@@ -213,9 +232,14 @@ if(JAKAL_CORE_BUILD_TESTS)
 
     add_executable(jakal_preset_execution_diag tests/preset_execution_diag.cpp)
     target_link_libraries(jakal_preset_execution_diag PRIVATE jakal::core)
+
+    add_executable(jakal_runtime_install_smoke tests/runtime_install_smoke.cpp)
+    target_link_libraries(jakal_runtime_install_smoke PRIVATE jakal::runtime)
+    add_test(NAME jakal_runtime_install_smoke COMMAND jakal_runtime_install_smoke)
 endif()
 
 set(jakal_installable_runtime_targets jakal_core)
+list(APPEND jakal_installable_runtime_targets jakal_runtime jakal_core_cli)
 if(TARGET jakal_bootstrap)
     list(APPEND jakal_installable_runtime_targets jakal_bootstrap)
 endif()
@@ -255,6 +279,19 @@ install(
         packaging/remove-jakal-core.ps1
     DESTINATION ${CMAKE_INSTALL_DATADIR}/jakal-core/remove
     COMPONENT maintenance)
+
+install(
+    FILES
+        packaging/jakal-runtime-config.ini
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/jakal-core/config
+    COMPONENT runtime)
+
+install(
+    FILES
+        python/jakal_runtime.py
+        python/jakal_app_adapter.py
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/jakal-core/python
+    COMPONENT runtime)
 
 configure_package_config_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/cmake/JakalCoreConfig.cmake.in

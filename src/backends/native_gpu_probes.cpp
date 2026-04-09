@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 
+#include <vulkan/vulkan.h>
+
 #if defined(_WIN32)
 #include <Windows.h>
 #else
@@ -575,6 +577,176 @@ private:
     RocmApi api_;
 };
 
+class VulkanApi {
+public:
+    using vk_get_instance_proc_addr_fn = PFN_vkGetInstanceProcAddr;
+    using vk_create_instance_fn = PFN_vkCreateInstance;
+    using vk_enumerate_physical_devices_fn = PFN_vkEnumeratePhysicalDevices;
+    using vk_get_physical_device_properties_fn = PFN_vkGetPhysicalDeviceProperties;
+    using vk_get_physical_device_memory_properties_fn = PFN_vkGetPhysicalDeviceMemoryProperties;
+    using vk_destroy_instance_fn = PFN_vkDestroyInstance;
+
+    VulkanApi() {
+#if defined(_WIN32)
+        library_ = load_library("vulkan-1.dll");
+#else
+        library_ = load_library("libvulkan.so");
+        if (library_ == nullptr) {
+            library_ = load_library("libvulkan.so.1");
+        }
+#endif
+        if (library_ == nullptr) {
+            return;
+        }
+        vk_get_instance_proc_addr_ =
+            reinterpret_cast<vk_get_instance_proc_addr_fn>(load_symbol(library_, "vkGetInstanceProcAddr"));
+        if (vk_get_instance_proc_addr_ == nullptr) {
+            return;
+        }
+        vk_create_instance_ =
+            reinterpret_cast<vk_create_instance_fn>(vk_get_instance_proc_addr_(nullptr, "vkCreateInstance"));
+        loaded_ = vk_create_instance_ != nullptr;
+    }
+
+    ~VulkanApi() {
+        close_library(library_);
+    }
+
+    [[nodiscard]] bool loaded() const { return loaded_; }
+
+    [[nodiscard]] std::vector<HardwareGraph> discover() const {
+        std::vector<HardwareGraph> graphs;
+        if (!loaded_) {
+            return graphs;
+        }
+
+        const VkApplicationInfo app_info{
+            VK_STRUCTURE_TYPE_APPLICATION_INFO,
+            nullptr,
+            "JakalRuntime",
+            1u,
+            "JakalRuntime",
+            1u,
+            VK_API_VERSION_1_0};
+        const VkInstanceCreateInfo create_info{
+            VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+            nullptr,
+            0u,
+            &app_info,
+            0u,
+            nullptr,
+            0u,
+            nullptr};
+
+        VkInstance instance = VK_NULL_HANDLE;
+        if (vk_create_instance_(&create_info, nullptr, &instance) != VK_SUCCESS || instance == VK_NULL_HANDLE) {
+            return graphs;
+        }
+
+        const auto vk_enumerate_physical_devices =
+            reinterpret_cast<vk_enumerate_physical_devices_fn>(
+                vk_get_instance_proc_addr_(instance, "vkEnumeratePhysicalDevices"));
+        const auto vk_get_physical_device_properties =
+            reinterpret_cast<vk_get_physical_device_properties_fn>(
+                vk_get_instance_proc_addr_(instance, "vkGetPhysicalDeviceProperties"));
+        const auto vk_get_physical_device_memory_properties =
+            reinterpret_cast<vk_get_physical_device_memory_properties_fn>(
+                vk_get_instance_proc_addr_(instance, "vkGetPhysicalDeviceMemoryProperties"));
+        const auto vk_destroy_instance =
+            reinterpret_cast<vk_destroy_instance_fn>(vk_get_instance_proc_addr_(instance, "vkDestroyInstance"));
+
+        if (vk_enumerate_physical_devices == nullptr ||
+            vk_get_physical_device_properties == nullptr ||
+            vk_get_physical_device_memory_properties == nullptr ||
+            vk_destroy_instance == nullptr) {
+            if (vk_destroy_instance != nullptr) {
+                vk_destroy_instance(instance, nullptr);
+            }
+            return graphs;
+        }
+
+        std::uint32_t device_count = 0u;
+        if (vk_enumerate_physical_devices(instance, &device_count, nullptr) != VK_SUCCESS || device_count == 0u) {
+            vk_destroy_instance(instance, nullptr);
+            return graphs;
+        }
+        std::vector<VkPhysicalDevice> devices(device_count, VK_NULL_HANDLE);
+        if (vk_enumerate_physical_devices(instance, &device_count, devices.data()) != VK_SUCCESS) {
+            vk_destroy_instance(instance, nullptr);
+            return graphs;
+        }
+
+        std::uint32_t ordinal = 0u;
+        for (const auto device : devices) {
+            VkPhysicalDeviceProperties props{};
+            VkPhysicalDeviceMemoryProperties memory{};
+            vk_get_physical_device_properties(device, &props);
+            vk_get_physical_device_memory_properties(device, &memory);
+
+            std::uint64_t total_memory = 0ull;
+            bool host_visible = false;
+            bool host_coherent = false;
+            for (std::uint32_t heap_index = 0u; heap_index < memory.memoryHeapCount; ++heap_index) {
+                if ((memory.memoryHeaps[heap_index].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0u) {
+                    total_memory += memory.memoryHeaps[heap_index].size;
+                }
+            }
+            for (std::uint32_t type_index = 0u; type_index < memory.memoryTypeCount; ++type_index) {
+                const auto flags = memory.memoryTypes[type_index].propertyFlags;
+                host_visible = host_visible || ((flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0u);
+                host_coherent = host_coherent || ((flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0u);
+            }
+
+            const auto vendor = props.vendorID;
+            const bool likely_fp16 = vendor == 0x10DEu || vendor == 0x8086u || vendor == 0x1002u || vendor == 0x1022u;
+            const auto driver = std::to_string(VK_VERSION_MAJOR(props.driverVersion)) + "." +
+                                std::to_string(VK_VERSION_MINOR(props.driverVersion));
+            const auto api = std::to_string(VK_VERSION_MAJOR(props.apiVersion)) + "." +
+                             std::to_string(VK_VERSION_MINOR(props.apiVersion));
+            const auto name = props.deviceName[0] == '\0' ? ("vulkan-device-" + std::to_string(ordinal))
+                                                           : std::string(props.deviceName);
+
+            graphs.push_back(make_native_gpu_graph(
+                "vulkan:" + sanitize_id_fragment(name),
+                "vulkan",
+                name,
+                driver,
+                api,
+                "glslang",
+                ordinal++,
+                std::max<std::uint32_t>(16u, props.limits.maxComputeWorkGroupInvocations / 8u),
+                std::max<std::uint32_t>(8u, props.limits.maxComputeWorkGroupInvocations / 16u),
+                likely_fp16 ? 8u : 4u,
+                1400u,
+                total_memory == 0ull ? (4ull * 1024ull * 1024ull * 1024ull) : total_memory,
+                64ull * 1024ull,
+                2ull * 1024ull * 1024ull,
+                host_visible && host_coherent,
+                likely_fp16,
+                true));
+        }
+
+        vk_destroy_instance(instance, nullptr);
+        return graphs;
+    }
+
+private:
+    LibraryHandle library_ = nullptr;
+    bool loaded_ = false;
+    vk_get_instance_proc_addr_fn vk_get_instance_proc_addr_ = nullptr;
+    vk_create_instance_fn vk_create_instance_ = nullptr;
+};
+
+class VulkanProbe final : public IDeviceProbe {
+public:
+    [[nodiscard]] std::string name() const override { return "vulkan"; }
+    [[nodiscard]] bool available() const override { return api_.loaded(); }
+    std::vector<HardwareGraph> discover_hardware() override { return api_.discover(); }
+
+private:
+    VulkanApi api_;
+};
+
 }  // namespace
 
 std::unique_ptr<IDeviceProbe> make_level_zero_probe() {
@@ -583,6 +755,10 @@ std::unique_ptr<IDeviceProbe> make_level_zero_probe() {
 
 std::unique_ptr<IDeviceProbe> make_cuda_probe() {
     return std::make_unique<CudaProbe>();
+}
+
+std::unique_ptr<IDeviceProbe> make_vulkan_probe() {
+    return std::make_unique<VulkanProbe>();
 }
 
 std::unique_ptr<IDeviceProbe> make_rocm_probe() {

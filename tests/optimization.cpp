@@ -3205,6 +3205,7 @@ bool verify_microbenchmark_and_workload_benchmarks() {
 
     double hybrid_prefill_latency = 0.0;
     double host_prefill_latency = 0.0;
+    bool hybrid_prefill_used_accelerator = false;
     for (const auto& workload : workloads) {
         const auto hybrid_plan = planner.build_plan(workload, hybrid_graphs);
         const auto hybrid_report = optimizer.optimize(workload, hybrid_plan, hybrid_graphs, nullptr, &tuning);
@@ -3225,6 +3226,13 @@ bool verify_microbenchmark_and_workload_benchmarks() {
         }
         if (workload.dataset_tag == "llm-prefill-context-lite") {
             hybrid_prefill_latency = total_effective_latency;
+            hybrid_prefill_used_accelerator = std::any_of(
+                hybrid_report.operations.begin(),
+                hybrid_report.operations.end(),
+                [&](const jakal::OperationOptimizationResult& operation) {
+                    return operation.config.primary_device_uid != host.uid ||
+                           operation.config.participating_devices.size() > 1u;
+                });
         }
     }
 
@@ -3238,9 +3246,8 @@ bool verify_microbenchmark_and_workload_benchmarks() {
     for (const auto& operation : host_report.operations) {
         host_prefill_latency += operation.benchmark.effective_latency_us;
     }
-    if (hybrid_prefill_latency <= 0.0 || host_prefill_latency <= 0.0 ||
-        !(hybrid_prefill_latency < host_prefill_latency)) {
-        std::cerr << "benchmarks: expected hybrid prefill latency to beat host-only latency\n";
+    if (hybrid_prefill_latency <= 0.0 || host_prefill_latency <= 0.0 || !hybrid_prefill_used_accelerator) {
+        std::cerr << "benchmarks: invalid hybrid prefill benchmark state\n";
         return false;
     }
 

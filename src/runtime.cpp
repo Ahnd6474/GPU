@@ -8,6 +8,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -202,6 +203,137 @@ std::filesystem::path default_runtime_telemetry_path() {
         return std::filesystem::temp_directory_path() / "jakal_core_runtime_telemetry.tsv";
     } catch (const std::exception&) {
         return std::filesystem::path("jakal_core_runtime_telemetry.tsv");
+    }
+}
+
+std::filesystem::path env_path(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        return {};
+    }
+    return std::filesystem::path(value);
+}
+
+std::filesystem::path choose_writable_runtime_root() {
+    if (const auto override_root = env_path("JAKAL_RUNTIME_HOME"); !override_root.empty()) {
+        return override_root;
+    }
+#if defined(_WIN32)
+    if (const auto local_app_data = env_path("LOCALAPPDATA"); !local_app_data.empty()) {
+        return local_app_data / "Jakal-Core";
+    }
+    if (const auto app_data = env_path("APPDATA"); !app_data.empty()) {
+        return app_data / "Jakal-Core";
+    }
+#else
+    if (const auto xdg_state = env_path("XDG_STATE_HOME"); !xdg_state.empty()) {
+        return xdg_state / "jakal-core";
+    }
+    if (const auto home = env_path("HOME"); !home.empty()) {
+        return home / ".local" / "state" / "jakal-core";
+    }
+#endif
+    try {
+        return std::filesystem::temp_directory_path() / "jakal-core";
+    } catch (const std::exception&) {
+        return std::filesystem::path("jakal-core-state");
+    }
+}
+
+std::filesystem::path choose_config_runtime_root() {
+    if (const auto override_root = env_path("JAKAL_RUNTIME_HOME"); !override_root.empty()) {
+        return override_root / "config";
+    }
+#if defined(_WIN32)
+    if (const auto app_data = env_path("APPDATA"); !app_data.empty()) {
+        return app_data / "Jakal-Core" / "config";
+    }
+#else
+    if (const auto xdg_config = env_path("XDG_CONFIG_HOME"); !xdg_config.empty()) {
+        return xdg_config / "jakal-core";
+    }
+    if (const auto home = env_path("HOME"); !home.empty()) {
+        return home / ".config" / "jakal-core";
+    }
+#endif
+    return choose_writable_runtime_root() / "config";
+}
+
+std::string trim_copy(std::string value) {
+    auto not_space = [](unsigned char ch) { return std::isspace(ch) == 0; };
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), not_space));
+    value.erase(std::find_if(value.rbegin(), value.rend(), not_space).base(), value.end());
+    return value;
+}
+
+bool parse_ini_bool(const std::string& value, const bool fallback) {
+    const auto normalized = trim_copy(value);
+    if (normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on") {
+        return true;
+    }
+    if (normalized == "0" || normalized == "false" || normalized == "no" || normalized == "off") {
+        return false;
+    }
+    return fallback;
+}
+
+void apply_runtime_ini_overrides(const std::filesystem::path& path, RuntimeOptions& options) {
+    std::ifstream input(path);
+    if (!input.is_open()) {
+        return;
+    }
+
+    std::string section;
+    std::string line;
+    while (std::getline(input, line)) {
+        line = trim_copy(line);
+        if (line.empty() || line[0] == '#' || line[0] == ';') {
+            continue;
+        }
+        if (line.front() == '[' && line.back() == ']') {
+            section = trim_copy(line.substr(1u, line.size() - 2u));
+            continue;
+        }
+        const auto equals = line.find('=');
+        if (equals == std::string::npos) {
+            continue;
+        }
+        const auto key = trim_copy(line.substr(0u, equals));
+        const auto value = trim_copy(line.substr(equals + 1u));
+
+        if (section == "runtime" && key == "home" && !value.empty()) {
+            const auto root = std::filesystem::path(value);
+            options.cache_path = root / "cache" / "planner-cache.tsv";
+            options.execution_cache_path = root / "cache" / "execution-cache.tsv";
+            options.product.observability.telemetry_path = root / "logs" / "runtime-telemetry.tsv";
+        } else if (section == "paths") {
+            if (key == "planner_cache" && !value.empty()) {
+                options.cache_path = value;
+            } else if (key == "execution_cache" && !value.empty()) {
+                options.execution_cache_path = value;
+            } else if (key == "telemetry" && !value.empty()) {
+                options.product.observability.telemetry_path = value;
+            }
+        } else if (section == "backends") {
+            if (key == "host") {
+                options.enable_host_probe = parse_ini_bool(value, options.enable_host_probe);
+            } else if (key == "opencl") {
+                options.enable_opencl_probe = parse_ini_bool(value, options.enable_opencl_probe);
+            } else if (key == "level_zero") {
+                options.enable_level_zero_probe = parse_ini_bool(value, options.enable_level_zero_probe);
+            } else if (key == "vulkan_probe") {
+                options.enable_vulkan_probe = parse_ini_bool(value, options.enable_vulkan_probe);
+            } else if (key == "vulkan_status") {
+                options.enable_vulkan_status = parse_ini_bool(value, options.enable_vulkan_status);
+            } else if (key == "cuda") {
+                options.enable_cuda_probe = parse_ini_bool(value, options.enable_cuda_probe);
+            } else if (key == "rocm") {
+                options.enable_rocm_probe = parse_ini_bool(value, options.enable_rocm_probe);
+            } else if (key == "prefer_level_zero_over_opencl") {
+                options.prefer_level_zero_over_opencl =
+                    parse_ini_bool(value, options.prefer_level_zero_over_opencl);
+            }
+        }
     }
 }
 
@@ -2156,6 +2288,48 @@ double planner_risk_score(
 
 }  // namespace
 
+std::string to_string(const RuntimeBackendStatusCode code) {
+    switch (code) {
+    case RuntimeBackendStatusCode::disabled:
+        return "disabled";
+    case RuntimeBackendStatusCode::unavailable:
+        return "unavailable";
+    case RuntimeBackendStatusCode::no_devices:
+        return "no-devices";
+    case RuntimeBackendStatusCode::ready_direct:
+        return "ready-direct";
+    case RuntimeBackendStatusCode::ready_modeled:
+        return "ready-modeled";
+    }
+    return "unavailable";
+}
+
+RuntimeInstallPaths resolve_runtime_install_paths(const std::filesystem::path& install_root) {
+    RuntimeInstallPaths paths;
+    paths.install_root =
+        install_root.empty() ? env_path("JAKAL_INSTALL_ROOT") : install_root;
+    paths.writable_root = choose_writable_runtime_root();
+    paths.config_dir = choose_config_runtime_root();
+    paths.cache_dir = paths.writable_root / "cache";
+    paths.logs_dir = paths.writable_root / "logs";
+    paths.telemetry_path = paths.logs_dir / "runtime-telemetry.tsv";
+    paths.planner_cache_path = paths.cache_dir / "planner-cache.tsv";
+    paths.execution_cache_path = paths.cache_dir / "execution-cache.tsv";
+    paths.python_dir = paths.install_root.empty() ? (paths.writable_root / "python") : (paths.install_root / "python");
+    return paths;
+}
+
+RuntimeOptions make_runtime_options_for_install(const std::filesystem::path& install_root) {
+    RuntimeOptions options;
+    const auto paths = resolve_runtime_install_paths(install_root);
+    options.cache_path = paths.planner_cache_path;
+    options.execution_cache_path = paths.execution_cache_path;
+    options.product.observability.telemetry_path = paths.telemetry_path;
+    const auto config_path = paths.config_dir / "jakal-runtime-config.ini";
+    apply_runtime_ini_overrides(config_path, options);
+    return options;
+}
+
 std::string runtime_backend_cache_tag_for_graph(const HardwareGraph& graph) {
     return backend_binary_cache_tag(graph);
 }
@@ -2172,12 +2346,23 @@ bool runtime_backend_supports_operation(
 }
 
 Runtime::Runtime(RuntimeOptions options)
-    : options_(std::move(options)),
-      planner_(options_.cache_path.empty() ? Planner::default_cache_path() : options_.cache_path),
-      execution_optimizer_(
-          options_.execution_cache_path.empty()
-              ? ExecutionOptimizer::default_cache_path()
-              : options_.execution_cache_path) {
+    : options_([&options]() {
+          auto normalized = std::move(options);
+          const auto paths = resolve_runtime_install_paths({});
+          if (normalized.cache_path.empty()) {
+              normalized.cache_path = paths.planner_cache_path;
+          }
+          if (normalized.execution_cache_path.empty()) {
+              normalized.execution_cache_path = paths.execution_cache_path;
+          }
+          if (normalized.product.observability.telemetry_path.empty()) {
+              normalized.product.observability.telemetry_path = paths.telemetry_path;
+          }
+          return normalized;
+      }()),
+      install_paths_(resolve_runtime_install_paths({})),
+      planner_(options_.cache_path),
+      execution_optimizer_(options_.execution_cache_path) {
     if (options_.enable_host_probe) {
         probes_.push_back(make_host_probe());
     }
@@ -2187,15 +2372,90 @@ Runtime::Runtime(RuntimeOptions options)
     if (options_.enable_level_zero_probe) {
         probes_.push_back(make_level_zero_probe());
     }
+    if (options_.enable_vulkan_probe) {
+        probes_.push_back(make_vulkan_probe());
+    }
     if (options_.enable_cuda_probe) {
         probes_.push_back(make_cuda_probe());
     }
     if (options_.enable_rocm_probe) {
         probes_.push_back(make_rocm_probe());
     }
+    rebuild_backend_statuses();
     if (options_.eager_hardware_refresh) {
         refresh_hardware();
     }
+}
+
+const RuntimeOptions& Runtime::options() const {
+    return options_;
+}
+
+const RuntimeInstallPaths& Runtime::install_paths() const {
+    return install_paths_;
+}
+
+const std::vector<RuntimeBackendStatus>& Runtime::backend_statuses() const {
+    return backend_statuses_;
+}
+
+void Runtime::rebuild_backend_statuses() {
+    backend_statuses_.clear();
+
+    auto append_backend = [&](const std::string& backend_name,
+                              const bool enabled,
+                              const bool direct_available,
+                              const bool modeled_fallback,
+                              const std::string& detail) {
+        std::size_t device_count = 0u;
+        for (const auto& graph : devices_) {
+            if (graph.probe == backend_name) {
+                RuntimeBackendStatus entry;
+                entry.backend_name = backend_name;
+                entry.device_uid = graph.uid;
+                entry.enabled = enabled;
+                entry.available = true;
+                entry.direct_execution = direct_available;
+                entry.modeled_fallback = modeled_fallback;
+                entry.code = direct_available ? RuntimeBackendStatusCode::ready_direct
+                                              : RuntimeBackendStatusCode::ready_modeled;
+                entry.detail = detail.empty() ? runtime_backend_name_for_graph(graph) : detail;
+                backend_statuses_.push_back(std::move(entry));
+                ++device_count;
+            }
+        }
+        if (device_count == 0u) {
+            RuntimeBackendStatus entry;
+            entry.backend_name = backend_name;
+            entry.enabled = enabled;
+            entry.available = false;
+            entry.direct_execution = direct_available;
+            entry.modeled_fallback = modeled_fallback;
+            entry.code = !enabled ? RuntimeBackendStatusCode::disabled
+                                  : (direct_available ? RuntimeBackendStatusCode::unavailable
+                                                      : RuntimeBackendStatusCode::no_devices);
+            entry.detail = detail;
+            backend_statuses_.push_back(std::move(entry));
+        }
+    };
+
+    append_backend("host", options_.enable_host_probe, true, false, options_.enable_host_probe ? "host probe enabled" : "host probe disabled");
+    append_backend("opencl", options_.enable_opencl_probe, true, false, options_.enable_opencl_probe ? "opencl probe active" : "opencl probe disabled");
+    append_backend("level-zero", options_.enable_level_zero_probe, true, false, options_.enable_level_zero_probe ? "level-zero probe active" : "level-zero probe disabled");
+    append_backend("cuda", options_.enable_cuda_probe, true, false, options_.enable_cuda_probe ? "cuda probe active" : "cuda probe disabled");
+    append_backend("rocm", options_.enable_rocm_probe, true, false, options_.enable_rocm_probe ? "rocm probe active" : "rocm probe disabled");
+
+    RuntimeBackendStatus vulkan;
+    vulkan.backend_name = "vulkan";
+    vulkan.enabled = options_.enable_vulkan_status;
+    vulkan.available = executors::vulkan_direct_backend_available();
+    vulkan.direct_execution = vulkan.available;
+    vulkan.modeled_fallback = !vulkan.available;
+    vulkan.code = !vulkan.enabled
+        ? RuntimeBackendStatusCode::disabled
+        : (vulkan.available ? RuntimeBackendStatusCode::ready_direct : RuntimeBackendStatusCode::ready_modeled);
+    vulkan.detail = executors::vulkan_direct_backend_status_detail();
+    backend_statuses_.push_back(std::move(vulkan));
 }
 
 void Runtime::refresh_hardware() {
@@ -2240,6 +2500,7 @@ void Runtime::refresh_hardware() {
     });
 
     jakal_toolkit_index_ = jakal_toolkit_.build_index(devices_);
+    rebuild_backend_statuses();
     hardware_refreshed_ = true;
 }
 

@@ -1334,7 +1334,7 @@ std::string shader_key(const ShaderKind kind) {
     case ShaderKind::reduction:
         return "v2.reduction";
     case ShaderKind::matmul:
-        return "v2.matmul";
+        return "v3.matmul";
     case ShaderKind::conv3x3:
         return "v2.conv3x3";
     case ShaderKind::resample:

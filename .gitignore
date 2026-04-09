@@ -3,6 +3,10 @@
 __pycache__/
 build/
 out/
+%TEMP%/
+.codex-temp/
+
+
 
 *.obj
 *.o

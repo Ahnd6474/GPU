@@ -227,6 +227,9 @@ int main() {
     const jakal_core_workload_spec c_workload{
         "smoke",
         "tensor",
+        "smoke-lite",
+        "prefill",
+        "b4-lite",
         128ull * 1024ull * 1024ull,
         64ull * 1024ull * 1024ull,
         2.0e11,

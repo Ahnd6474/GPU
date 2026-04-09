@@ -10,6 +10,7 @@
 
 struct jakal_core_runtime {
     jakal::Runtime runtime;
+    std::string last_error;
 };
 
 namespace {
@@ -115,6 +116,18 @@ void fill_graph_edge_info(const jakal::HardwareGraphEdge& edge, jakal_core_graph
     out_edge->latency_us = edge.latency_us;
 }
 
+void set_last_error(jakal_core_runtime_t* runtime, const std::string& message) {
+    if (runtime != nullptr) {
+        runtime->last_error = message;
+    }
+}
+
+void clear_last_error(jakal_core_runtime_t* runtime) {
+    if (runtime != nullptr) {
+        runtime->last_error.clear();
+    }
+}
+
 void fill_optimization_info(const jakal::OptimizationReport& report, jakal_core_optimization_info* out_optimization) {
     if (out_optimization == nullptr) {
         return;
@@ -188,6 +201,47 @@ void fill_execution_operation_info(
     out_operation->logical_partitions_used = operation.logical_partitions_used;
 }
 
+void fill_runtime_paths(
+    const jakal::RuntimeInstallPaths& paths,
+    jakal_core_runtime_paths* out_paths) {
+    if (out_paths == nullptr) {
+        return;
+    }
+
+    copy_string(paths.install_root.string(), out_paths->install_root, sizeof(out_paths->install_root));
+    copy_string(paths.writable_root.string(), out_paths->writable_root, sizeof(out_paths->writable_root));
+    copy_string(paths.config_dir.string(), out_paths->config_dir, sizeof(out_paths->config_dir));
+    copy_string(paths.cache_dir.string(), out_paths->cache_dir, sizeof(out_paths->cache_dir));
+    copy_string(paths.logs_dir.string(), out_paths->logs_dir, sizeof(out_paths->logs_dir));
+    copy_string(paths.telemetry_path.string(), out_paths->telemetry_path, sizeof(out_paths->telemetry_path));
+    copy_string(
+        paths.planner_cache_path.string(),
+        out_paths->planner_cache_path,
+        sizeof(out_paths->planner_cache_path));
+    copy_string(
+        paths.execution_cache_path.string(),
+        out_paths->execution_cache_path,
+        sizeof(out_paths->execution_cache_path));
+    copy_string(paths.python_dir.string(), out_paths->python_dir, sizeof(out_paths->python_dir));
+}
+
+void fill_backend_status_info(
+    const jakal::RuntimeBackendStatus& status,
+    jakal_core_backend_status_info* out_status) {
+    if (out_status == nullptr) {
+        return;
+    }
+
+    copy_string(status.backend_name, out_status->backend_name, sizeof(out_status->backend_name));
+    copy_string(status.device_uid, out_status->device_uid, sizeof(out_status->device_uid));
+    copy_string(jakal::to_string(status.code), out_status->code, sizeof(out_status->code));
+    copy_string(status.detail, out_status->detail, sizeof(out_status->detail));
+    out_status->enabled = status.enabled ? 1 : 0;
+    out_status->available = status.available ? 1 : 0;
+    out_status->direct_execution = status.direct_execution ? 1 : 0;
+    out_status->modeled_fallback = status.modeled_fallback ? 1 : 0;
+}
+
 jakal::WorkloadKind parse_workload_kind(const char* kind) {
     if (kind == nullptr) {
         return jakal::WorkloadKind::custom;
@@ -212,12 +266,87 @@ jakal::WorkloadKind parse_workload_kind(const char* kind) {
     return jakal::WorkloadKind::custom;
 }
 
+jakal::WorkloadPhase parse_workload_phase(const char* phase) {
+    if (phase == nullptr) {
+        return jakal::WorkloadPhase::unknown;
+    }
+    const std::string value(phase);
+    if (value == "decode") {
+        return jakal::WorkloadPhase::decode;
+    }
+    if (value == "prefill") {
+        return jakal::WorkloadPhase::prefill;
+    }
+    if (value == "cache_update") {
+        return jakal::WorkloadPhase::cache_update;
+    }
+    if (value == "dequantize") {
+        return jakal::WorkloadPhase::dequantize;
+    }
+    if (value == "training_step") {
+        return jakal::WorkloadPhase::training_step;
+    }
+    return jakal::WorkloadPhase::unknown;
+}
+
+jakal::WorkloadSpec convert_workload(const jakal_core_workload_spec& workload) {
+    return jakal::WorkloadSpec{
+        workload.name == nullptr ? std::string("unnamed") : std::string(workload.name),
+        parse_workload_kind(workload.kind),
+        workload.dataset_tag == nullptr ? std::string{} : std::string(workload.dataset_tag),
+        workload.working_set_bytes,
+        workload.host_exchange_bytes,
+        workload.estimated_flops,
+        workload.batch_size,
+        workload.latency_sensitive != 0,
+        workload.prefer_unified_memory != 0,
+        workload.matrix_friendly != 0,
+        jakal::PartitionStrategy::auto_balanced,
+        parse_workload_phase(workload.phase),
+        workload.shape_bucket == nullptr ? std::string{} : std::string(workload.shape_bucket)};
+}
+
+jakal::RuntimeOptions convert_runtime_options(const jakal_core_runtime_options& options) {
+    auto runtime_options = jakal::make_runtime_options_for_install(
+        options.install_root == nullptr ? std::filesystem::path{} : std::filesystem::path(options.install_root));
+    runtime_options.enable_host_probe = options.enable_host_probe != 0;
+    runtime_options.enable_opencl_probe = options.enable_opencl_probe != 0;
+    runtime_options.enable_level_zero_probe = options.enable_level_zero_probe != 0;
+    runtime_options.enable_vulkan_probe = options.enable_vulkan_probe != 0;
+    runtime_options.enable_vulkan_status = options.enable_vulkan_status != 0;
+    runtime_options.enable_cuda_probe = options.enable_cuda_probe != 0;
+    runtime_options.enable_rocm_probe = options.enable_rocm_probe != 0;
+    runtime_options.prefer_level_zero_over_opencl = options.prefer_level_zero_over_opencl != 0;
+    runtime_options.eager_hardware_refresh = options.eager_hardware_refresh != 0;
+    if (options.cache_path != nullptr && options.cache_path[0] != '\0') {
+        runtime_options.cache_path = options.cache_path;
+    }
+    if (options.execution_cache_path != nullptr && options.execution_cache_path[0] != '\0') {
+        runtime_options.execution_cache_path = options.execution_cache_path;
+    }
+    if (options.telemetry_path != nullptr && options.telemetry_path[0] != '\0') {
+        runtime_options.product.observability.telemetry_path = options.telemetry_path;
+    }
+    return runtime_options;
+}
+
 }  // namespace
 
 jakal_core_runtime_t* jakal_core_runtime_create(void) {
     try {
         return new jakal_core_runtime_t{jakal::Runtime{}};
-    } catch (const std::bad_alloc&) {
+    } catch (const std::exception&) {
+        return nullptr;
+    }
+}
+
+jakal_core_runtime_t* jakal_core_runtime_create_with_options(const jakal_core_runtime_options* options) {
+    try {
+        if (options == nullptr) {
+            return new jakal_core_runtime_t{jakal::Runtime{}};
+        }
+        return new jakal_core_runtime_t{jakal::Runtime{convert_runtime_options(*options)}};
+    } catch (const std::exception&) {
         return nullptr;
     }
 }
@@ -231,7 +360,51 @@ int jakal_core_runtime_refresh(jakal_core_runtime_t* runtime) {
         return -1;
     }
 
-    runtime->runtime.refresh_hardware();
+    try {
+        clear_last_error(runtime);
+        runtime->runtime.refresh_hardware();
+        return 0;
+    } catch (const std::exception& error) {
+        set_last_error(runtime, error.what());
+        return -2;
+    }
+}
+
+int jakal_core_runtime_get_last_error(const jakal_core_runtime_t* runtime, char* buffer, size_t capacity) {
+    if (runtime == nullptr || buffer == nullptr || capacity == 0u) {
+        return -1;
+    }
+    copy_string(runtime->last_error, buffer, capacity);
+    return 0;
+}
+
+int jakal_core_runtime_get_install_paths(const jakal_core_runtime_t* runtime, jakal_core_runtime_paths* out_paths) {
+    if (runtime == nullptr || out_paths == nullptr) {
+        return -1;
+    }
+    fill_runtime_paths(runtime->runtime.install_paths(), out_paths);
+    return 0;
+}
+
+size_t jakal_core_runtime_backend_status_count(const jakal_core_runtime_t* runtime) {
+    if (runtime == nullptr) {
+        return 0u;
+    }
+    return runtime->runtime.backend_statuses().size();
+}
+
+int jakal_core_runtime_get_backend_status(
+    const jakal_core_runtime_t* runtime,
+    size_t index,
+    jakal_core_backend_status_info* out_status) {
+    if (runtime == nullptr || out_status == nullptr) {
+        return -1;
+    }
+    const auto& statuses = runtime->runtime.backend_statuses();
+    if (index >= statuses.size()) {
+        return -2;
+    }
+    fill_backend_status_info(statuses[index], out_status);
     return 0;
 }
 
@@ -340,36 +513,30 @@ int jakal_core_runtime_plan(
         return -1;
     }
 
-    const jakal::WorkloadSpec cpp_workload{
-        workload->name == nullptr ? std::string("unnamed") : std::string(workload->name),
-        parse_workload_kind(workload->kind),
-        "",
-        workload->working_set_bytes,
-        workload->host_exchange_bytes,
-        workload->estimated_flops,
-        workload->batch_size,
-        workload->latency_sensitive != 0,
-        workload->prefer_unified_memory != 0,
-        workload->matrix_friendly != 0};
+    try {
+        clear_last_error(runtime);
+        const auto cpp_workload = convert_workload(*workload);
+        const auto plan = runtime->runtime.plan(cpp_workload);
+        *out_count = plan.allocations.size();
 
-    const auto plan = runtime->runtime.plan(cpp_workload);
-    *out_count = plan.allocations.size();
+        if (out_loaded_from_cache != nullptr) {
+            *out_loaded_from_cache = plan.loaded_from_cache ? 1 : 0;
+        }
 
-    if (out_loaded_from_cache != nullptr) {
-        *out_loaded_from_cache = plan.loaded_from_cache ? 1 : 0;
+        if (entries == nullptr || capacity < plan.allocations.size()) {
+            return -2;
+        }
+
+        for (size_t index = 0; index < plan.allocations.size(); ++index) {
+            fill_device_info(plan.allocations[index].device, &entries[index].device);
+            entries[index].ratio = plan.allocations[index].ratio;
+            entries[index].score = plan.allocations[index].score;
+        }
+        return 0;
+    } catch (const std::exception& error) {
+        set_last_error(runtime, error.what());
+        return -3;
     }
-
-    if (entries == nullptr || capacity < plan.allocations.size()) {
-        return -2;
-    }
-
-    for (size_t index = 0; index < plan.allocations.size(); ++index) {
-        fill_device_info(plan.allocations[index].device, &entries[index].device);
-        entries[index].ratio = plan.allocations[index].ratio;
-        entries[index].score = plan.allocations[index].score;
-    }
-
-    return 0;
 }
 
 int jakal_core_runtime_optimize(
@@ -383,31 +550,24 @@ int jakal_core_runtime_optimize(
         return -1;
     }
 
-    const jakal::WorkloadSpec cpp_workload{
-        workload->name == nullptr ? std::string("unnamed") : std::string(workload->name),
-        parse_workload_kind(workload->kind),
-        "",
-        workload->working_set_bytes,
-        workload->host_exchange_bytes,
-        workload->estimated_flops,
-        workload->batch_size,
-        workload->latency_sensitive != 0,
-        workload->prefer_unified_memory != 0,
-        workload->matrix_friendly != 0};
+    try {
+        clear_last_error(runtime);
+        const auto report = runtime->runtime.optimize(convert_workload(*workload));
+        *out_count = report.operations.size();
+        fill_optimization_info(report, out_optimization);
 
-    const auto report = runtime->runtime.optimize(cpp_workload);
-    *out_count = report.operations.size();
-    fill_optimization_info(report, out_optimization);
+        if (operations == nullptr || capacity < report.operations.size()) {
+            return -2;
+        }
 
-    if (operations == nullptr || capacity < report.operations.size()) {
-        return -2;
+        for (size_t index = 0; index < report.operations.size(); ++index) {
+            fill_operation_optimization_info(report.operations[index], &operations[index]);
+        }
+        return 0;
+    } catch (const std::exception& error) {
+        set_last_error(runtime, error.what());
+        return -3;
     }
-
-    for (size_t index = 0; index < report.operations.size(); ++index) {
-        fill_operation_optimization_info(report.operations[index], &operations[index]);
-    }
-
-    return 0;
 }
 
 int jakal_core_runtime_execute(
@@ -421,31 +581,55 @@ int jakal_core_runtime_execute(
         return -1;
     }
 
-    const jakal::WorkloadSpec cpp_workload{
-        workload->name == nullptr ? std::string("unnamed") : std::string(workload->name),
-        parse_workload_kind(workload->kind),
-        "",
-        workload->working_set_bytes,
-        workload->host_exchange_bytes,
-        workload->estimated_flops,
-        workload->batch_size,
-        workload->latency_sensitive != 0,
-        workload->prefer_unified_memory != 0,
-        workload->matrix_friendly != 0};
+    try {
+        clear_last_error(runtime);
+        const auto report = runtime->runtime.execute(convert_workload(*workload));
+        *out_count = report.operations.size();
+        fill_execution_info(report, out_execution);
 
-    const auto report = runtime->runtime.execute(cpp_workload);
-    *out_count = report.operations.size();
-    fill_execution_info(report, out_execution);
+        if (operations == nullptr || capacity < report.operations.size()) {
+            return -2;
+        }
 
-    if (operations == nullptr || capacity < report.operations.size()) {
-        return -2;
+        for (size_t index = 0; index < report.operations.size(); ++index) {
+            fill_execution_operation_info(report.operations[index], &operations[index]);
+        }
+        return 0;
+    } catch (const std::exception& error) {
+        set_last_error(runtime, error.what());
+        return -3;
+    }
+}
+
+int jakal_core_runtime_execute_manifest(
+    jakal_core_runtime_t* runtime,
+    const char* manifest_path,
+    jakal_core_execution_info* out_execution,
+    jakal_core_execution_operation_info* operations,
+    size_t capacity,
+    size_t* out_count) {
+    if (runtime == nullptr || manifest_path == nullptr || out_count == nullptr) {
+        return -1;
     }
 
-    for (size_t index = 0; index < report.operations.size(); ++index) {
-        fill_execution_operation_info(report.operations[index], &operations[index]);
-    }
+    try {
+        clear_last_error(runtime);
+        const auto report = runtime->runtime.execute_manifest(manifest_path);
+        *out_count = report.execution.operations.size();
+        fill_execution_info(report.execution, out_execution);
 
-    return 0;
+        if (operations == nullptr || capacity < report.execution.operations.size()) {
+            return -2;
+        }
+
+        for (size_t index = 0; index < report.execution.operations.size(); ++index) {
+            fill_execution_operation_info(report.execution.operations[index], &operations[index]);
+        }
+        return 0;
+    } catch (const std::exception& error) {
+        set_last_error(runtime, error.what());
+        return -3;
+    }
 }
 
 

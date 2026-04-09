@@ -563,6 +563,12 @@ std::uint32_t desired_semantic_partition_count(
     const WorkloadSpec& workload,
     const OperationSpec& operation,
     const ExecutionConfig& config);
+std::string build_report_signature(
+    const WorkloadSpec& workload,
+    const ExecutionPlan& placement,
+    const std::string& compiled_workload_signature,
+    const std::vector<OperationSpec>& operations,
+    const ExecutionTuningOverrides* tuning_overrides);
 
 bool placement_has_host_and_accelerator(
     const ExecutionPlan& placement,
@@ -1384,7 +1390,7 @@ void apply_operation_lowering_hints(
     }
 }
 
-void optimize_workload_operations_for_targets(
+void run_graph_rewrite_pass(
     const WorkloadSpec& workload,
     const ExecutionPlan& placement,
     const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,
@@ -1633,10 +1639,27 @@ void optimize_workload_operations_for_targets(
         }
     }
 
+}
+
+void run_lowering_hint_pass(
+    const WorkloadSpec& workload,
+    const ExecutionPlan& placement,
+    const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,
+    WorkloadGraph& graph) {
     normalize_workload_graph(graph);
     const auto host_summary = strongest_host_summary(placement, graph_lookup);
     const auto accelerator_summary = strongest_accelerator_summary(placement, graph_lookup);
     apply_operation_lowering_hints(workload, host_summary, accelerator_summary, graph);
+}
+
+void optimize_workload_operations_for_targets(
+    const WorkloadSpec& workload,
+    const ExecutionPlan& placement,
+    const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,
+    WorkloadGraph& graph,
+    const ExecutionTuningOverrides* tuning_overrides) {
+    run_graph_rewrite_pass(workload, placement, graph_lookup, graph, tuning_overrides);
+    run_lowering_hint_pass(workload, placement, graph_lookup, graph);
 }
 
 std::string summarize_graph_set(const std::vector<HardwareGraph>& graphs) {
@@ -1872,6 +1895,23 @@ const PerformanceSummary* best_graph_family_summary(
     return best_score >= 0.55 ? best : nullptr;
 }
 
+struct PlacementPolicyPassResult {
+    WorkloadSpec effective_workload;
+    std::unordered_map<std::string, const HardwareGraph*> graph_lookup;
+    std::string graph_set_signature;
+};
+
+struct ExecutionConfigSearchPassState {
+    CompiledWorkloadGraph compiled_workload;
+    std::unordered_map<std::string, ExecutionConfig> cached_by_operation;
+    bool fully_cached = false;
+    bool runtime_sensitive_path = false;
+    bool lightweight_path = false;
+    ValidationTier validation_tier = ValidationTier::adaptive;
+    OptimizationDeadline optimization_deadline;
+    std::string optimizer_route;
+};
+
 WorkloadSpec effective_workload_for_placement(const WorkloadSpec& workload, const ExecutionPlan& placement) {
     auto effective = workload;
     if (placement.strategy_source == PlanStrategySource::explicit_request) {
@@ -1889,6 +1929,62 @@ WorkloadSpec effective_workload_for_placement(const WorkloadSpec& workload, cons
                 : placement.strategy_reason;
     }
     return effective;
+}
+
+PlacementPolicyPassResult run_placement_policy_pass(
+    const WorkloadSpec& workload,
+    const ExecutionPlan& placement,
+    const std::vector<HardwareGraph>& graphs) {
+    PlacementPolicyPassResult pass;
+    pass.effective_workload = effective_workload_for_placement(workload, placement);
+    pass.graph_lookup.reserve(graphs.size());
+    for (const auto& graph : graphs) {
+        pass.graph_lookup.emplace(graph.uid, &graph);
+    }
+    pass.graph_set_signature = summarize_graph_set(graphs);
+    return pass;
+}
+
+ExecutionConfigSearchPassState prepare_execution_config_search_pass(
+    AdaptiveExecutionOptimizer& adaptive_optimizer,
+    BootstrapExecutionOptimizer& bootstrap_optimizer,
+    const WorkloadSpec& effective_workload,
+    const ExecutionPlan& placement,
+    const WorkloadGraph& workload_graph,
+    const std::unordered_map<std::string, const HardwareGraph*>& graph_lookup,
+    const ExecutionTuningOverrides* tuning_overrides) {
+    ExecutionConfigSearchPassState pass;
+    pass.compiled_workload = compile_workload_graph(workload_graph);
+    const auto report_signature =
+        build_report_signature(
+            effective_workload,
+            placement,
+            pass.compiled_workload.signature,
+            workload_graph.operations,
+            tuning_overrides);
+    pass.fully_cached = bootstrap_optimizer.has_full_cache(
+        report_signature,
+        workload_graph.operations,
+        graph_lookup,
+        &pass.cached_by_operation);
+    pass.runtime_sensitive_path = adaptive_optimizer.should_reoptimize(report_signature);
+    pass.lightweight_path =
+        adaptive_optimizer.should_use_lightweight_path(report_signature, pass.fully_cached);
+    pass.validation_tier =
+        tuning_overrides == nullptr ? ValidationTier::adaptive : tuning_overrides->validation_tier;
+    pass.optimization_deadline = make_optimizer_deadline(tuning_overrides);
+    pass.optimizer_route =
+        (pass.lightweight_path || pass.runtime_sensitive_path) ? "runtime_sensitive_optimizer"
+                                                               : "bootstrap_general_optimizer";
+    return pass;
+}
+
+void run_feedback_retuning_pass(
+    AdaptiveExecutionOptimizer& adaptive_optimizer,
+    const OptimizationReport& report,
+    const std::vector<ExecutionFeedbackRecord>& feedback,
+    const std::vector<HardwareGraph>& graphs) {
+    adaptive_optimizer.ingest_execution_feedback(report, feedback, graphs);
 }
 
 double preset_trace_weight(const WorkloadSpec& workload) {
@@ -7328,9 +7424,11 @@ OptimizationReport ExecutionOptimizer::optimize(
     const std::vector<HardwareGraph>& graphs,
     const WorkloadGraph* workload_graph_override,
     const ExecutionTuningOverrides* tuning_overrides) {
-    const auto effective_workload = effective_workload_for_placement(workload, placement);
     bootstrap_optimizer_.load_cache();
     adaptive_optimizer_.load_cache();
+    const auto placement_pass = run_placement_policy_pass(workload, placement, graphs);
+    const auto& effective_workload = placement_pass.effective_workload;
+    const auto& graph_lookup = placement_pass.graph_lookup;
 
     OptimizationReport report;
     report.workload_kind = effective_workload.kind;
@@ -7344,12 +7442,6 @@ OptimizationReport ExecutionOptimizer::optimize(
     report.system_profile = capture_system_profile(effective_workload, graphs);
     adaptive_optimizer_.apply_runtime_state(report.system_profile, graphs);
 
-    std::unordered_map<std::string, const HardwareGraph*> graph_lookup;
-    graph_lookup.reserve(graphs.size());
-    for (const auto& graph : graphs) {
-        graph_lookup.emplace(graph.uid, &graph);
-    }
-
     report.workload_graph =
         workload_graph_override == nullptr ? default_workload_graph(effective_workload) : *workload_graph_override;
     optimize_workload_operations_for_targets(
@@ -7359,28 +7451,27 @@ OptimizationReport ExecutionOptimizer::optimize(
         report.workload_graph,
         tuning_overrides);
     adaptive_optimizer_.apply_feedback_tuning_hints(report.workload_graph);
-    const auto compiled_workload = compile_workload_graph(report.workload_graph);
+    const auto config_search_pass = prepare_execution_config_search_pass(
+        adaptive_optimizer_,
+        bootstrap_optimizer_,
+        effective_workload,
+        placement,
+        report.workload_graph,
+        graph_lookup,
+        tuning_overrides);
+    const auto& compiled_workload = config_search_pass.compiled_workload;
     const auto& operations = report.workload_graph.operations;
-    report.signature =
-        build_report_signature(effective_workload, placement, compiled_workload.signature, operations, tuning_overrides);
-    const auto graph_set_signature = summarize_graph_set(graphs);
-
-    std::unordered_map<std::string, ExecutionConfig> cached_by_operation;
-    const bool fully_cached =
-        bootstrap_optimizer_.has_full_cache(report.signature, operations, graph_lookup, &cached_by_operation);
-    const bool runtime_sensitive_path = adaptive_optimizer_.should_reoptimize(report.signature);
-    const bool lightweight_path =
-        adaptive_optimizer_.should_use_lightweight_path(report.signature, fully_cached);
-    const auto validation_tier =
-        tuning_overrides == nullptr ? ValidationTier::adaptive : tuning_overrides->validation_tier;
-    const auto optimization_deadline = make_optimizer_deadline(tuning_overrides);
-    const std::string optimizer_route =
-        (lightweight_path || runtime_sensitive_path) ? "runtime_sensitive_optimizer" : "bootstrap_general_optimizer";
+    report.signature = build_report_signature(
+        effective_workload,
+        placement,
+        compiled_workload.signature,
+        operations,
+        tuning_overrides);
 
     std::vector<CachedExecutionConfig> persisted_configs;
     persisted_configs.reserve(operations.size());
 
-    std::unordered_map<std::string, ExecutionConfig> cache_input = cached_by_operation;
+    std::unordered_map<std::string, ExecutionConfig> cache_input = config_search_pass.cached_by_operation;
     report.graph_optimization = optimize_graph_continuous_state(
         report.signature,
         effective_workload,
@@ -7394,20 +7485,22 @@ OptimizationReport ExecutionOptimizer::optimize(
         adaptive_optimizer_.graph_family_performance_cache(),
         adaptive_optimizer_.backend_penalty_cache(),
         adaptive_optimizer_.warmed_devices(),
-        graph_set_signature,
-        (fully_cached && !runtime_sensitive_path) ? &cache_input : nullptr,
-        lightweight_path || runtime_sensitive_path,
+        placement_pass.graph_set_signature,
+        (config_search_pass.fully_cached && !config_search_pass.runtime_sensitive_path) ? &cache_input : nullptr,
+        config_search_pass.lightweight_path || config_search_pass.runtime_sensitive_path,
         tuning_overrides,
-        validation_tier,
-        optimization_deadline);
-    report.graph_optimization.optimizer_name = optimizer_route + ":" + report.graph_optimization.optimizer_name;
+        config_search_pass.validation_tier,
+        config_search_pass.optimization_deadline);
+    report.graph_optimization.optimizer_name =
+        config_search_pass.optimizer_route + ":" + report.graph_optimization.optimizer_name;
 
     std::unordered_map<std::string, ExecutionConfig> selected_configs;
     for (const auto& operation : operations) {
-        const auto cached_it = cached_by_operation.find(operation.name);
-        const ExecutionConfig* cached_config = cached_it == cached_by_operation.end() ? nullptr : &cached_it->second;
+        const auto cached_it = config_search_pass.cached_by_operation.find(operation.name);
+        const ExecutionConfig* cached_config =
+            cached_it == config_search_pass.cached_by_operation.end() ? nullptr : &cached_it->second;
         const bool operation_needs_fast_recovery =
-            runtime_sensitive_path &&
+            config_search_pass.runtime_sensitive_path &&
             adaptive_optimizer_.should_reoptimize_operation(report.signature, operation.name);
         auto result = optimize_operation(
             report.signature,
@@ -7423,17 +7516,18 @@ OptimizationReport ExecutionOptimizer::optimize(
             adaptive_optimizer_.graph_family_performance_cache(),
             adaptive_optimizer_.backend_penalty_cache(),
             adaptive_optimizer_.warmed_devices(),
-            graph_set_signature,
+            placement_pass.graph_set_signature,
             cached_config,
             &report.graph_optimization.final_state,
-            !lightweight_path || operation_needs_fast_recovery,
-            validation_tier,
-            optimization_deadline);
+            !config_search_pass.lightweight_path || operation_needs_fast_recovery,
+            config_search_pass.validation_tier,
+            config_search_pass.optimization_deadline);
         if (result.config.signature.empty()) {
             continue;
         }
 
-        result.benchmark.optimizer_name = optimizer_route + ":" + result.benchmark.optimizer_name;
+        result.benchmark.optimizer_name =
+            config_search_pass.optimizer_route + ":" + result.benchmark.optimizer_name;
         persisted_configs.push_back(CachedExecutionConfig{
             operation.name,
             result.config});
@@ -7443,7 +7537,8 @@ OptimizationReport ExecutionOptimizer::optimize(
     }
 
     bootstrap_optimizer_.store_configs(report.signature, std::move(persisted_configs));
-    report.loaded_from_cache = fully_cached && !runtime_sensitive_path;
+    report.loaded_from_cache =
+        config_search_pass.fully_cached && !config_search_pass.runtime_sensitive_path;
     return report;
 }
 
@@ -7463,7 +7558,7 @@ void ExecutionOptimizer::ingest_execution_feedback(
     const OptimizationReport& report,
     const std::vector<ExecutionFeedbackRecord>& feedback,
     const std::vector<HardwareGraph>& graphs) {
-    adaptive_optimizer_.ingest_execution_feedback(report, feedback, graphs);
+    run_feedback_retuning_pass(adaptive_optimizer_, report, feedback, graphs);
 }
 
 void BootstrapExecutionOptimizer::load_cache() {
