@@ -1,0 +1,6 @@
+# ninja log v7
+148	5736	7974227838788036	CMakeFiles/jakal_core.dir/src/executors/host_native_kernels_bf16.cpp.obj	d2c204c28133034
+41	8246	7974227837711839	CMakeFiles/jakal_core.dir/src/device.cpp.obj	49fd4e6020e068bd
+5739	8586	7974227894689938	CMakeFiles/jakal_core.dir/src/backends/opencl_backend.cpp.obj	1ec48a83f53633f8
+234	9943	7974227839652892	CMakeFiles/jakal_core.dir/src/backends/native_gpu_probes.cpp.obj	ad29b717f2bc8215
+225	13899	7974227839558888	CMakeFiles/jakal_core.dir/src/backends/cpu_backend.cpp.obj	d8c9eadd89a4735b

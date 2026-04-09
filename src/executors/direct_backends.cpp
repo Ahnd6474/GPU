@@ -1,5 +1,6 @@
 #include "jakal/executors/direct_backends.hpp"
 #include "jakal/executors/host_native_kernels.hpp"
+#include "jakal/executors/host_thread_pool.hpp"
 #include "jakal/executors/native_gpu_backend.hpp"
 
 #include "jakal/jakal_l0.hpp"
@@ -15,7 +16,6 @@
 #include <memory>
 #include <mutex>
 #include <span>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -26,6 +26,9 @@
 #endif
 
 namespace jakal::executors {
+std::unique_ptr<IKernelBackend> make_vulkan_direct_kernel_backend_internal();
+bool vulkan_direct_backend_available_internal();
+
 namespace {
 
 #if defined(_WIN32)
@@ -83,6 +86,14 @@ enum class HostPrecisionMode {
     bf16,
     emulated_lowp
 };
+
+bool host_output_is_usable(const std::span<const float> output) {
+    constexpr double kReasonableMagnitude = 1.0e8;
+    return std::all_of(output.begin(), output.end(), [](const float value) {
+        return std::isfinite(value) &&
+               std::abs(static_cast<double>(value)) <= kReasonableMagnitude;
+    });
+}
 
 std::uint32_t float_to_bits(const float value) {
     return std::bit_cast<std::uint32_t>(value);
@@ -174,8 +185,13 @@ HostPrecisionMode select_host_precision(const HardwareGraph& graph, const bool l
     if (graph.probe != "host") {
         return HostPrecisionMode::emulated_lowp;
     }
-    // Product-correctness first: native host fp16/bf16 easily overflows these
-    // surrogate workloads and breaks semantic verification.
+    const auto summary = summarize_graph(graph);
+    if (summary.supports_bf16 && summary.native_vector_bits >= 512u) {
+        return HostPrecisionMode::bf16;
+    }
+    if (summary.supports_fp16 && summary.native_vector_bits >= 256u) {
+        return HostPrecisionMode::fp16;
+    }
     return HostPrecisionMode::emulated_lowp;
 }
 
@@ -222,14 +238,42 @@ bool cpu_resample_uses_packed6_layout(const OperationSpec& operation, const std:
     return input.size() == dst_h * dst_w * 6u;
 }
 
-class HostKernelBackend final : public IKernelBackend {
+std::size_t choose_host_linear_chunk(
+    const HardwareGraph& graph,
+    const std::size_t items,
+    const bool reduction_like) {
+    const auto summary = summarize_graph(graph);
+    const std::size_t vector_bonus = summary.native_vector_bits >= 512u ? 2u : 1u;
+    if (reduction_like) {
+        if (items >= (1u << 20u)) {
+            return 8192u * vector_bonus;
+        }
+        if (items >= (1u << 16u)) {
+            return 4096u * vector_bonus;
+        }
+        return 2048u * vector_bonus;
+    }
+    if (items >= (1u << 20u)) {
+        return 2048u * vector_bonus;
+    }
+    if (items >= (1u << 16u)) {
+        return 1024u * vector_bonus;
+    }
+    return 512u * vector_bonus;
+}
+
+std::size_t choose_host_row_chunk(const OperationSpec& operation, const std::size_t fallback) {
+    return std::max<std::size_t>(1u, operation.cpu_parallel_chunk == 0u ? fallback : operation.cpu_parallel_chunk);
+}
+
+class HostNativeBackend final : public IKernelBackend {
 public:
     [[nodiscard]] bool matches(const HardwareGraph& graph) const override {
         return graph.probe == "host";
     }
 
     [[nodiscard]] std::string name() const override {
-        return "host-direct";
+        return "host-native";
     }
 
     [[nodiscard]] bool supports_async_dispatch(const HardwareGraph&) const override {
@@ -238,6 +282,7 @@ public:
 
     BackendRunResult run_elementwise(
         const HardwareGraph& graph,
+        const OperationSpec& operation,
         const std::span<const float> lhs,
         const std::span<const float> rhs,
         const bool low_precision) const override {
@@ -245,27 +290,29 @@ public:
         result.output.resize(lhs.size(), 0.0f);
         const auto precision = select_host_precision(graph, low_precision);
         result.runtime_us = measure_us([&]() {
-            const std::size_t workers = std::max<std::size_t>(1u, std::thread::hardware_concurrency());
-            const std::size_t chunk = std::max<std::size_t>(1u, lhs.size() / workers);
-            std::vector<std::thread> threads;
-            threads.reserve(workers);
-            for (std::size_t worker = 0; worker < workers; ++worker) {
-                const std::size_t begin = worker * chunk;
-                if (begin >= lhs.size()) {
-                    break;
+            if (try_run_host_native_elementwise(
+                    graph,
+                    operation,
+                    lhs,
+                    rhs,
+                    low_precision,
+                    operation.cpu_parallel_chunk,
+                    result.output) &&
+                host_output_is_usable(result.output)) {
+                return;
+            }
+            const auto chunk = std::max<std::size_t>(
+                1u,
+                operation.cpu_parallel_chunk == 0u
+                    ? choose_host_linear_chunk(graph, lhs.size(), false)
+                    : operation.cpu_parallel_chunk);
+            HostThreadPool::instance().parallel_for(lhs.size(), chunk, [&](const std::size_t begin, const std::size_t end) {
+                for (std::size_t index = begin; index < end; ++index) {
+                    const float left = quantize_host_value(lhs[index] * 1.125f, precision);
+                    const float right = quantize_host_value(rhs[index] * 0.25f, precision);
+                    result.output[index] = quantize_host_value(left + right - 0.03125f, precision);
                 }
-                const std::size_t end = worker + 1 == workers ? lhs.size() : std::min(lhs.size(), begin + chunk);
-                threads.emplace_back([&, begin, end]() {
-                    for (std::size_t index = begin; index < end; ++index) {
-                        const float left = quantize_host_value(lhs[index] * 1.125f, precision);
-                        const float right = quantize_host_value(rhs[index] * 0.25f, precision);
-                        result.output[index] = quantize_host_value(left + right - 0.03125f, precision);
-                    }
-                });
-            }
-            for (auto& thread : threads) {
-                thread.join();
-            }
+            });
         });
         result.success = true;
         result.used_host = true;
@@ -275,33 +322,46 @@ public:
 
     BackendRunResult run_reduction(
         const HardwareGraph& graph,
+        const OperationSpec& operation,
         const std::span<const float> input,
         const bool low_precision) const override {
         BackendRunResult result;
         const auto precision = select_host_precision(graph, low_precision);
         result.runtime_us = measure_us([&]() {
-            const std::size_t workers = std::max<std::size_t>(1u, std::thread::hardware_concurrency());
-            const std::size_t chunk = std::max<std::size_t>(1u, input.size() / workers);
-            std::vector<std::thread> threads;
-            std::vector<float> partials(workers, 0.0f);
-            threads.reserve(workers);
-            for (std::size_t worker = 0; worker < workers; ++worker) {
-                const std::size_t begin = worker * chunk;
-                if (begin >= input.size()) {
-                    break;
-                }
-                const std::size_t end = worker + 1 == workers ? input.size() : std::min(input.size(), begin + chunk);
-                threads.emplace_back([&, worker, begin, end]() {
+            float native_output = 0.0f;
+            if (try_run_host_native_reduction(
+                    graph,
+                    operation,
+                    input,
+                    low_precision,
+                    operation.cpu_parallel_chunk,
+                    native_output) &&
+                std::isfinite(native_output) &&
+                std::abs(native_output) <= 1.0e8f) {
+                result.scalar_output = native_output;
+                return;
+            }
+            const auto chunk = std::max<std::size_t>(
+                1u,
+                operation.cpu_parallel_chunk == 0u
+                    ? choose_host_linear_chunk(graph, input.size(), true)
+                    : operation.cpu_parallel_chunk);
+            const std::size_t concurrency =
+                std::max<std::size_t>(1u, HostThreadPool::instance().worker_count() + 1u);
+            const std::size_t block = std::max<std::size_t>(chunk, (input.size() + concurrency - 1u) / concurrency);
+            const std::size_t task_count = input.empty() ? 0u : (input.size() + block - 1u) / block;
+            std::vector<float> partials(task_count, 0.0f);
+            HostThreadPool::instance().parallel_for(task_count, 1u, [&](const std::size_t begin, const std::size_t end) {
+                for (std::size_t task = begin; task < end; ++task) {
+                    const auto task_begin = task * block;
+                    const auto task_end = std::min(input.size(), task_begin + block);
                     float partial = 0.0f;
-                    for (std::size_t index = begin; index < end; ++index) {
+                    for (std::size_t index = task_begin; index < task_end; ++index) {
                         partial = quantize_host_value(partial + input[index], precision);
                     }
-                    partials[worker] = partial;
-                });
-            }
-            for (auto& thread : threads) {
-                thread.join();
-            }
+                    partials[task] = partial;
+                }
+            });
             float total = 0.0f;
             for (const auto partial : partials) {
                 total = quantize_host_value(total + partial, precision);
@@ -327,49 +387,57 @@ public:
         result.output.resize(static_cast<std::size_t>(rows) * columns, 0.0f);
         const auto precision = select_host_precision(graph, low_precision);
         result.runtime_us = measure_us([&]() {
-            if (!cpu_rhs_uses_transposed_layout(operation) && try_run_host_native_low_precision_matmul(
-                    graph,
-                    lhs,
-                    rhs,
-                    rows,
-                    columns,
-                    depth,
-                    precision == HostPrecisionMode::fp16,
-                    precision == HostPrecisionMode::bf16,
-                    result.output)) {
-                return;
+            const bool rhs_transposed = cpu_rhs_uses_transposed_layout(operation);
+            const bool used_native = precision == HostPrecisionMode::fp32
+                ? try_run_host_native_matmul(
+                      graph,
+                      lhs,
+                      rhs,
+                      rows,
+                      columns,
+                      depth,
+                      rhs_transposed,
+                      operation.cpu_tile_m,
+                      operation.cpu_tile_n,
+                      operation.cpu_tile_k,
+                      operation.cpu_parallel_chunk,
+                      result.output)
+                : try_run_host_native_low_precision_matmul(
+                      graph,
+                      lhs,
+                      rhs,
+                      rows,
+                      columns,
+                      depth,
+                      rhs_transposed,
+                      operation.cpu_parallel_chunk,
+                      precision == HostPrecisionMode::fp16,
+                      precision == HostPrecisionMode::bf16,
+                      result.output);
+            if (used_native) {
+                if (host_output_is_usable(result.output)) {
+                    return;
+                }
+                std::fill(result.output.begin(), result.output.end(), 0.0f);
             }
 
-            const std::size_t workers = std::max<std::size_t>(1u, std::thread::hardware_concurrency());
-            const std::size_t chunk = std::max<std::size_t>(1u, rows / workers);
-            std::vector<std::thread> threads;
-            threads.reserve(workers);
-            for (std::size_t worker = 0; worker < workers; ++worker) {
-                const std::size_t begin = worker * chunk;
-                if (begin >= rows) {
-                    break;
-                }
-                const std::size_t end = worker + 1 == workers ? rows : std::min<std::size_t>(rows, begin + chunk);
-                threads.emplace_back([&, begin, end]() {
-                    for (std::size_t row = begin; row < end; ++row) {
-                        for (std::uint32_t col = 0; col < columns; ++col) {
-                            float acc = 0.0f;
-                            for (std::uint32_t inner = 0; inner < depth; ++inner) {
-                                const float left = quantize_host_value(lhs[row * depth + inner], precision);
-                                const std::size_t rhs_index = cpu_rhs_uses_transposed_layout(operation)
-                                                                  ? (static_cast<std::size_t>(col) * depth + inner)
-                                                                  : (static_cast<std::size_t>(inner) * columns + col);
-                                const float right = quantize_host_value(rhs[rhs_index], precision);
-                                acc = quantize_host_value(acc + (left * right), precision);
-                            }
-                            result.output[row * columns + col] = acc;
+            const auto row_chunk = choose_host_row_chunk(operation, 4u);
+            HostThreadPool::instance().parallel_for(rows, row_chunk, [&](const std::size_t begin, const std::size_t end) {
+                for (std::size_t row = begin; row < end; ++row) {
+                    for (std::uint32_t col = 0; col < columns; ++col) {
+                        float acc = 0.0f;
+                        for (std::uint32_t inner = 0; inner < depth; ++inner) {
+                            const float left = quantize_host_value(lhs[row * depth + inner], precision);
+                            const std::size_t rhs_index = cpu_rhs_uses_transposed_layout(operation)
+                                                              ? (static_cast<std::size_t>(col) * depth + inner)
+                                                              : (static_cast<std::size_t>(inner) * columns + col);
+                            const float right = quantize_host_value(rhs[rhs_index], precision);
+                            acc = quantize_host_value(acc + (left * right), precision);
                         }
+                        result.output[row * columns + col] = acc;
                     }
-                });
-            }
-            for (auto& thread : threads) {
-                thread.join();
-            }
+                }
+            });
         });
         result.success = true;
         result.used_host = true;
@@ -396,25 +464,42 @@ public:
         const auto precision = select_host_precision(graph, low_precision);
         result.runtime_us = measure_us([&]() {
             const bool packed_input = cpu_conv_uses_patch9_layout(operation, input);
-            for (std::uint32_t y = 1; y + 1 < height; ++y) {
-                for (std::uint32_t x = 1; x + 1 < width; ++x) {
-                    float acc = 0.0f;
-                    for (std::uint32_t ky = 0; ky < 3; ++ky) {
-                        for (std::uint32_t kx = 0; kx < 3; ++kx) {
-                            const std::size_t patch_index =
-                                ((static_cast<std::size_t>(y - 1u) * out_width) + (x - 1u)) * 9u +
-                                ky * 3u + kx;
-                            const std::size_t dense_index =
-                                (static_cast<std::size_t>(y + ky - 1u) * width) + (x + kx - 1u);
-                            const float value = quantize_host_value(
-                                input[packed_input ? patch_index : dense_index],
-                                precision);
-                            acc = quantize_host_value(acc + (value * kernel[ky * 3u + kx]), precision);
-                        }
-                    }
-                    result.output[(y - 1u) * out_width + (x - 1u)] = acc;
+            if (try_run_host_native_conv3x3(
+                    graph,
+                    input,
+                    height,
+                    width,
+                    packed_input,
+                    operation.cpu_parallel_chunk,
+                    result.output)) {
+                if (host_output_is_usable(result.output)) {
+                    return;
                 }
+                std::fill(result.output.begin(), result.output.end(), 0.0f);
             }
+            const auto row_chunk = choose_host_row_chunk(operation, 2u);
+            HostThreadPool::instance().parallel_for(out_height, row_chunk, [&](const std::size_t begin, const std::size_t end) {
+                for (std::size_t out_y = begin; out_y < end; ++out_y) {
+                    const auto y = static_cast<std::uint32_t>(out_y) + 1u;
+                    for (std::uint32_t x = 1u; x + 1u < width; ++x) {
+                        float acc = 0.0f;
+                        for (std::uint32_t ky = 0; ky < 3; ++ky) {
+                            for (std::uint32_t kx = 0; kx < 3; ++kx) {
+                                const std::size_t patch_index =
+                                    ((static_cast<std::size_t>(y - 1u) * out_width) + (x - 1u)) * 9u +
+                                    ky * 3u + kx;
+                                const std::size_t dense_index =
+                                    (static_cast<std::size_t>(y + ky - 1u) * width) + (x + kx - 1u);
+                                const float value = quantize_host_value(
+                                    input[packed_input ? patch_index : dense_index],
+                                    precision);
+                                acc = quantize_host_value(acc + (value * kernel[ky * 3u + kx]), precision);
+                            }
+                        }
+                        result.output[out_y * out_width + (x - 1u)] = acc;
+                    }
+                }
+            });
         });
         result.success = true;
         result.used_host = true;
@@ -438,46 +523,66 @@ public:
         const auto precision = select_host_precision(graph, low_precision);
         result.runtime_us = measure_us([&]() {
             const bool packed_input = cpu_resample_uses_packed6_layout(operation, input);
-            for (std::uint32_t local_y = 0; local_y < row_count; ++local_y) {
-                const std::uint32_t y = row_offset + local_y;
-                for (std::uint32_t x = 0; x < dst_w; ++x) {
-                    float v00 = 0.0f;
-                    float v01 = 0.0f;
-                    float v10 = 0.0f;
-                    float v11 = 0.0f;
-                    float wx = 0.0f;
-                    float wy = 0.0f;
-                    if (packed_input) {
-                        const std::size_t base = (static_cast<std::size_t>(y) * dst_w + x) * 6u;
-                        v00 = quantize_host_value(input[base + 0u], precision);
-                        v01 = quantize_host_value(input[base + 1u], precision);
-                        v10 = quantize_host_value(input[base + 2u], precision);
-                        v11 = quantize_host_value(input[base + 3u], precision);
-                        wx = input[base + 4u];
-                        wy = input[base + 5u];
-                    } else {
-                        const float src_y =
-                            (static_cast<float>(y) + 0.5f) * static_cast<float>(src_h) / static_cast<float>(dst_h) - 0.5f;
-                        const float clamped_y = std::clamp(src_y, 0.0f, static_cast<float>(src_h - 1u));
-                        const auto y0 = static_cast<std::uint32_t>(clamped_y);
-                        const auto y1 = std::min(y0 + 1u, src_h - 1u);
-                        wy = clamped_y - static_cast<float>(y0);
-                        const float src_x =
-                            (static_cast<float>(x) + 0.5f) * static_cast<float>(src_w) / static_cast<float>(dst_w) - 0.5f;
-                        const float clamped_x = std::clamp(src_x, 0.0f, static_cast<float>(src_w - 1u));
-                        const auto x0 = static_cast<std::uint32_t>(clamped_x);
-                        const auto x1 = std::min(x0 + 1u, src_w - 1u);
-                        wx = clamped_x - static_cast<float>(x0);
-                        v00 = quantize_host_value(input[y0 * src_w + x0], precision);
-                        v01 = quantize_host_value(input[y0 * src_w + x1], precision);
-                        v10 = quantize_host_value(input[y1 * src_w + x0], precision);
-                        v11 = quantize_host_value(input[y1 * src_w + x1], precision);
-                    }
-                    const float top = quantize_host_value(v00 + ((v01 - v00) * wx), precision);
-                    const float bottom = quantize_host_value(v10 + ((v11 - v10) * wx), precision);
-                    result.output[local_y * dst_w + x] = quantize_host_value(top + ((bottom - top) * wy), precision);
+            if (try_run_host_native_resample(
+                    graph,
+                    input,
+                    src_h,
+                    src_w,
+                    dst_h,
+                    dst_w,
+                    row_offset,
+                    row_count,
+                    packed_input,
+                    operation.cpu_parallel_chunk,
+                    result.output)) {
+                if (host_output_is_usable(result.output)) {
+                    return;
                 }
+                std::fill(result.output.begin(), result.output.end(), 0.0f);
             }
+            const auto row_chunk = choose_host_row_chunk(operation, 2u);
+            HostThreadPool::instance().parallel_for(row_count, row_chunk, [&](const std::size_t begin, const std::size_t end) {
+                for (std::size_t local_y = begin; local_y < end; ++local_y) {
+                    const std::uint32_t y = row_offset + static_cast<std::uint32_t>(local_y);
+                    for (std::uint32_t x = 0; x < dst_w; ++x) {
+                        float v00 = 0.0f;
+                        float v01 = 0.0f;
+                        float v10 = 0.0f;
+                        float v11 = 0.0f;
+                        float wx = 0.0f;
+                        float wy = 0.0f;
+                        if (packed_input) {
+                            const std::size_t base = (static_cast<std::size_t>(y) * dst_w + x) * 6u;
+                            v00 = quantize_host_value(input[base + 0u], precision);
+                            v01 = quantize_host_value(input[base + 1u], precision);
+                            v10 = quantize_host_value(input[base + 2u], precision);
+                            v11 = quantize_host_value(input[base + 3u], precision);
+                            wx = input[base + 4u];
+                            wy = input[base + 5u];
+                        } else {
+                            const float src_y =
+                                (static_cast<float>(y) + 0.5f) * static_cast<float>(src_h) / static_cast<float>(dst_h) - 0.5f;
+                            const float clamped_y = std::clamp(src_y, 0.0f, static_cast<float>(src_h - 1u));
+                            const auto y0 = static_cast<std::uint32_t>(clamped_y);
+                            const auto y1 = std::min(y0 + 1u, src_h - 1u);
+                            wy = clamped_y - static_cast<float>(y0);
+                            const float src_x =
+                                (static_cast<float>(x) + 0.5f) * static_cast<float>(src_w) / static_cast<float>(dst_w) - 0.5f;
+                            const float clamped_x = std::clamp(src_x, 0.0f, static_cast<float>(src_w - 1u));
+                            const auto x0 = static_cast<std::uint32_t>(clamped_x);
+                            const auto x1 = std::min(x0 + 1u, src_w - 1u);
+                            wx = clamped_x - static_cast<float>(x0);
+                            v00 = quantize_host_value(input[y0 * src_w + x0], precision);
+                            v01 = quantize_host_value(input[y0 * src_w + x1], precision);
+                            v10 = quantize_host_value(input[y1 * src_w + x0], precision);
+                            v11 = quantize_host_value(input[y1 * src_w + x1], precision);
+                        }
+                        const float top = quantize_host_value(v00 + ((v01 - v00) * wx), precision);
+                        const float bottom = quantize_host_value(v10 + ((v11 - v10) * wx), precision);
+                        result.output[local_y * dst_w + x] = quantize_host_value(top + ((bottom - top) * wy), precision);
+                    }
+                }
+            });
         });
         result.success = true;
         result.used_host = true;
@@ -547,7 +652,7 @@ double estimate_transfer_runtime_us(
     }
     const auto summary = summarize_graph(graph);
     const double bandwidth_gbps =
-        std::max(write_direction ? summary.write_bandwidth_gbps : summary.read_bandwidth_gbps, 1.0);
+        std::max(write_direction ? summary.host_write_gbps : summary.host_read_gbps, 1.0);
     const double payload_us =
         (static_cast<double>(bytes) / (bandwidth_gbps * 1.0e9)) * 1.0e6;
     const double latency_us = std::max(summary.dispatch_latency_us * 0.20, 0.25);
@@ -628,6 +733,8 @@ private:
             ready_ = bootstrap_rocm();
             break;
         case JakalBackendKind::vulkan_compute:
+            ready_ = vulkan_direct_backend_available_internal();
+            break;
         case JakalBackendKind::opencl:
         default:
             ready_ = true;
@@ -778,13 +885,14 @@ public:
 
     BackendRunResult run_elementwise(
         const HardwareGraph& graph,
+        const OperationSpec& operation,
         const std::span<const float> lhs,
         const std::span<const float> rhs,
         const bool low_precision) const override {
         return finalize(
             graph,
             OperationClass::elementwise_map,
-            host_.run_elementwise(graph, lhs, rhs, low_precision),
+            host_.run_elementwise(graph, operation, lhs, rhs, low_precision),
             {},
             lhs.size_bytes() + rhs.size_bytes(),
             lhs.size_bytes(),
@@ -793,12 +901,13 @@ public:
 
     BackendRunResult run_reduction(
         const HardwareGraph& graph,
+        const OperationSpec& operation,
         const std::span<const float> input,
         const bool low_precision) const override {
         return finalize(
             graph,
             OperationClass::reduction,
-            host_.run_reduction(graph, input, low_precision),
+            host_.run_reduction(graph, operation, input, low_precision),
             {},
             input.size_bytes(),
             sizeof(float),
@@ -984,6 +1093,14 @@ private:
         result.copy_runtime_us = split.copy_runtime_us * resource_compute_scale;
         result.compute_runtime_us = split.compute_runtime_us * resource_compute_scale;
         result.copy_overlap_ratio = split.overlap_ratio;
+        result.copy_queue_count = input_bytes > 0u || output_bytes > 0u ? 1u : 0u;
+        result.compute_queue_count = 1u;
+        result.event_wait_count =
+            (result.copy_queue_count > 0u && supports_async_dispatch(graph)) ? (output_bytes > 0u ? 2u : 1u) : 0u;
+        result.queue_separation_ratio =
+            result.copy_queue_count > 0u && supports_async_dispatch(graph)
+                ? std::clamp(0.30 + result.copy_overlap_ratio, 0.0, 1.0)
+                : 0.0;
         result.synchronize_runtime_us =
             result.compute_runtime_us + (result.copy_runtime_us * (1.0 - result.copy_overlap_ratio));
         result.runtime_us = result.submit_runtime_us + result.synchronize_runtime_us;
@@ -994,7 +1111,7 @@ private:
     }
 
     JakalBackendKind backend_;
-    HostKernelBackend host_;
+    HostNativeBackend host_;
     NativeRuntimeBootstrap bootstrap_;
     mutable std::mutex dispatch_cache_mutex_;
     mutable std::uint64_t dispatch_cache_tick_ = 0u;
@@ -1008,8 +1125,12 @@ private:
 
 }  // namespace
 
+std::unique_ptr<IKernelBackend> make_host_native_kernel_backend() {
+    return std::make_unique<HostNativeBackend>();
+}
+
 std::unique_ptr<IKernelBackend> make_host_kernel_backend() {
-    return std::make_unique<HostKernelBackend>();
+    return make_host_native_kernel_backend();
 }
 
 std::unique_ptr<IKernelBackend> make_level_zero_kernel_backend() {
@@ -1025,7 +1146,11 @@ std::unique_ptr<IKernelBackend> make_rocm_kernel_backend() {
 }
 
 std::unique_ptr<IKernelBackend> make_vulkan_kernel_backend() {
-    return std::make_unique<GenericGpuKernelBackend>(JakalBackendKind::vulkan_compute);
+    return make_vulkan_direct_kernel_backend_internal();
+}
+
+bool vulkan_direct_backend_available() {
+    return vulkan_direct_backend_available_internal();
 }
 
 }  // namespace jakal::executors

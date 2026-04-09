@@ -1,5 +1,6 @@
 #include "jakal/device.hpp"
 #include "jakal/executor.hpp"
+#include "jakal/executors/direct_backends.hpp"
 #include "jakal/executors/scheduler.hpp"
 #include "jakal/jakal_toolkit.hpp"
 #include "jakal/operation_variant_registry.hpp"
@@ -895,6 +896,94 @@ jakal::WorkloadGraph make_small_fusion_graph() {
     return graph;
 }
 
+jakal::WorkloadGraph make_multistage_epilogue_graph() {
+    jakal::WorkloadGraph graph;
+    graph.signature = "multistage-epilogue-graph";
+    graph.tensors = {
+        {"tokens", "tokens", "", {"projection"}, 256ull * 128ull * sizeof(float), false, false, true},
+        {"weights", "weights", "", {"projection"}, 128ull * 256ull * sizeof(float), true, false, false},
+        {"proj-out", "proj-out", "projection", {"bias"}, 256ull * 256ull * sizeof(float), false, true, false},
+        {"bias-out", "bias-out", "bias", {"relu"}, 256ull * 256ull * sizeof(float), false, true, false},
+        {"final", "final", "relu", {}, 256ull * 256ull * sizeof(float), false, false, true}};
+
+    jakal::OperationSpec projection;
+    projection.name = "projection";
+    projection.op_class = jakal::OperationClass::matmul;
+    projection.extents = {256u, 256u, 128u};
+    projection.input_bytes = (256ull * 128ull + 128ull * 256ull) * sizeof(float);
+    projection.output_bytes = 256ull * 256ull * sizeof(float);
+    projection.temporary_bytes = 256ull * 1024ull;
+    projection.estimated_flops = 2.0 * 256.0 * 256.0 * 128.0;
+    projection.parallelizable = true;
+    projection.matrix_friendly = true;
+    projection.input_tensor_ids = {"tokens", "weights"};
+    projection.output_tensor_ids = {"proj-out"};
+
+    jakal::OperationSpec bias;
+    bias.name = "bias";
+    bias.op_class = jakal::OperationClass::elementwise_map;
+    bias.extents = {256ull * 256ull};
+    bias.input_bytes = 256ull * 256ull * sizeof(float);
+    bias.output_bytes = 256ull * 256ull * sizeof(float);
+    bias.estimated_flops = static_cast<double>(256ull * 256ull);
+    bias.parallelizable = true;
+    bias.streaming_friendly = true;
+    bias.input_tensor_ids = {"proj-out"};
+    bias.output_tensor_ids = {"bias-out"};
+
+    jakal::OperationSpec relu = bias;
+    relu.name = "relu";
+    relu.input_tensor_ids = {"bias-out"};
+    relu.output_tensor_ids = {"final"};
+
+    graph.operations = {projection, bias, relu};
+    jakal::normalize_workload_graph(graph);
+    return graph;
+}
+
+jakal::WorkloadGraph make_chain_reduction_graph() {
+    jakal::WorkloadGraph graph;
+    graph.signature = "chain-reduction-graph";
+    graph.tensors = {
+        {"tokens", "tokens", "", {"bias"}, 4096ull * sizeof(float), false, false, true},
+        {"biased", "biased", "bias", {"relu"}, 4096ull * sizeof(float), false, true, false},
+        {"activated", "activated", "relu", {"sum"}, 4096ull * sizeof(float), false, true, false},
+        {"score", "score", "sum", {}, sizeof(float), false, false, true}};
+
+    jakal::OperationSpec bias;
+    bias.name = "bias";
+    bias.op_class = jakal::OperationClass::elementwise_map;
+    bias.extents = {4096};
+    bias.input_bytes = 4096ull * sizeof(float);
+    bias.output_bytes = 4096ull * sizeof(float);
+    bias.estimated_flops = 4096.0;
+    bias.parallelizable = true;
+    bias.streaming_friendly = true;
+    bias.input_tensor_ids = {"tokens"};
+    bias.output_tensor_ids = {"biased"};
+
+    jakal::OperationSpec relu = bias;
+    relu.name = "relu";
+    relu.input_tensor_ids = {"biased"};
+    relu.output_tensor_ids = {"activated"};
+
+    jakal::OperationSpec sum;
+    sum.name = "sum";
+    sum.op_class = jakal::OperationClass::reduction;
+    sum.extents = {4096};
+    sum.input_bytes = 4096ull * sizeof(float);
+    sum.output_bytes = sizeof(float);
+    sum.estimated_flops = 4096.0;
+    sum.parallelizable = true;
+    sum.reduction_like = true;
+    sum.input_tensor_ids = {"activated"};
+    sum.output_tensor_ids = {"score"};
+
+    graph.operations = {bias, relu, sum};
+    jakal::normalize_workload_graph(graph);
+    return graph;
+}
+
 bool verify_compiled_graph_signature_isolation() {
     const auto plan_cache = unique_temp_file("compiled-graph-plan");
     const auto exec_cache = unique_temp_file("compiled-graph-exec");
@@ -1295,7 +1384,13 @@ bool verify_graph_family_feedback_sharing() {
             used_host,
             !used_host,
             result.config.participating_devices.size() > 1u,
-            result.config.logical_partitions});
+            result.config.logical_partitions,
+            0.28,
+            0.46,
+            0.25,
+            0.55,
+            result.config.logical_partitions,
+            2u});
     }
     optimizer.ingest_execution_feedback(first_report, feedback, graphs);
 
@@ -1303,6 +1398,20 @@ bool verify_graph_family_feedback_sharing() {
     adaptive.load_cache();
     if (adaptive.graph_family_performance_cache().empty()) {
         std::cerr << "graph-family: family cache should persist feedback\n";
+        return false;
+    }
+    bool observed_transfer_metrics = false;
+    for (const auto& [key, summary] : adaptive.graph_family_performance_cache()) {
+        (void)key;
+        if (summary.average_transfer_overlap_ratio > 0.0 &&
+            summary.average_queue_separation_ratio > 0.0 &&
+            summary.average_budget_pressure > 0.0) {
+            observed_transfer_metrics = true;
+            break;
+        }
+    }
+    if (!observed_transfer_metrics) {
+        std::cerr << "graph-family: expected family cache to retain transfer and budget metrics\n";
         return false;
     }
 
@@ -1339,6 +1448,231 @@ bool verify_graph_family_feedback_sharing() {
     std::filesystem::remove(exec_cache.string() + ".perf", ec);
     std::filesystem::remove(exec_cache.string() + ".perf.family", ec);
     return true;
+}
+
+bool verify_feedback_tuned_cpu_parallel_chunks() {
+    const auto plan_cache = unique_temp_file("cpu-chunk-plan");
+    const auto exec_cache = unique_temp_file("cpu-chunk-exec");
+
+    jakal::Planner planner(plan_cache);
+    jakal::ExecutionOptimizer optimizer(exec_cache);
+
+    auto host = make_manual_host_graph();
+    host.nodes[2].compute.native_vector_bits = 512;
+    host.nodes[2].compute.execution_width = 32;
+    attach_cache_and_scratch(host, 2ull * 1024ull * 1024ull, 64ull * 1024ull);
+    const std::vector<jakal::HardwareGraph> graphs{host};
+
+    jakal::WorkloadGraph graph;
+    graph.signature = "cpu-feedback-chunk-graph";
+    graph.tensors = {
+        {"tokens", "tokens", "", {"bias"}, (1ull << 20u) * sizeof(float), false, false, true},
+        {"biases", "biases", "", {"bias"}, (1ull << 20u) * sizeof(float), true, false, true},
+        {"biased", "biased", "bias", {"sum"}, (1ull << 20u) * sizeof(float), false, true, false},
+        {"sum-out", "sum-out", "sum", {}, sizeof(float), false, false, true}};
+
+    jakal::OperationSpec bias;
+    bias.name = "bias";
+    bias.op_class = jakal::OperationClass::elementwise_map;
+    bias.extents = {1ull << 20u};
+    bias.input_bytes = 2ull * (1ull << 20u) * sizeof(float);
+    bias.output_bytes = (1ull << 20u) * sizeof(float);
+    bias.estimated_flops = static_cast<double>(1u << 20u) * 3.0;
+    bias.parallelizable = true;
+    bias.streaming_friendly = true;
+    bias.input_tensor_ids = {"tokens", "biases"};
+    bias.output_tensor_ids = {"biased"};
+
+    jakal::OperationSpec sum;
+    sum.name = "sum";
+    sum.op_class = jakal::OperationClass::reduction;
+    sum.extents = {1ull << 20u};
+    sum.input_bytes = (1ull << 20u) * sizeof(float);
+    sum.output_bytes = sizeof(float);
+    sum.estimated_flops = static_cast<double>(1u << 20u);
+    sum.parallelizable = true;
+    sum.reduction_like = true;
+    sum.input_tensor_ids = {"biased"};
+    sum.output_tensor_ids = {"sum-out"};
+
+    graph.operations = {bias, sum};
+    jakal::normalize_workload_graph(graph);
+
+    const jakal::WorkloadSpec workload{
+        "cpu-feedback-chunk",
+        jakal::WorkloadKind::inference,
+        "cpu-feedback-chunk",
+        64ull * 1024ull * 1024ull,
+        8ull * 1024ull * 1024ull,
+        1.0e9,
+        1,
+        true,
+        false,
+        true,
+        jakal::PartitionStrategy::auto_balanced,
+        jakal::WorkloadPhase::decode,
+        "cpu-feedback-chunk"};
+
+    const auto plan = planner.build_plan(workload, graphs);
+    const auto first_report = optimizer.optimize(workload, plan, graphs, &graph);
+    const auto* first_bias = find_operation_by_name(first_report, "bias");
+    const auto* first_sum = find_operation_by_name(first_report, "sum");
+    if (first_bias == nullptr || first_sum == nullptr) {
+        return false;
+    }
+
+    std::vector<jakal::ExecutionFeedbackRecord> feedback;
+    feedback.reserve(first_report.operations.size());
+    for (const auto& result : first_report.operations) {
+        feedback.push_back(jakal::ExecutionFeedbackRecord{
+            result.operation.name,
+            "host-native",
+            result.config.participating_devices,
+            std::max(1.0, result.graph.predicted_latency_us * 1.35),
+            std::max(1.0, result.graph.predicted_latency_us),
+            result.graph.expected_relative_error,
+            true,
+            true,
+            false,
+            false,
+            result.config.logical_partitions,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1u,
+            0u});
+    }
+    optimizer.ingest_execution_feedback(first_report, feedback, graphs);
+
+    jakal::AdaptiveExecutionOptimizer adaptive(exec_cache);
+    adaptive.load_cache();
+    if (adaptive.cpu_runtime_hint_cache().empty()) {
+        std::cerr << "cpu-feedback: expected cpu runtime hint cache to persist feedback\n";
+        return false;
+    }
+
+    const auto second_report = optimizer.optimize(workload, plan, graphs, &graph);
+    const auto* second_bias = find_operation_by_name(second_report, "bias");
+    const auto* second_sum = find_operation_by_name(second_report, "sum");
+    if (second_bias == nullptr || second_sum == nullptr) {
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(plan_cache, ec);
+    std::filesystem::remove(exec_cache, ec);
+    std::filesystem::remove(exec_cache.string() + ".perf", ec);
+    std::filesystem::remove(exec_cache.string() + ".perf.family", ec);
+    std::filesystem::remove(exec_cache.string() + ".cpuhint", ec);
+
+    return second_bias->operation.cpu_parallel_chunk > first_bias->operation.cpu_parallel_chunk &&
+           second_sum->operation.cpu_parallel_chunk > first_sum->operation.cpu_parallel_chunk;
+}
+
+bool verify_feedback_tuned_cpu_matmul_tiles() {
+    const auto exec_cache = unique_temp_file("cpu-tile-exec");
+    jakal::ExecutionOptimizer optimizer(exec_cache);
+
+    auto host = make_manual_host_graph();
+    host.nodes[2].compute.native_vector_bits = 512;
+    host.nodes[2].compute.execution_width = 32;
+    attach_cache_and_scratch(host, 2ull * 1024ull * 1024ull, 64ull * 1024ull);
+
+    jakal::ExecutionPlan plan;
+    plan.signature = "manual-cpu-tiles";
+    plan.allocations.push_back({host, 1.0, 1.0});
+
+    jakal::WorkloadGraph graph;
+    graph.signature = "cpu-feedback-tile-graph";
+    graph.tensors = {
+        {"tokens", "tokens", "", {"projection"}, 256ull * 256ull * sizeof(float), false, false, true},
+        {"weights", "weights", "", {"projection"}, 256ull * 256ull * sizeof(float), true, false, false},
+        {"projection-out", "projection-out", "projection", {}, 256ull * 256ull * sizeof(float), false, false, true}};
+
+    jakal::OperationSpec projection;
+    projection.name = "projection";
+    projection.op_class = jakal::OperationClass::matmul;
+    projection.extents = {256u, 256u, 256u};
+    projection.input_bytes = 2ull * 256ull * 256ull * sizeof(float);
+    projection.output_bytes = 256ull * 256ull * sizeof(float);
+    projection.temporary_bytes = 512ull * 1024ull;
+    projection.estimated_flops = 2.0 * 256.0 * 256.0 * 256.0;
+    projection.parallelizable = true;
+    projection.matrix_friendly = true;
+    projection.input_tensor_ids = {"tokens", "weights"};
+    projection.output_tensor_ids = {"projection-out"};
+    graph.operations = {projection};
+    jakal::normalize_workload_graph(graph);
+
+    const jakal::WorkloadSpec workload{
+        "cpu-feedback-tiles",
+        jakal::WorkloadKind::inference,
+        "cpu-feedback-tiles",
+        96ull * 1024ull * 1024ull,
+        8ull * 1024ull * 1024ull,
+        4.0e9,
+        1,
+        true,
+        false,
+        true,
+        jakal::PartitionStrategy::auto_balanced,
+        jakal::WorkloadPhase::decode,
+        "cpu-feedback-tiles"};
+
+    const auto first_report = optimizer.optimize(workload, plan, {host}, &graph);
+    const auto* first_projection = find_operation_by_name(first_report, "projection");
+    if (first_projection == nullptr) {
+        return false;
+    }
+
+    const jakal::ExecutionFeedbackRecord feedback{
+        "projection",
+        "host-native",
+        {host.uid},
+        std::max(1.0, first_projection->graph.predicted_latency_us * 1.35),
+        std::max(1.0, first_projection->graph.predicted_latency_us),
+        0.0,
+        true,
+        true,
+        false,
+        false,
+        1u,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1u,
+        0u};
+    optimizer.ingest_execution_feedback(first_report, {feedback}, {host});
+
+    jakal::AdaptiveExecutionOptimizer adaptive(exec_cache);
+    adaptive.load_cache();
+    if (adaptive.cpu_runtime_hint_cache().empty()) {
+        std::cerr << "cpu-tiles: expected cpu runtime hint cache to persist feedback\n";
+        return false;
+    }
+
+    const auto second_report = optimizer.optimize(workload, plan, {host}, &graph);
+    const auto* second_projection = find_operation_by_name(second_report, "projection");
+    if (second_projection == nullptr) {
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(exec_cache, ec);
+    std::filesystem::remove(exec_cache.string() + ".perf", ec);
+    std::filesystem::remove(exec_cache.string() + ".perf.family", ec);
+    std::filesystem::remove(exec_cache.string() + ".cpuhint", ec);
+
+    const bool tiles_changed =
+        second_projection->operation.cpu_tile_m != first_projection->operation.cpu_tile_m ||
+        second_projection->operation.cpu_tile_n != first_projection->operation.cpu_tile_n ||
+        second_projection->operation.cpu_tile_k != first_projection->operation.cpu_tile_k;
+    return tiles_changed &&
+           second_projection->operation.cpu_tile_m >= first_projection->operation.cpu_tile_m &&
+           second_projection->operation.cpu_tile_n >= first_projection->operation.cpu_tile_n &&
+           second_projection->operation.cpu_tile_k >= first_projection->operation.cpu_tile_k;
 }
 
 bool verify_small_op_fusion_and_policy() {
@@ -1393,6 +1727,117 @@ bool verify_small_op_fusion_and_policy() {
         1.0);
     if (policy.max_devices != 1u || policy.max_candidates > 4u || policy.validation_shortlist != 1u) {
         std::cerr << "small-fusion: small-op candidate policy did not reduce exploration\n";
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(plan_cache, ec);
+    std::filesystem::remove(exec_cache, ec);
+    std::filesystem::remove(exec_cache.string() + ".perf", ec);
+    std::filesystem::remove(exec_cache.string() + ".perf.family", ec);
+    return true;
+}
+
+bool verify_multistage_epilogue_fusion() {
+    const auto plan_cache = unique_temp_file("epilogue-fusion-plan");
+    const auto exec_cache = unique_temp_file("epilogue-fusion-exec");
+
+    jakal::Planner planner(plan_cache);
+    jakal::ExecutionOptimizer optimizer(exec_cache);
+    const std::vector<jakal::HardwareGraph> graphs{
+        make_manual_host_graph(),
+        make_manual_gpu_graph("gpu:epilogue:0", "Epilogue GPU", true, true, true)};
+    const auto graph = make_multistage_epilogue_graph();
+    const jakal::WorkloadSpec workload{
+        "epilogue-fusion-workload",
+        jakal::WorkloadKind::inference,
+        "epilogue-fusion-workload",
+        64ull * 1024ull * 1024ull,
+        2ull * 1024ull * 1024ull,
+        4.5e7,
+        1,
+        true,
+        true,
+        true,
+        jakal::PartitionStrategy::auto_balanced,
+        jakal::WorkloadPhase::decode,
+        "b1-s1"};
+    const auto plan = planner.build_plan(workload, graphs);
+
+    jakal::ExecutionTuningOverrides tuning;
+    tuning.graph_rewrite_level = 5u;
+    const auto report = optimizer.optimize(workload, plan, graphs, &graph, &tuning);
+    const auto* projection = find_operation_by_name(report, "projection");
+    if (projection == nullptr || report.workload_graph.operations.size() != 1u || report.operations.size() != 1u) {
+        std::cerr << "epilogue-fusion: expected matmul epilogue chain to collapse to one op\n";
+        return false;
+    }
+    if (std::find(
+            projection->operation.fused_operation_names.begin(),
+            projection->operation.fused_operation_names.end(),
+            "bias") == projection->operation.fused_operation_names.end() ||
+        std::find(
+            projection->operation.fused_operation_names.begin(),
+            projection->operation.fused_operation_names.end(),
+            "relu") == projection->operation.fused_operation_names.end()) {
+        std::cerr << "epilogue-fusion: projection missing fused elementwise chain tags\n";
+        return false;
+    }
+    if (projection->graph.indexed_operations.size() != 1u) {
+        std::cerr << "epilogue-fusion: execution graph indices not compacted after fusion\n";
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(plan_cache, ec);
+    std::filesystem::remove(exec_cache, ec);
+    std::filesystem::remove(exec_cache.string() + ".perf", ec);
+    std::filesystem::remove(exec_cache.string() + ".perf.family", ec);
+    return true;
+}
+
+bool verify_chain_reduction_fusion() {
+    const auto plan_cache = unique_temp_file("chain-reduction-plan");
+    const auto exec_cache = unique_temp_file("chain-reduction-exec");
+
+    jakal::Planner planner(plan_cache);
+    jakal::ExecutionOptimizer optimizer(exec_cache);
+    const std::vector<jakal::HardwareGraph> graphs{
+        make_manual_host_graph(),
+        make_manual_gpu_graph("gpu:chain:0", "Chain GPU", true, true, true)};
+    const auto graph = make_chain_reduction_graph();
+    const jakal::WorkloadSpec workload{
+        "chain-reduction-workload",
+        jakal::WorkloadKind::inference,
+        "chain-reduction-workload",
+        16ull * 1024ull * 1024ull,
+        512ull * 1024ull,
+        16384.0,
+        1,
+        true,
+        false,
+        true,
+        jakal::PartitionStrategy::auto_balanced,
+        jakal::WorkloadPhase::decode,
+        "b1-s1"};
+    const auto plan = planner.build_plan(workload, graphs);
+
+    jakal::ExecutionTuningOverrides tuning;
+    tuning.graph_rewrite_level = 5u;
+    const auto report = optimizer.optimize(workload, plan, graphs, &graph, &tuning);
+    const auto* sum = find_operation_by_name(report, "sum");
+    if (sum == nullptr || report.workload_graph.operations.size() != 1u || report.operations.size() != 1u) {
+        std::cerr << "chain-reduction: expected elementwise chain to collapse into reduction\n";
+        return false;
+    }
+    if (sum->operation.op_class != jakal::OperationClass::reduction ||
+        std::find(sum->operation.fused_operation_names.begin(),
+                  sum->operation.fused_operation_names.end(),
+                  "bias") == sum->operation.fused_operation_names.end() ||
+        std::find(sum->operation.fused_operation_names.begin(),
+                  sum->operation.fused_operation_names.end(),
+                  "relu") == sum->operation.fused_operation_names.end()) {
+        std::cerr << "chain-reduction: reduction missing fused chain markers\n";
         return false;
     }
 
@@ -1788,6 +2233,10 @@ bool verify_operation_lowering_for_cpu_and_gpu_inference() {
         patch_proj->operation.cpu_output_layout == "native" ||
         patch_proj->operation.gpu_output_layout == "native" ||
         patch_proj->operation.cpu_micro_kernel_unroll < 2u ||
+        patch_proj->operation.cpu_tile_m == 0u ||
+        patch_proj->operation.cpu_tile_n == 0u ||
+        patch_proj->operation.cpu_tile_k == 0u ||
+        patch_proj->operation.cpu_parallel_chunk == 0u ||
         patch_proj->operation.gpu_micro_kernel_unroll < 2u) {
         std::cerr << "lowering: patch-proj hints cpu_pack=" << patch_proj->operation.cpu_pack_weights
                   << " gpu_pack=" << patch_proj->operation.gpu_pack_weights
@@ -1800,6 +2249,10 @@ bool verify_operation_lowering_for_cpu_and_gpu_inference() {
                   << " cpu_out=" << patch_proj->operation.cpu_output_layout
                   << " gpu_out=" << patch_proj->operation.gpu_output_layout
                   << " cpu_u=" << patch_proj->operation.cpu_micro_kernel_unroll
+                  << " cpu_tm=" << patch_proj->operation.cpu_tile_m
+                  << " cpu_tn=" << patch_proj->operation.cpu_tile_n
+                  << " cpu_tk=" << patch_proj->operation.cpu_tile_k
+                  << " cpu_chunk=" << patch_proj->operation.cpu_parallel_chunk
                   << " gpu_u=" << patch_proj->operation.gpu_micro_kernel_unroll << '\n';
         return false;
     }
@@ -1817,6 +2270,63 @@ bool verify_operation_lowering_for_cpu_and_gpu_inference() {
         return false;
     }
     return true;
+}
+
+bool verify_cpu_runtime_tuning_hints_scale_with_workload() {
+    const auto small_cache = unique_temp_file("cpu-hints-small");
+    const auto large_cache = unique_temp_file("cpu-hints-large");
+    jakal::ExecutionOptimizer small_optimizer(small_cache);
+    jakal::ExecutionOptimizer large_optimizer(large_cache);
+
+    auto host = make_manual_host_graph();
+    host.nodes[2].compute.native_vector_bits = 512;
+    host.nodes[2].compute.execution_width = 32;
+    attach_cache_and_scratch(host, 2ull * 1024ull * 1024ull, 64ull * 1024ull);
+
+    jakal::ExecutionPlan plan;
+    plan.signature = "manual-cpu-hints";
+    plan.allocations.push_back({host, 1.0, 1.0});
+
+    const jakal::WorkloadSpec workload{
+        "cpu-hint-scaling",
+        jakal::WorkloadKind::inference,
+        "cpu-hint-scaling",
+        512ull * 1024ull * 1024ull,
+        16ull * 1024ull * 1024ull,
+        2.0e11,
+        1,
+        true,
+        false,
+        true,
+        jakal::PartitionStrategy::auto_balanced,
+        jakal::WorkloadPhase::decode,
+        "cpu-hint-scaling"};
+
+    const auto small_graph = make_validation_policy_graph(false);
+    const auto large_graph = make_candidate_policy_graph();
+    const auto small_report = small_optimizer.optimize(workload, plan, {host}, &small_graph);
+    const auto large_report = large_optimizer.optimize(workload, plan, {host}, &large_graph);
+
+    const auto* small_projection = find_operation_by_name(small_report, "projection");
+    const auto* large_projection = find_operation_by_name(large_report, "projection");
+    if (small_projection == nullptr || large_projection == nullptr) {
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(small_cache, ec);
+    std::filesystem::remove(large_cache, ec);
+    std::filesystem::remove(small_cache.string() + ".perf", ec);
+    std::filesystem::remove(large_cache.string() + ".perf", ec);
+
+    return large_projection->operation.cpu_tile_m >= small_projection->operation.cpu_tile_m &&
+           large_projection->operation.cpu_tile_n >= small_projection->operation.cpu_tile_n &&
+           large_projection->operation.cpu_tile_k >= small_projection->operation.cpu_tile_k &&
+           large_projection->operation.cpu_parallel_chunk >= small_projection->operation.cpu_parallel_chunk &&
+           small_projection->operation.cpu_tile_m > 0u &&
+           small_projection->operation.cpu_tile_n > 0u &&
+           small_projection->operation.cpu_tile_k > 0u &&
+           small_projection->operation.cpu_parallel_chunk > 0u;
 }
 
 bool verify_operation_lowering_for_non_dl_graphs() {
@@ -1898,10 +2408,11 @@ bool verify_gpu_direct_variants() {
         {"level-zero", "Intel Arc A770", jakal::JakalVendorFamily::intel, jakal::JakalBackendKind::level_zero, jakal::OperationClass::matmul, {64, 64, 64}, true, false, true},
         {"level-zero-conv", "Intel Arc A770", jakal::JakalVendorFamily::intel, jakal::JakalBackendKind::level_zero, jakal::OperationClass::convolution_2d, {64, 64}, true, false, true},
         {"cuda", "NVIDIA RTX 4090", jakal::JakalVendorFamily::nvidia, jakal::JakalBackendKind::cuda, jakal::OperationClass::matmul, {64, 64, 64}, true, true, false},
-        {"vulkan", "AMD Radeon RX 7900", jakal::JakalVendorFamily::amd, jakal::JakalBackendKind::vulkan_compute, jakal::OperationClass::resample_2d, {128, 128, 256, 256}, true, false, false},
     };
 
     jakal::DirectExecutor executor;
+    bool observed_copy_accounting = false;
+    bool observed_dispatch_metrics = false;
     for (const auto& test_case : cases) {
         auto graph = make_manual_gpu_graph(
             "graph:" + test_case.name,
@@ -2035,6 +2546,135 @@ bool verify_gpu_direct_variants() {
             std::cerr << "Successful direct execution was not verified for " << test_case.name << ".\n";
             return false;
         }
+        if (!record.used_host && (record.copy_runtime_us <= 0.0 || record.compute_runtime_us <= 0.0)) {
+            std::cerr << "Expected copy/compute accounting for " << test_case.name << ".\n";
+            return false;
+        }
+        if (!record.used_host) {
+            observed_copy_accounting = true;
+        }
+        if ((execution.copy_overlap_ratio < 0.0 || execution.copy_overlap_ratio > 1.0) ||
+            (!record.used_host &&
+             (execution.total_copy_runtime_us <= 0.0 || execution.total_compute_runtime_us <= 0.0))) {
+            std::cerr << "Invalid copy overlap metrics for " << test_case.name << ".\n";
+            return false;
+        }
+        if (!record.used_host &&
+            (record.dispatch_count == 0u || record.compute_queue_count == 0u || record.event_wait_count == 0u)) {
+            std::cerr << "Missing queue/event accounting for " << test_case.name << ".\n";
+            return false;
+        }
+        if (execution.total_dispatch_count > 0u &&
+            execution.total_compute_queue_count > 0u &&
+            execution.total_event_wait_count > 0u) {
+            observed_dispatch_metrics = true;
+        }
+    }
+
+    if (!observed_copy_accounting) {
+        std::cerr << "Expected at least one GPU-direct path to expose copy/compute accounting.\n";
+        return false;
+    }
+    if (!observed_dispatch_metrics) {
+        std::cerr << "Expected aggregate dispatch/queue/event counters.\n";
+        return false;
+    }
+
+    return true;
+}
+
+bool verify_modeled_gpu_variants_do_not_execute_direct() {
+    auto graph = make_manual_gpu_graph(
+        "graph:vulkan",
+        "AMD Radeon RX 7900",
+        true,
+        false,
+        false);
+    graph.probe = "vulkan";
+
+    jakal::OperationSpec operation;
+    operation.name = "op-vulkan";
+    operation.op_class = jakal::OperationClass::resample_2d;
+    operation.extents = {128, 128, 256, 256};
+    operation.input_bytes = 1ull << 20;
+    operation.output_bytes = 1ull << 20;
+    operation.temporary_bytes = 1ull << 18;
+    operation.estimated_flops = 1.0e9;
+    operation.max_relative_error = 1.0e-4;
+    operation.parallelizable = true;
+    operation.streaming_friendly = true;
+    operation.gpu_input_layout = "gpu-resample-packed6";
+    operation.gpu_output_layout = "gpu-resample-linear";
+    operation.gpu_tensorized = true;
+
+    jakal::ExecutionConfig config;
+    config.signature = "cfg-vulkan";
+    config.operation_name = operation.name;
+    config.primary_device_uid = graph.uid;
+    config.participating_devices = {graph.uid};
+    config.mapped_structural_nodes = {"cluster"};
+    config.logical_partitions = 1;
+    config.target_error_tolerance = operation.max_relative_error;
+
+    jakal::ExecutionGraph execution_graph;
+    execution_graph.signature = "exec-vulkan";
+    execution_graph.workload_signature = "manual";
+    execution_graph.operation = operation;
+    execution_graph.participating_devices = {graph.uid};
+
+    jakal::OperationOptimizationResult optimized;
+    optimized.operation = operation;
+    optimized.config = config;
+    optimized.graph = execution_graph;
+
+    jakal::OptimizationReport report;
+    report.signature = "report-vulkan";
+    report.placement.signature = "plan-vulkan";
+    report.placement.allocations.push_back({graph, 1.0, 1.0});
+    report.operations.push_back(optimized);
+
+    jakal::JakalToolkitVariant variant;
+    variant.binding.device_uid = graph.uid;
+    variant.binding.graph_fingerprint = jakal::structural_fingerprint(graph);
+    variant.binding.adapter_id = "adapter-vulkan";
+    variant.binding.presentation_name = graph.presentation_name;
+    variant.binding.vendor = jakal::JakalVendorFamily::amd;
+    variant.binding.backend = jakal::JakalBackendKind::vulkan_compute;
+    variant.binding.capabilities.adapter_available = true;
+    variant.binding.capabilities.kernel_specialization = true;
+    variant.binding.capabilities.asynchronous_dispatch = true;
+    variant.executable = true;
+    variant.toolkit_score = 2.0;
+    const bool direct_available = jakal::executors::vulkan_direct_backend_available();
+    if (jakal::jakal_variant_executes_directly(variant) != direct_available) {
+        std::cerr << "unexpected Vulkan variant executability.\n";
+        return false;
+    }
+
+    jakal::JakalToolkitIndexEntry index_entry;
+    index_entry.device_uid = graph.uid;
+    index_entry.graph_fingerprint = jakal::structural_fingerprint(graph);
+    index_entry.variants.push_back(variant);
+
+    jakal::DirectExecutor executor;
+    const auto execution = executor.execute(report, {graph}, {index_entry});
+    if (execution.operations.size() != 1u) {
+        std::cerr << "Expected one execution record for modeled Vulkan.\n";
+        return false;
+    }
+
+    const auto& record = execution.operations.front();
+    if (!record.used_host) {
+        std::cerr << "Unsupported Vulkan op should fall back to host execution.\n";
+        return false;
+    }
+    if (!record.requested_gpu_backend.empty()) {
+        std::cerr << "Unsupported Vulkan op should not request a direct GPU backend.\n";
+        return false;
+    }
+    if (record.backend_name.find("host-native+gpu-fallback") == std::string::npos) {
+        std::cerr << "Expected host fallback backend label for Vulkan fallback.\n";
+        return false;
     }
 
     return true;
@@ -2318,6 +2958,10 @@ int main(int argc, char** argv) {
         std::cerr << "GPU direct variant execution check failed.\n";
         return 1;
     }
+    if (!verify_modeled_gpu_variants_do_not_execute_direct()) {
+        std::cerr << "Modeled GPU variant rejection check failed.\n";
+        return 1;
+    }
     std::cerr << "stage: verify-registry\n";
     if (!verify_operation_variant_registry()) {
         std::cerr << "Operation variant registry check failed.\n";
@@ -2335,11 +2979,21 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::cerr << "stage: device-agnostic\n";
-        if (!verify_aggressive_graph_rewrites()) {
-            std::cerr << "Aggressive graph rewrite check failed.\n";
-            return 1;
-        }
-        std::cerr << "stage: rewrites\n";
+    if (!verify_aggressive_graph_rewrites()) {
+        std::cerr << "Aggressive graph rewrite check failed.\n";
+        return 1;
+    }
+    std::cerr << "stage: rewrites\n";
+    if (!verify_multistage_epilogue_fusion()) {
+        std::cerr << "Multistage epilogue fusion check failed.\n";
+        return 1;
+    }
+    std::cerr << "stage: epilogue-fusion\n";
+    if (!verify_chain_reduction_fusion()) {
+        std::cerr << "Chain reduction fusion check failed.\n";
+        return 1;
+    }
+    std::cerr << "stage: chain-reduction\n";
     }
     if (!verify_compiled_graph_signature_isolation()) {
         std::cerr << "Compiled graph signature isolation check failed.\n";
@@ -2366,6 +3020,16 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::cerr << "stage: graph-family\n";
+    if (!verify_feedback_tuned_cpu_parallel_chunks()) {
+        std::cerr << "CPU parallel chunk feedback tuning check failed.\n";
+        return 1;
+    }
+    std::cerr << "stage: cpu-feedback\n";
+    if (!verify_feedback_tuned_cpu_matmul_tiles()) {
+        std::cerr << "CPU matmul tile feedback tuning check failed.\n";
+        return 1;
+    }
+    std::cerr << "stage: cpu-tiles\n";
     if (!verify_optimizer_wall_time_budget()) {
         std::cerr << "Optimizer wall-time budget check failed.\n";
         return 1;
@@ -2406,6 +3070,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::cerr << "stage: lowering\n";
+    if (!verify_cpu_runtime_tuning_hints_scale_with_workload()) {
+        std::cerr << "CPU runtime tuning hint scaling check failed.\n";
+        return 1;
+    }
+    std::cerr << "stage: cpu-hints\n";
     if (!verify_operation_lowering_for_non_dl_graphs()) {
         std::cerr << "Non-DL operation lowering check failed.\n";
         return 1;

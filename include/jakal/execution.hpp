@@ -142,6 +142,10 @@ struct OperationSpec {
     bool gpu_pretranspose_rhs = false;
     std::uint32_t cpu_micro_kernel_unroll = 1;
     std::uint32_t gpu_micro_kernel_unroll = 1;
+    std::uint32_t cpu_tile_m = 0;
+    std::uint32_t cpu_tile_n = 0;
+    std::uint32_t cpu_tile_k = 0;
+    std::uint32_t cpu_parallel_chunk = 0;
 };
 
 struct WorkloadTensor {
@@ -336,6 +340,20 @@ struct PerformanceSummary {
     double average_system_penalty_us = 0.0;
     double average_validation_spread_us = 0.0;
     double average_reward = 0.0;
+    double average_copy_share = 0.0;
+    double average_transfer_overlap_ratio = 0.0;
+    double average_budget_pressure = 0.0;
+    double average_queue_separation_ratio = 0.0;
+};
+
+struct CpuRuntimeHintSummary {
+    std::string shape_bucket;
+    std::uint32_t preferred_parallel_chunk = 0;
+    std::uint32_t preferred_tile_m = 0;
+    std::uint32_t preferred_tile_n = 0;
+    std::uint32_t preferred_tile_k = 0;
+    std::uint32_t observations = 0;
+    double average_effective_latency_us = 0.0;
 };
 
 struct OperationOptimizationResult {
@@ -374,6 +392,12 @@ struct ExecutionFeedbackRecord {
     bool used_opencl = false;
     bool used_multiple_devices = false;
     std::uint32_t logical_partitions_used = 1;
+    double copy_share = 0.0;
+    double transfer_overlap_ratio = 0.0;
+    double budget_pressure = 0.0;
+    double queue_separation_ratio = 0.0;
+    std::uint32_t dispatch_count = 0;
+    std::uint32_t event_wait_count = 0;
 };
 
 struct CachedExecutionConfig {
@@ -423,8 +447,10 @@ public:
         const std::string& operation_name) const;
     [[nodiscard]] const std::unordered_map<std::string, PerformanceSummary>& performance_cache() const;
     [[nodiscard]] const std::unordered_map<std::string, PerformanceSummary>& graph_family_performance_cache() const;
+    [[nodiscard]] const std::unordered_map<std::string, CpuRuntimeHintSummary>& cpu_runtime_hint_cache() const;
     [[nodiscard]] const std::unordered_map<std::string, double>& backend_penalty_cache() const;
     [[nodiscard]] const std::unordered_map<std::string, bool>& warmed_devices() const;
+    void apply_feedback_tuning_hints(WorkloadGraph& graph) const;
     void ingest_execution_feedback(
         const OptimizationReport& report,
         const std::vector<ExecutionFeedbackRecord>& feedback,
@@ -433,9 +459,11 @@ public:
 private:
     std::filesystem::path performance_cache_path_;
     std::filesystem::path graph_family_cache_path_;
+    std::filesystem::path cpu_runtime_hint_cache_path_;
     bool cache_loaded_ = false;
     std::unordered_map<std::string, PerformanceSummary> performance_cache_;
     std::unordered_map<std::string, PerformanceSummary> graph_family_performance_cache_;
+    std::unordered_map<std::string, CpuRuntimeHintSummary> cpu_runtime_hint_cache_;
     std::unordered_map<std::string, double> device_sustained_slowdown_;
     std::unordered_map<std::string, bool> warmed_devices_;
     std::unordered_map<std::string, double> backend_penalty_cache_;

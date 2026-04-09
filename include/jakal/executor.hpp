@@ -21,6 +21,7 @@ struct OperationExecutionRecord {
     double copy_runtime_us = 0.0;
     double compute_runtime_us = 0.0;
     double copy_overlap_ratio = 0.0;
+    double queue_separation_ratio = 0.0;
     double predicted_transfer_runtime_us = 0.0;
     double overlapped_transfer_runtime_us = 0.0;
     double transfer_overlap_ratio = 0.0;
@@ -28,6 +29,10 @@ struct OperationExecutionRecord {
     double reference_runtime_us = 0.0;
     double speedup_vs_reference = 1.0;
     double relative_error = 0.0;
+    std::uint32_t dispatch_count = 0;
+    std::uint32_t copy_queue_count = 0;
+    std::uint32_t compute_queue_count = 0;
+    std::uint32_t event_wait_count = 0;
     bool verified = false;
     bool used_host = false;
     bool used_opencl = false;
@@ -45,11 +50,16 @@ struct DirectExecutionReport {
     double total_copy_runtime_us = 0.0;
     double total_compute_runtime_us = 0.0;
     double copy_overlap_ratio = 0.0;
+    double queue_separation_ratio = 0.0;
     double total_predicted_transfer_runtime_us = 0.0;
     double total_overlapped_transfer_runtime_us = 0.0;
     double total_transfer_overlap_gain_us = 0.0;
     double transfer_overlap_ratio = 0.0;
     double speedup_vs_reference = 1.0;
+    std::uint32_t total_dispatch_count = 0;
+    std::uint32_t total_copy_queue_count = 0;
+    std::uint32_t total_compute_queue_count = 0;
+    std::uint32_t total_event_wait_count = 0;
     bool all_succeeded = false;
 };
 

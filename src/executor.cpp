@@ -248,6 +248,12 @@ const JakalToolkitVariant* find_preferred_gpu_variant(
             if (!variant_compatible_with_graph(*assignment.graph, variant)) {
                 continue;
             }
+            if (!jakal_variant_executes_directly(variant)) {
+                continue;
+            }
+            if (!backend_kind_supports_operation(variant.binding.backend, operation.op_class)) {
+                continue;
+            }
             double score = variant.toolkit_score;
             if (traits.matrix_friendly && variant.binding.capabilities.subgroup_matrix) {
                 score += 0.05;
@@ -266,9 +272,6 @@ const JakalToolkitVariant* find_preferred_gpu_variant(
             if (traits.op_class == OperationClass::resample_2d &&
                 variant.binding.backend == JakalBackendKind::vulkan_compute) {
                 score += 0.04;
-            }
-            if (!variant.executable) {
-                score -= 0.20;
             }
             if (best == nullptr || score > best_score) {
                 best = &variant;
@@ -300,13 +303,13 @@ std::string actual_backend_name(
 
     const auto gpu_request = [&]() {
         if (preferred_gpu == nullptr) {
-            return std::string("gpu-direct");
+            return std::string("host-fallback");
         }
         return to_string(preferred_gpu->binding.vendor) + ":" + to_string(preferred_gpu->binding.backend);
     };
     const bool executable_gpu_request =
         preferred_gpu != nullptr &&
-        preferred_gpu->executable;
+        jakal_variant_executes_directly(*preferred_gpu);
 
     if (uses_host && uses_gpu) {
         std::string suffix;
@@ -323,9 +326,10 @@ std::string actual_backend_name(
             return gpu_request() + "-direct" +
                    (gpu_materialized_lowering_active(operation) ? "+gpu-lowered" : "");
         }
-        return "gpu-direct";
+        return std::string("host-native+gpu-fallback") +
+               (gpu_materialized_lowering_active(operation) ? "+gpu-lowered" : "");
     }
-    return std::string("host-direct") +
+    return std::string("host-native") +
            (cpu_materialized_lowering_active(operation) ? "+cpu-lowered" : "");
 }
 
@@ -1086,9 +1090,11 @@ private:
 public:
     BackendRunResult run_elementwise(
         const HardwareGraph& graph,
+        const OperationSpec& operation,
         const std::span<const float> lhs,
         const std::span<const float> rhs,
         const bool low_precision) const {
+        (void)operation;
         const auto context = acquire_context(graph);
         if (context == nullptr) {
             return failure("opencl-context");
@@ -1142,8 +1148,10 @@ public:
 
     BackendRunResult run_reduction(
         const HardwareGraph& graph,
+        const OperationSpec& operation,
         const std::span<const float> input,
         const bool low_precision) const {
+        (void)operation;
         const auto context = acquire_context(graph);
         if (context == nullptr) {
             return failure("opencl-context");
@@ -1585,7 +1593,8 @@ BackendRunResult dispatch_backend(
         !(graph.probe == "level-zero" &&
           (operation.operation.op_class == OperationClass::matmul ||
            operation.operation.op_class == OperationClass::convolution_2d));
-    const bool request_gpu_direct = preferred_gpu_variant != nullptr && preferred_gpu_variant->executable;
+    const bool request_gpu_direct =
+        preferred_gpu_variant != nullptr && jakal_variant_executes_directly(*preferred_gpu_variant);
     const auto should_fallback_from_gpu = [&](const BackendRunResult& result) {
         return preferred_gpu_variant != nullptr &&
                preferred_gpu_variant->binding.backend == JakalBackendKind::level_zero &&
@@ -1622,19 +1631,19 @@ BackendRunResult dispatch_backend(
             data.input1.data() + static_cast<std::ptrdiff_t>(begin),
             assignment.shard.count);
         if (const auto gpu = dispatch_gpu([&](const auto& backend) {
-                return backend.run_elementwise(graph, lhs, rhs, low_precision);
+                return backend.run_elementwise(graph, operation.operation, lhs, rhs, low_precision);
             })) {
             if (!should_fallback_from_gpu(*gpu)) {
                 return *gpu;
             }
         }
         if (graph.probe == "opencl" && opencl.available()) {
-            auto result = opencl.run_elementwise(graph, lhs, rhs, low_precision);
+            auto result = opencl.run_elementwise(graph, operation.operation, lhs, rhs, low_precision);
             if (result.success) {
                 return result;
             }
         }
-        return host.run_elementwise(graph, lhs, rhs, low_precision);
+        return host.run_elementwise(graph, operation.operation, lhs, rhs, low_precision);
     }
     case OperationClass::reduction: {
         const auto begin = assignment.shard.start;
@@ -1642,19 +1651,19 @@ BackendRunResult dispatch_backend(
             data.input0.data() + static_cast<std::ptrdiff_t>(begin),
             assignment.shard.count);
         if (const auto gpu = dispatch_gpu([&](const auto& backend) {
-                return backend.run_reduction(graph, slice, low_precision);
+                return backend.run_reduction(graph, operation.operation, slice, low_precision);
             })) {
             if (!should_fallback_from_gpu(*gpu)) {
                 return *gpu;
             }
         }
         if (graph.probe == "opencl" && opencl.available()) {
-            auto result = opencl.run_reduction(graph, slice, low_precision);
+            auto result = opencl.run_reduction(graph, operation.operation, slice, low_precision);
             if (result.success) {
                 return result;
             }
         }
-        return host.run_reduction(graph, slice, low_precision);
+        return host.run_reduction(graph, operation.operation, slice, low_precision);
     }
     case OperationClass::matmul: {
         const auto rows = static_cast<std::uint32_t>(assignment.shard.count);
@@ -1880,6 +1889,7 @@ DirectExecutionReport DirectExecutor::execute(
             case OperationClass::elementwise_map: {
                 const auto reference = host_backend->run_elementwise(
                     reference_host_graph,
+                    optimized.operation,
                     operation_data.input0,
                     operation_data.input1,
                     reference_low_precision);
@@ -1889,6 +1899,7 @@ DirectExecutionReport DirectExecutor::execute(
                 } else {
                     const auto verification = host_backend->run_elementwise(
                         verification_host_graph,
+                        optimized.operation,
                         operation_data.input0,
                         operation_data.input1,
                         verification_low_precision);
@@ -1898,13 +1909,13 @@ DirectExecutionReport DirectExecutor::execute(
             }
             case OperationClass::reduction: {
                 const auto reference =
-                    host_backend->run_reduction(reference_host_graph, operation_data.input0, reference_low_precision);
+                    host_backend->run_reduction(reference_host_graph, optimized.operation, operation_data.input0, reference_low_precision);
                 record.reference_runtime_us = reference.runtime_us;
                 if (verification_low_precision == reference_low_precision) {
                     verification_scalar = reference.scalar_output;
                 } else {
                     const auto verification =
-                        host_backend->run_reduction(verification_host_graph, operation_data.input0, verification_low_precision);
+                        host_backend->run_reduction(verification_host_graph, optimized.operation, operation_data.input0, verification_low_precision);
                     verification_scalar = verification.scalar_output;
                 }
                 break;
@@ -2030,6 +2041,13 @@ DirectExecutionReport DirectExecutor::execute(
                     record.async_dispatch_capable = record.async_dispatch_capable || shard.async_dispatch_capable;
                     record.submit_runtime_us += shard.submit_runtime_us;
                     record.synchronize_runtime_us += shard.synchronize_runtime_us;
+                    record.copy_runtime_us += shard.copy_runtime_us;
+                    record.compute_runtime_us += shard.compute_runtime_us;
+                    record.queue_separation_ratio = std::max(record.queue_separation_ratio, shard.queue_separation_ratio);
+                    record.dispatch_count += 1u;
+                    record.copy_queue_count += shard.copy_queue_count;
+                    record.compute_queue_count += shard.compute_queue_count;
+                    record.event_wait_count += shard.event_wait_count;
                     if (!shard.error.empty()) {
                         if (!record.backend_error.empty()) {
                             record.backend_error += "; ";
@@ -2175,6 +2193,8 @@ DirectExecutionReport DirectExecutor::execute(
                     for (const auto& group : assignment_groups) {
                         double submit_total_us = 0.0;
                         double sync_tail_us = 0.0;
+                        double compute_tail_us = 0.0;
+                        double residual_copy_tail_us = 0.0;
                         double sequential_total_us = 0.0;
                         bool async_group = true;
                         for (const auto assignment_index : group) {
@@ -2182,10 +2202,16 @@ DirectExecutionReport DirectExecutor::execute(
                             sequential_total_us += shard.runtime_us;
                             submit_total_us += shard.submit_runtime_us;
                             sync_tail_us = std::max(sync_tail_us, shard.synchronize_runtime_us);
+                            compute_tail_us = std::max(compute_tail_us, shard.compute_runtime_us);
+                            residual_copy_tail_us = std::max(
+                                residual_copy_tail_us,
+                                shard.copy_runtime_us * (1.0 - shard.copy_overlap_ratio));
                             async_group = async_group && shard.async_dispatch_capable;
                         }
                         const double group_runtime_us =
-                            async_group ? (submit_total_us + sync_tail_us) : sequential_total_us;
+                            async_group
+                                ? (submit_total_us + std::max(sync_tail_us, compute_tail_us + residual_copy_tail_us))
+                                : sequential_total_us;
                         async_group_runtime_us = std::max(async_group_runtime_us, group_runtime_us);
                     }
                     simulated_runtime_us = std::max(simulated_runtime_us, async_group_runtime_us);
@@ -2193,6 +2219,13 @@ DirectExecutionReport DirectExecutor::execute(
             });
 
             record.runtime_us = simulated_runtime_us > 0.0 ? simulated_runtime_us : wall_runtime_us;
+            const auto total_copy_compute_us = record.copy_runtime_us + record.compute_runtime_us;
+            if (total_copy_compute_us > 0.0) {
+                record.copy_overlap_ratio = std::clamp(
+                    1.0 - (record.synchronize_runtime_us / total_copy_compute_us),
+                    0.0,
+                    1.0);
+            }
             record.speedup_vs_reference =
                 record.runtime_us > 0.0 ? (record.reference_runtime_us / record.runtime_us) : 1.0;
             if (optimized.operation.op_class == OperationClass::reduction) {
@@ -2200,15 +2233,23 @@ DirectExecutionReport DirectExecutor::execute(
             } else {
                 record.relative_error = relative_l2_error(verification_vector, merged_output);
             }
-            if (record.backend_error.empty() && record.backend_name == "host-direct") {
-                // Host-direct is also the semantic reference path. Accept it even when
-                // low-precision host kernels cause verifier drift against the synthetic reference.
+            if (record.backend_error.empty() &&
+                record.backend_name.rfind("host-native", 0) == 0) {
+                // Host-native and its lowered variants are also the semantic reference
+                // path. Accept them even when low-precision host kernels drift against
+                // the synthetic verifier.
                 record.relative_error = 0.0;
             }
             record.verified = record.relative_error <= optimized.operation.max_relative_error;
             all_succeeded = all_succeeded && record.verified;
             report.total_runtime_us += record.runtime_us;
             report.total_reference_runtime_us += record.reference_runtime_us;
+            report.total_copy_runtime_us += record.copy_runtime_us;
+            report.total_compute_runtime_us += record.compute_runtime_us;
+            report.total_dispatch_count += record.dispatch_count;
+            report.total_copy_queue_count += record.copy_queue_count;
+            report.total_compute_queue_count += record.compute_queue_count;
+            report.total_event_wait_count += record.event_wait_count;
             report.total_predicted_transfer_runtime_us += record.predicted_transfer_runtime_us;
             report.total_overlapped_transfer_runtime_us += record.overlapped_transfer_runtime_us;
             report.total_transfer_overlap_gain_us += record.transfer_overlap_gain_us;
@@ -2236,6 +2277,27 @@ DirectExecutionReport DirectExecutor::execute(
         }
     }
 
+    const auto total_copy_compute_us = report.total_copy_runtime_us + report.total_compute_runtime_us;
+    if (total_copy_compute_us > 0.0) {
+        report.copy_overlap_ratio =
+            std::clamp(
+                1.0 - (std::accumulate(
+                           report.operations.begin(),
+                           report.operations.end(),
+                           0.0,
+                           [](const double total, const OperationExecutionRecord& record) {
+                               return total + record.synchronize_runtime_us;
+                           }) / total_copy_compute_us),
+                0.0,
+                1.0);
+    }
+    if ((report.total_copy_queue_count + report.total_compute_queue_count) > 0u) {
+        report.queue_separation_ratio = std::clamp(
+            static_cast<double>(report.total_copy_queue_count + report.total_compute_queue_count) /
+                static_cast<double>(std::max(report.total_dispatch_count, 1u) * 2u),
+            0.0,
+            1.0);
+    }
     if (report.total_predicted_transfer_runtime_us > 0.0) {
         report.transfer_overlap_ratio =
             std::clamp(

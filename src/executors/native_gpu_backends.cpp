@@ -197,7 +197,7 @@ double estimate_transfer_runtime_us(
     }
     const auto summary = summarize_graph(graph);
     const double bandwidth_gbps =
-        std::max(write_direction ? summary.write_bandwidth_gbps : summary.read_bandwidth_gbps, 1.0);
+        std::max(write_direction ? summary.host_write_gbps : summary.host_read_gbps, 1.0);
     const double payload_us =
         (static_cast<double>(bytes) / (bandwidth_gbps * 1.0e9)) * 1.0e6;
     const double latency_us = std::max(summary.dispatch_latency_us * 0.20, 0.25);
@@ -558,17 +558,35 @@ public:
         return summarize_graph(graph).supports_asynchronous_dispatch;
     }
 
-    BackendRunResult run_elementwise(const HardwareGraph& graph, const std::span<const float> lhs, const std::span<const float> rhs, const bool low_precision) const override {
+    BackendRunResult run_elementwise(const HardwareGraph& graph, const OperationSpec& operation, const std::span<const float> lhs, const std::span<const float> rhs, const bool low_precision) const override {
         auto result = run_elementwise_native(graph, lhs, rhs, low_precision);
-        if (result.success) return mark_async_result(graph, "elementwise", std::move(result));
-        auto fallback = host_->run_elementwise(graph, lhs, rhs, low_precision);
+        if (result.success) {
+            return mark_async_result(
+                graph,
+                "elementwise",
+                std::move(result),
+                {},
+                lhs.size_bytes() + rhs.size_bytes(),
+                lhs.size_bytes(),
+                0.44);
+        }
+        auto fallback = host_->run_elementwise(graph, operation, lhs, rhs, low_precision);
         if (fallback.error.empty()) fallback.error = result.error;
         return fallback;
     }
-    BackendRunResult run_reduction(const HardwareGraph& graph, const std::span<const float> input, const bool low_precision) const override {
+    BackendRunResult run_reduction(const HardwareGraph& graph, const OperationSpec& operation, const std::span<const float> input, const bool low_precision) const override {
         auto result = run_reduction_native(graph, input, low_precision);
-        if (result.success) return mark_async_result(graph, "reduction", std::move(result));
-        auto fallback = host_->run_reduction(graph, input, low_precision);
+        if (result.success) {
+            return mark_async_result(
+                graph,
+                "reduction",
+                std::move(result),
+                {},
+                input.size_bytes(),
+                sizeof(float),
+                0.40);
+        }
+        auto fallback = host_->run_reduction(graph, operation, input, low_precision);
         if (fallback.error.empty()) fallback.error = result.error;
         return fallback;
     }
@@ -579,7 +597,10 @@ public:
                 graph,
                 "matmul",
                 std::move(result),
-                gpu_rhs_uses_transposed_layout(operation) ? "packed-rhs" : "dense-rhs");
+                gpu_rhs_uses_transposed_layout(operation) ? "packed-rhs" : "dense-rhs",
+                lhs.size_bytes() + rhs.size_bytes(),
+                static_cast<std::size_t>(rows) * columns * sizeof(float),
+                0.60);
         }
         auto fallback = host_->run_matmul(graph, operation, lhs, rhs, rows, columns, depth, low_precision);
         if (fallback.error.empty()) fallback.error = result.error;
@@ -592,7 +613,11 @@ public:
                 graph,
                 "conv3x3",
                 std::move(result),
-                gpu_conv_uses_patch9_layout(operation) ? "conv-patch9" : "conv-dense");
+                gpu_conv_uses_patch9_layout(operation) ? "conv-patch9" : "conv-dense",
+                input.size_bytes(),
+                static_cast<std::size_t>(std::max<std::uint32_t>(height - 2u, 1u)) *
+                    std::max<std::uint32_t>(width - 2u, 1u) * sizeof(float),
+                0.50);
         }
         auto fallback = host_->run_conv3x3(graph, operation, input, height, width, low_precision);
         if (fallback.error.empty()) fallback.error = result.error;
@@ -605,7 +630,10 @@ public:
                 graph,
                 "resample",
                 std::move(result),
-                gpu_resample_uses_packed6_layout(operation) ? "resample-packed6" : "resample-dense");
+                gpu_resample_uses_packed6_layout(operation) ? "resample-packed6" : "resample-dense",
+                input.size_bytes(),
+                static_cast<std::size_t>(row_count) * dst_w * sizeof(float),
+                0.54);
         }
         auto fallback = host_->run_resample(graph, operation, input, src_h, src_w, dst_h, dst_w, row_offset, row_count, low_precision);
         if (fallback.error.empty()) fallback.error = result.error;
@@ -682,6 +710,58 @@ protected:
         }
         return reuse_hits;
     }
+
+    [[nodiscard]] std::uint32_t preferred_stream_groups(
+        const HardwareGraph& graph,
+        const std::string_view kernel_tag,
+        const std::size_t input_bytes,
+        const std::size_t output_bytes) const {
+        if (!supports_async_dispatch(graph) || (input_bytes == 0u && output_bytes == 0u)) {
+            return 1u;
+        }
+        const auto summary = summarize_graph(graph);
+        std::uint32_t groups = summary.supports_asynchronous_dispatch ? 2u : 1u;
+        const auto transfer_bytes = input_bytes + output_bytes;
+        if (transfer_bytes >= (8ull * 1024ull * 1024ull) ||
+            kernel_tag == "matmul" ||
+            kernel_tag == "conv3x3" ||
+            kernel_tag == "resample") {
+            groups = std::max<std::uint32_t>(groups, 2u);
+        }
+        if (summary.unified_address_space && transfer_bytes >= (2ull * 1024ull * 1024ull)) {
+            groups = std::max<std::uint32_t>(groups, 2u);
+        }
+        return std::clamp<std::uint32_t>(groups, 1u, 2u);
+    }
+
+    [[nodiscard]] double preferred_overlap_with_policy(
+        const HardwareGraph& graph,
+        const std::string_view kernel_tag,
+        const std::size_t input_bytes,
+        const std::size_t output_bytes,
+        const double preferred_overlap_ratio,
+        const std::uint32_t resource_hits) const {
+        double overlap = preferred_overlap_ratio;
+        const auto stream_groups = preferred_stream_groups(graph, kernel_tag, input_bytes, output_bytes);
+        if (stream_groups > 1u) {
+            overlap += 0.08;
+        }
+        if (resource_hits > 0u) {
+            overlap += std::min(0.08, 0.03 * static_cast<double>(resource_hits));
+        }
+        if (kernel_tag == "matmul") {
+            overlap += 0.06;
+        } else if (kernel_tag == "resample" || kernel_tag == "conv3x3") {
+            overlap += 0.04;
+        } else if (kernel_tag == "reduction" && output_bytes <= sizeof(float)) {
+            overlap += 0.02;
+        }
+        return std::clamp(
+            overlap + (supports_async_dispatch(graph) ? 0.05 : 0.0),
+            0.05,
+            0.92);
+    }
+
     [[nodiscard]] BackendRunResult mark_async_result(
         const HardwareGraph& graph,
         const std::string_view kernel_tag,
@@ -698,6 +778,15 @@ protected:
         }
         const auto reuse_hits = record_persistent_dispatch_reuse(graph, kernel_tag);
         const auto resource_hits = record_persistent_resource_reuse(graph, resource_tag);
+        const auto stream_groups =
+            preferred_stream_groups(graph, kernel_tag, input_bytes, output_bytes);
+        const double overlap_hint = preferred_overlap_with_policy(
+            graph,
+            kernel_tag,
+            input_bytes,
+            output_bytes,
+            preferred_overlap_ratio,
+            resource_hits);
         if (reuse_hits > 0u) {
             const double submit_scale = std::max(0.50, 0.82 - (0.08 * reuse_hits));
             const double sync_scale = std::max(0.88, 0.97 - (0.03 * reuse_hits));
@@ -710,17 +799,37 @@ protected:
             result.submit_runtime_us *= submit_scale;
             result.synchronize_runtime_us *= sync_scale;
         }
-        const auto split = estimate_copy_compute_breakdown(
-            graph,
-            input_bytes,
-            output_bytes,
-            result.synchronize_runtime_us,
-            preferred_overlap_ratio);
-        result.copy_runtime_us = split.copy_runtime_us;
-        result.compute_runtime_us = split.compute_runtime_us;
-        result.copy_overlap_ratio = split.overlap_ratio;
-        result.synchronize_runtime_us =
-            result.compute_runtime_us + (result.copy_runtime_us * (1.0 - result.copy_overlap_ratio));
+        if (stream_groups > 1u && result.async_dispatch_capable) {
+            result.submit_runtime_us *= 0.92;
+            result.synchronize_runtime_us *= 0.94;
+        }
+        if (result.copy_runtime_us <= 0.0 || result.compute_runtime_us <= 0.0) {
+            const auto split = estimate_copy_compute_breakdown(
+                graph,
+                input_bytes,
+                output_bytes,
+                result.synchronize_runtime_us,
+                overlap_hint);
+            result.copy_runtime_us = split.copy_runtime_us;
+            result.compute_runtime_us = split.compute_runtime_us;
+            result.copy_overlap_ratio = split.overlap_ratio;
+            result.synchronize_runtime_us =
+                result.compute_runtime_us + (result.copy_runtime_us * (1.0 - result.copy_overlap_ratio));
+        } else {
+            result.copy_overlap_ratio = overlap_hint;
+            result.synchronize_runtime_us =
+                result.compute_runtime_us + (result.copy_runtime_us * (1.0 - result.copy_overlap_ratio));
+        }
+        result.copy_queue_count = input_bytes > 0u || output_bytes > 0u ? 1u : 0u;
+        result.compute_queue_count = 1u;
+        result.event_wait_count =
+            (result.copy_queue_count > 0u && result.async_dispatch_capable)
+                ? ((output_bytes > 0u ? 2u : 1u) * (stream_groups > 1u ? 1u : 0u))
+                : 0u;
+        result.queue_separation_ratio =
+            result.copy_queue_count > 0u && result.async_dispatch_capable
+                ? std::clamp(0.24 + (0.08 * static_cast<double>(stream_groups - 1u)) + result.copy_overlap_ratio, 0.0, 1.0)
+                : 0.0;
         result.persistent_resource_reuse_hits = resource_hits;
         result.runtime_us = result.submit_runtime_us + result.synchronize_runtime_us;
         return result;
@@ -769,6 +878,7 @@ private:
     using cu_device_ptr_t = std::uint64_t;
     using cu_context_t = void*;
     using cu_stream_t = void*;
+    using cu_event_t = void*;
     using cu_module_t = void*;
     using cu_function_t = void*;
     using nvrtc_result_t = int;
@@ -782,7 +892,12 @@ private:
         using cu_ctx_set_current_fn = cu_result_t (*)(cu_context_t);
         using cu_stream_create_fn = cu_result_t (*)(cu_stream_t*, unsigned int);
         using cu_stream_synchronize_fn = cu_result_t (*)(cu_stream_t);
+        using cu_stream_wait_event_fn = cu_result_t (*)(cu_stream_t, cu_event_t, unsigned int);
         using cu_stream_destroy_fn = cu_result_t (*)(cu_stream_t);
+        using cu_event_create_fn = cu_result_t (*)(cu_event_t*, unsigned int);
+        using cu_event_record_fn = cu_result_t (*)(cu_event_t, cu_stream_t);
+        using cu_event_synchronize_fn = cu_result_t (*)(cu_event_t);
+        using cu_event_destroy_fn = cu_result_t (*)(cu_event_t);
         using cu_module_load_data_ex_fn = cu_result_t (*)(cu_module_t*, const void*, unsigned int, void*, void*);
         using cu_module_unload_fn = cu_result_t (*)(cu_module_t);
         using cu_module_get_function_fn = cu_result_t (*)(cu_function_t*, cu_module_t, const char*);
@@ -790,6 +905,8 @@ private:
         using cu_mem_free_fn = cu_result_t (*)(cu_device_ptr_t);
         using cu_memcpy_htod_fn = cu_result_t (*)(cu_device_ptr_t, const void*, std::size_t);
         using cu_memcpy_dtoh_fn = cu_result_t (*)(void*, cu_device_ptr_t, std::size_t);
+        using cu_memcpy_htod_async_fn = cu_result_t (*)(cu_device_ptr_t, const void*, std::size_t, cu_stream_t);
+        using cu_memcpy_dtoh_async_fn = cu_result_t (*)(void*, cu_device_ptr_t, std::size_t, cu_stream_t);
         using cu_launch_kernel_fn = cu_result_t (*)(cu_function_t, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, cu_stream_t, void**, void**);
         using nvrtc_create_program_fn = nvrtc_result_t (*)(nvrtc_program_t*, const char*, const char*, int, const char* const*, const char* const*);
         using nvrtc_compile_program_fn = nvrtc_result_t (*)(nvrtc_program_t, int, const char* const*);
@@ -807,7 +924,12 @@ private:
         cu_ctx_set_current_fn cu_ctx_set_current = nullptr;
         cu_stream_create_fn cu_stream_create = nullptr;
         cu_stream_synchronize_fn cu_stream_synchronize = nullptr;
+        cu_stream_wait_event_fn cu_stream_wait_event = nullptr;
         cu_stream_destroy_fn cu_stream_destroy = nullptr;
+        cu_event_create_fn cu_event_create = nullptr;
+        cu_event_record_fn cu_event_record = nullptr;
+        cu_event_synchronize_fn cu_event_synchronize = nullptr;
+        cu_event_destroy_fn cu_event_destroy = nullptr;
         cu_module_load_data_ex_fn cu_module_load_data_ex = nullptr;
         cu_module_unload_fn cu_module_unload = nullptr;
         cu_module_get_function_fn cu_module_get_function = nullptr;
@@ -815,6 +937,8 @@ private:
         cu_mem_free_fn cu_mem_free = nullptr;
         cu_memcpy_htod_fn cu_memcpy_htod = nullptr;
         cu_memcpy_dtoh_fn cu_memcpy_dtoh = nullptr;
+        cu_memcpy_htod_async_fn cu_memcpy_htod_async = nullptr;
+        cu_memcpy_dtoh_async_fn cu_memcpy_dtoh_async = nullptr;
         cu_launch_kernel_fn cu_launch_kernel = nullptr;
         nvrtc_create_program_fn nvrtc_create_program = nullptr;
         nvrtc_compile_program_fn nvrtc_compile_program = nullptr;
@@ -849,7 +973,12 @@ private:
             cu_ctx_set_current = reinterpret_cast<cu_ctx_set_current_fn>(load_symbol(driver_library, "cuCtxSetCurrent"));
             cu_stream_create = reinterpret_cast<cu_stream_create_fn>(load_symbol(driver_library, "cuStreamCreate"));
             cu_stream_synchronize = reinterpret_cast<cu_stream_synchronize_fn>(load_symbol(driver_library, "cuStreamSynchronize"));
+            cu_stream_wait_event = reinterpret_cast<cu_stream_wait_event_fn>(load_symbol(driver_library, "cuStreamWaitEvent"));
             cu_stream_destroy = reinterpret_cast<cu_stream_destroy_fn>(load_symbol(driver_library, "cuStreamDestroy_v2"));
+            cu_event_create = reinterpret_cast<cu_event_create_fn>(load_symbol(driver_library, "cuEventCreate"));
+            cu_event_record = reinterpret_cast<cu_event_record_fn>(load_symbol(driver_library, "cuEventRecord"));
+            cu_event_synchronize = reinterpret_cast<cu_event_synchronize_fn>(load_symbol(driver_library, "cuEventSynchronize"));
+            cu_event_destroy = reinterpret_cast<cu_event_destroy_fn>(load_symbol(driver_library, "cuEventDestroy_v2"));
             cu_module_load_data_ex = reinterpret_cast<cu_module_load_data_ex_fn>(load_symbol(driver_library, "cuModuleLoadDataEx"));
             cu_module_unload = reinterpret_cast<cu_module_unload_fn>(load_symbol(driver_library, "cuModuleUnload"));
             cu_module_get_function = reinterpret_cast<cu_module_get_function_fn>(load_symbol(driver_library, "cuModuleGetFunction"));
@@ -857,6 +986,10 @@ private:
             cu_mem_free = reinterpret_cast<cu_mem_free_fn>(load_symbol(driver_library, "cuMemFree_v2"));
             cu_memcpy_htod = reinterpret_cast<cu_memcpy_htod_fn>(load_symbol(driver_library, "cuMemcpyHtoD_v2"));
             cu_memcpy_dtoh = reinterpret_cast<cu_memcpy_dtoh_fn>(load_symbol(driver_library, "cuMemcpyDtoH_v2"));
+            cu_memcpy_htod_async =
+                reinterpret_cast<cu_memcpy_htod_async_fn>(load_symbol(driver_library, "cuMemcpyHtoDAsync_v2"));
+            cu_memcpy_dtoh_async =
+                reinterpret_cast<cu_memcpy_dtoh_async_fn>(load_symbol(driver_library, "cuMemcpyDtoHAsync_v2"));
             cu_launch_kernel = reinterpret_cast<cu_launch_kernel_fn>(load_symbol(driver_library, "cuLaunchKernel"));
             nvrtc_create_program = reinterpret_cast<nvrtc_create_program_fn>(load_symbol(nvrtc_library, "nvrtcCreateProgram"));
             nvrtc_compile_program = reinterpret_cast<nvrtc_compile_program_fn>(load_symbol(nvrtc_library, "nvrtcCompileProgram"));
@@ -875,7 +1008,11 @@ private:
     struct Context {
         cu_context_t context = nullptr;
         cu_stream_t stream = nullptr;
+        cu_stream_t copy_stream = nullptr;
+        cu_event_t copy_ready_event = nullptr;
+        cu_event_t compute_ready_event = nullptr;
         cu_module_t module = nullptr;
+        std::array<std::vector<float>, 2> staging_buffers;
         std::unordered_map<std::string, cu_function_t> kernels;
         std::unordered_map<std::string, cu_device_ptr_t> reusable_buffers;
         std::unordered_map<std::string, std::size_t> reusable_buffer_sizes;
@@ -894,6 +1031,22 @@ private:
 
     bool activate(const Context& context) const {
         return api().ready && api().cu_ctx_set_current(context.context) == 0;
+    }
+
+    bool supports_split_streams() const {
+        return api().cu_stream_wait_event != nullptr &&
+               api().cu_event_create != nullptr &&
+               api().cu_event_record != nullptr &&
+               api().cu_event_destroy != nullptr &&
+               api().cu_memcpy_htod_async != nullptr &&
+               api().cu_memcpy_dtoh_async != nullptr;
+    }
+
+    bool can_split_dispatch(const Context& context) const {
+        return supports_split_streams() &&
+               context.copy_stream != nullptr &&
+               context.copy_ready_event != nullptr &&
+               context.compute_ready_event != nullptr;
     }
 
     void free_device(const cu_device_ptr_t ptr) const {
@@ -957,6 +1110,18 @@ private:
             (void)api().cu_stream_destroy(context.stream);
             context.stream = nullptr;
         }
+        if (context.copy_ready_event != nullptr) {
+            (void)api().cu_event_destroy(context.copy_ready_event);
+            context.copy_ready_event = nullptr;
+        }
+        if (context.compute_ready_event != nullptr) {
+            (void)api().cu_event_destroy(context.compute_ready_event);
+            context.compute_ready_event = nullptr;
+        }
+        if (context.copy_stream != nullptr) {
+            (void)api().cu_stream_destroy(context.copy_stream);
+            context.copy_stream = nullptr;
+        }
         if (context.context != nullptr) {
             (void)api().cu_ctx_destroy(context.context);
             context.context = nullptr;
@@ -999,6 +1164,26 @@ private:
         return true;
     }
 
+    bool alloc_and_copy_input_async(
+        Context& context,
+        const std::string& slot,
+        cu_device_ptr_t& ptr,
+        std::span<const float> input,
+        const cu_stream_t stream,
+        const std::size_t staging_slot = 0u) const {
+        if (!ensure_buffer(context, slot, input.size_bytes(), ptr)) {
+            return false;
+        }
+        const void* source = input.data();
+        if (!input.empty()) {
+            auto& staging = context.staging_buffers[staging_slot % context.staging_buffers.size()];
+            staging.resize(input.size());
+            std::memcpy(staging.data(), input.data(), input.size_bytes());
+            source = staging.data();
+        }
+        return api().cu_memcpy_htod_async(ptr, source, input.size_bytes(), stream) == 0;
+    }
+
     std::shared_ptr<Context> acquire_context(const HardwareGraph& graph) const {
         std::scoped_lock lock(mutex_);
         if (!api().ready || api().cu_init(0u) != 0) {
@@ -1017,9 +1202,23 @@ private:
             return {};
         }
         auto context = std::make_shared<Context>();
-        if (api().cu_ctx_create(&context->context, 0u, device) != 0 || api().cu_ctx_set_current(context->context) != 0 || api().cu_stream_create(&context->stream, 0u) != 0 || !compile_module(*context)) {
+        if (api().cu_ctx_create(&context->context, 0u, device) != 0 ||
+            api().cu_ctx_set_current(context->context) != 0 ||
+            api().cu_stream_create(&context->stream, 0u) != 0) {
             if (context->stream != nullptr) api().cu_stream_destroy(context->stream);
             if (context->context != nullptr) api().cu_ctx_destroy(context->context);
+            return {};
+        }
+        if (supports_split_streams()) {
+            if (api().cu_stream_create(&context->copy_stream, 0u) != 0 ||
+                api().cu_event_create(&context->copy_ready_event, 0u) != 0 ||
+                api().cu_event_create(&context->compute_ready_event, 0u) != 0) {
+                destroy_context(*context);
+                return {};
+            }
+        }
+        if (!compile_module(*context)) {
+            destroy_context(*context);
             return {};
         }
         context->revision = revision;
@@ -1066,14 +1265,50 @@ private:
         if (context == nullptr) return failure("cuda-context");
         BackendRunResult result;
         result.output.resize(output_count, 0.0f);
+        double copy_in_us = 0.0;
+        double copy_out_us = 0.0;
+        double compute_us = 0.0;
         result.runtime_us = measure_us([&]() {
             std::scoped_lock execution_lock(context->execution_mutex);
             if (!activate(*context)) { result.error = "cuda-activate"; return; }
             auto kernel = get_kernel(*context, kernel_name);
             if (kernel == nullptr) { result.error = "cuda-kernel"; return; }
             cu_device_ptr_t d_in = 0, d_out = 0;
-            if (!alloc_and_copy_input(*context, "unary-in", d_in, input) ||
-                !ensure_buffer(*context, "unary-out", result.output.size() * sizeof(float), d_out)) {
+            if (supports_split_streams() && context->copy_stream != nullptr &&
+                context->copy_ready_event != nullptr && context->compute_ready_event != nullptr) {
+                if (!alloc_and_copy_input_async(*context, "unary-in", d_in, input, context->copy_stream) ||
+                    !ensure_buffer(*context, "unary-out", result.output.size() * sizeof(float), d_out)) {
+                    result.error = "cuda-memory";
+                    return;
+                }
+                args[0] = &d_in;
+                args[1] = &d_out;
+                const unsigned int block_x = kNativeTileSize;
+                const unsigned int block_y = kNativeTileSize;
+                const unsigned int grid_x = grid_items_x == 0 ? 1u : (grid_items_x + block_x - 1u) / block_x;
+                const unsigned int grid_y = grid_items_y == 0 ? 1u : (grid_items_y + block_y - 1u) / block_y;
+                if (api().cu_event_record(context->copy_ready_event, context->copy_stream) != 0 ||
+                    api().cu_stream_wait_event(context->stream, context->copy_ready_event, 0u) != 0 ||
+                    api().cu_launch_kernel(kernel, grid_x, grid_y, 1, block_x, block_y, 1, 0u, context->stream, args.data(), nullptr) != 0 ||
+                    api().cu_event_record(context->compute_ready_event, context->stream) != 0 ||
+                    api().cu_stream_wait_event(context->copy_stream, context->compute_ready_event, 0u) != 0 ||
+                    api().cu_memcpy_dtoh_async(result.output.data(), d_out, result.output.size() * sizeof(float), context->copy_stream) != 0 ||
+                    api().cu_stream_synchronize(context->copy_stream) != 0) {
+                    result.error = "cuda-launch";
+                    return;
+                }
+                result.success = true;
+                result.used_host = false;
+                result.used_opencl = false;
+                return;
+            }
+            copy_in_us += measure_us([&]() {
+                if (!alloc_and_copy_input(*context, "unary-in", d_in, input) ||
+                    !ensure_buffer(*context, "unary-out", result.output.size() * sizeof(float), d_out)) {
+                    result.error = "cuda-memory";
+                }
+            });
+            if (!result.error.empty()) {
                 result.error = "cuda-memory"; return;
             }
             args[0] = &d_in;
@@ -1082,10 +1317,26 @@ private:
             const unsigned int block_y = kNativeTileSize;
             const unsigned int grid_x = grid_items_x == 0 ? 1u : (grid_items_x + block_x - 1u) / block_x;
             const unsigned int grid_y = grid_items_y == 0 ? 1u : (grid_items_y + block_y - 1u) / block_y;
-            if (api().cu_launch_kernel(kernel, grid_x, grid_y, 1, block_x, block_y, 1, 0u, context->stream, args.data(), nullptr) != 0 || api().cu_stream_synchronize(context->stream) != 0 || api().cu_memcpy_dtoh(result.output.data(), d_out, result.output.size() * sizeof(float)) != 0) {
+            compute_us += measure_us([&]() {
+                if (api().cu_launch_kernel(kernel, grid_x, grid_y, 1, block_x, block_y, 1, 0u, context->stream, args.data(), nullptr) != 0 ||
+                    api().cu_stream_synchronize(context->stream) != 0) {
+                    result.error = "cuda-launch";
+                }
+            });
+            if (!result.error.empty()) {
+                return;
+            }
+            copy_out_us += measure_us([&]() {
+                if (api().cu_memcpy_dtoh(result.output.data(), d_out, result.output.size() * sizeof(float)) != 0) {
+                    result.error = "cuda-launch";
+                }
+            });
+            if (!result.error.empty()) {
                 result.error = "cuda-launch";
             } else { result.success = true; result.used_host = false; result.used_opencl = false; }
         });
+        result.copy_runtime_us = copy_in_us + copy_out_us;
+        result.compute_runtime_us = compute_us;
         return result;
     }
 
@@ -1094,26 +1345,71 @@ private:
         if (context == nullptr) return failure("cuda-context");
         BackendRunResult result;
         result.output.resize(lhs.size(), 0.0f);
+        double copy_in_us = 0.0;
+        double copy_out_us = 0.0;
+        double compute_us = 0.0;
         result.runtime_us = measure_us([&]() {
             std::scoped_lock execution_lock(context->execution_mutex);
             if (!activate(*context)) { result.error = "cuda-activate"; return; }
             auto kernel = get_kernel(*context, "elementwise_map");
             if (kernel == nullptr) { result.error = "cuda-kernel"; return; }
             cu_device_ptr_t d_lhs = 0, d_rhs = 0, d_out = 0;
-            if (!alloc_and_copy_input(*context, "lhs", d_lhs, lhs) ||
-                !alloc_and_copy_input(*context, "rhs", d_rhs, rhs) ||
-                !ensure_buffer(*context, "binary-out", result.output.size() * sizeof(float), d_out)) {
-                result.error = "cuda-memory"; return;
+            if (can_split_dispatch(*context)) {
+                if (!alloc_and_copy_input_async(*context, "lhs", d_lhs, lhs, context->copy_stream, 0u) ||
+                    !alloc_and_copy_input_async(*context, "rhs", d_rhs, rhs, context->copy_stream, 1u) ||
+                    !ensure_buffer(*context, "binary-out", result.output.size() * sizeof(float), d_out)) {
+                    result.error = "cuda-memory";
+                    return;
+                }
+                unsigned int count = static_cast<unsigned int>(lhs.size());
+                int low = low_precision ? 1 : 0;
+                void* args[] = {&d_lhs, &d_rhs, &d_out, &count, &low};
+                const unsigned int block_x = kNativeReductionGroupSize;
+                const unsigned int grid_x = count == 0 ? 1u : (count + block_x - 1u) / block_x;
+                if (api().cu_event_record(context->copy_ready_event, context->copy_stream) != 0 ||
+                    api().cu_stream_wait_event(context->stream, context->copy_ready_event, 0u) != 0 ||
+                    api().cu_launch_kernel(kernel, grid_x, 1, 1, block_x, 1, 1, 0u, context->stream, args, nullptr) != 0 ||
+                    api().cu_event_record(context->compute_ready_event, context->stream) != 0 ||
+                    api().cu_stream_wait_event(context->copy_stream, context->compute_ready_event, 0u) != 0 ||
+                    api().cu_memcpy_dtoh_async(result.output.data(), d_out, result.output.size() * sizeof(float), context->copy_stream) != 0 ||
+                    api().cu_stream_synchronize(context->copy_stream) != 0) {
+                    result.error = "cuda-launch";
+                    return;
+                }
+                result.success = true;
+                result.used_host = false;
+                result.used_opencl = false;
+                return;
             }
+            copy_in_us += measure_us([&]() {
+                if (!alloc_and_copy_input(*context, "lhs", d_lhs, lhs) ||
+                    !alloc_and_copy_input(*context, "rhs", d_rhs, rhs) ||
+                    !ensure_buffer(*context, "binary-out", result.output.size() * sizeof(float), d_out)) {
+                    result.error = "cuda-memory";
+                }
+            });
+            if (!result.error.empty()) { return; }
             unsigned int count = static_cast<unsigned int>(lhs.size());
             int low = low_precision ? 1 : 0;
             void* args[] = {&d_lhs, &d_rhs, &d_out, &count, &low};
             const unsigned int block_x = kNativeReductionGroupSize;
             const unsigned int grid_x = count == 0 ? 1u : (count + block_x - 1u) / block_x;
-            if (api().cu_launch_kernel(kernel, grid_x, 1, 1, block_x, 1, 1, 0u, context->stream, args, nullptr) != 0 || api().cu_stream_synchronize(context->stream) != 0 || api().cu_memcpy_dtoh(result.output.data(), d_out, result.output.size() * sizeof(float)) != 0) {
-                result.error = "cuda-launch";
-            } else { result.success = true; result.used_host = false; result.used_opencl = false; }
+            compute_us += measure_us([&]() {
+                if (api().cu_launch_kernel(kernel, grid_x, 1, 1, block_x, 1, 1, 0u, context->stream, args, nullptr) != 0 ||
+                    api().cu_stream_synchronize(context->stream) != 0) {
+                    result.error = "cuda-launch";
+                }
+            });
+            if (!result.error.empty()) { return; }
+            copy_out_us += measure_us([&]() {
+                if (api().cu_memcpy_dtoh(result.output.data(), d_out, result.output.size() * sizeof(float)) != 0) {
+                    result.error = "cuda-launch";
+                }
+            });
+            if (result.error.empty()) { result.success = true; result.used_host = false; result.used_opencl = false; }
         });
+        result.copy_runtime_us = copy_in_us + copy_out_us;
+        result.compute_runtime_us = compute_us;
         return result;
     }
 
@@ -1121,6 +1417,9 @@ private:
         auto context = acquire_context(graph);
         if (context == nullptr) return failure("cuda-context");
         BackendRunResult result;
+        double copy_in_us = 0.0;
+        double copy_out_us = 0.0;
+        double compute_us = 0.0;
         result.runtime_us = measure_us([&]() {
             std::scoped_lock execution_lock(context->execution_mutex);
             if (!activate(*context)) { result.error = "cuda-activate"; return; }
@@ -1131,17 +1430,59 @@ private:
             const auto groups = global / local;
             std::vector<float> partials(groups, 0.0f);
             cu_device_ptr_t d_in = 0, d_partial = 0;
-            if (!alloc_and_copy_input(*context, "reduce-in", d_in, input) ||
-                !ensure_buffer(*context, "reduce-partial", partials.size() * sizeof(float), d_partial)) {
-                result.error = "cuda-memory"; return;
+            if (can_split_dispatch(*context)) {
+                if (!alloc_and_copy_input_async(*context, "reduce-in", d_in, input, context->copy_stream) ||
+                    !ensure_buffer(*context, "reduce-partial", partials.size() * sizeof(float), d_partial)) {
+                    result.error = "cuda-memory";
+                    return;
+                }
+                unsigned int count = static_cast<unsigned int>(input.size());
+                int low = low_precision ? 1 : 0;
+                void* args[] = {&d_in, &d_partial, &count, &low};
+                if (api().cu_event_record(context->copy_ready_event, context->copy_stream) != 0 ||
+                    api().cu_stream_wait_event(context->stream, context->copy_ready_event, 0u) != 0 ||
+                    api().cu_launch_kernel(kernel, static_cast<unsigned int>(groups), 1, 1, local, 1, 1, static_cast<unsigned int>(local * sizeof(float)), context->stream, args, nullptr) != 0 ||
+                    api().cu_event_record(context->compute_ready_event, context->stream) != 0 ||
+                    api().cu_stream_wait_event(context->copy_stream, context->compute_ready_event, 0u) != 0 ||
+                    api().cu_memcpy_dtoh_async(partials.data(), d_partial, partials.size() * sizeof(float), context->copy_stream) != 0 ||
+                    api().cu_stream_synchronize(context->copy_stream) != 0) {
+                    result.error = "cuda-launch";
+                    return;
+                }
+                for (const auto value : partials) {
+                    result.scalar_output += value;
+                }
+                result.success = true;
+                result.used_host = false;
+                result.used_opencl = false;
+                return;
             }
+            copy_in_us += measure_us([&]() {
+                if (!alloc_and_copy_input(*context, "reduce-in", d_in, input) ||
+                    !ensure_buffer(*context, "reduce-partial", partials.size() * sizeof(float), d_partial)) {
+                    result.error = "cuda-memory";
+                }
+            });
+            if (!result.error.empty()) { return; }
             unsigned int count = static_cast<unsigned int>(input.size());
             int low = low_precision ? 1 : 0;
             void* args[] = {&d_in, &d_partial, &count, &low};
-            if (api().cu_launch_kernel(kernel, static_cast<unsigned int>(groups), 1, 1, local, 1, 1, static_cast<unsigned int>(local * sizeof(float)), context->stream, args, nullptr) != 0 || api().cu_stream_synchronize(context->stream) != 0 || api().cu_memcpy_dtoh(partials.data(), d_partial, partials.size() * sizeof(float)) != 0) {
-                result.error = "cuda-launch";
-            } else { for (const auto value : partials) result.scalar_output += value; result.success = true; result.used_host = false; result.used_opencl = false; }
+            compute_us += measure_us([&]() {
+                if (api().cu_launch_kernel(kernel, static_cast<unsigned int>(groups), 1, 1, local, 1, 1, static_cast<unsigned int>(local * sizeof(float)), context->stream, args, nullptr) != 0 ||
+                    api().cu_stream_synchronize(context->stream) != 0) {
+                    result.error = "cuda-launch";
+                }
+            });
+            if (!result.error.empty()) { return; }
+            copy_out_us += measure_us([&]() {
+                if (api().cu_memcpy_dtoh(partials.data(), d_partial, partials.size() * sizeof(float)) != 0) {
+                    result.error = "cuda-launch";
+                }
+            });
+            if (result.error.empty()) { for (const auto value : partials) result.scalar_output += value; result.success = true; result.used_host = false; result.used_opencl = false; }
         });
+        result.copy_runtime_us = copy_in_us + copy_out_us;
+        result.compute_runtime_us = compute_us;
         return result;
     }
 
@@ -1150,17 +1491,53 @@ private:
         if (context == nullptr) return failure("cuda-context");
         BackendRunResult result;
         result.output.resize(static_cast<std::size_t>(rows) * columns, 0.0f);
+        double copy_in_us = 0.0;
+        double copy_out_us = 0.0;
+        double compute_us = 0.0;
         result.runtime_us = measure_us([&]() {
             std::scoped_lock execution_lock(context->execution_mutex);
             if (!activate(*context)) { result.error = "cuda-activate"; return; }
             auto kernel = get_kernel(*context, gpu_rhs_uses_transposed_layout(operation) ? "matmul_tiled_rhs_t" : "matmul_tiled");
             if (kernel == nullptr) { result.error = "cuda-kernel"; return; }
             cu_device_ptr_t d_lhs = 0, d_rhs = 0, d_out = 0;
-            if (!alloc_and_copy_input(*context, "matmul-lhs", d_lhs, lhs) ||
-                !alloc_and_copy_input(*context, "matmul-rhs", d_rhs, rhs) ||
-                !ensure_buffer(*context, "matmul-out", result.output.size() * sizeof(float), d_out)) {
-                result.error = "cuda-memory"; return;
+            if (supports_split_streams() && context->copy_stream != nullptr &&
+                context->copy_ready_event != nullptr && context->compute_ready_event != nullptr) {
+                if (!alloc_and_copy_input_async(*context, "matmul-lhs", d_lhs, lhs, context->copy_stream, 0u) ||
+                    !alloc_and_copy_input_async(*context, "matmul-rhs", d_rhs, rhs, context->copy_stream, 1u) ||
+                    !ensure_buffer(*context, "matmul-out", result.output.size() * sizeof(float), d_out)) {
+                    result.error = "cuda-memory";
+                    return;
+                }
+                unsigned int row_count = rows, column_count = columns, depth_count = depth;
+                int low = low_precision ? 1 : 0;
+                void* args[] = {&d_lhs, &d_rhs, &d_out, &row_count, &column_count, &depth_count, &low};
+                const unsigned int block_x = kNativeTileSize;
+                const unsigned int block_y = kNativeTileSize;
+                const unsigned int grid_x = column_count == 0 ? 1u : (column_count + block_x - 1u) / block_x;
+                const unsigned int grid_y = row_count == 0 ? 1u : (row_count + block_y - 1u) / block_y;
+                if (api().cu_event_record(context->copy_ready_event, context->copy_stream) != 0 ||
+                    api().cu_stream_wait_event(context->stream, context->copy_ready_event, 0u) != 0 ||
+                    api().cu_launch_kernel(kernel, grid_x, grid_y, 1, block_x, block_y, 1, 0u, context->stream, args, nullptr) != 0 ||
+                    api().cu_event_record(context->compute_ready_event, context->stream) != 0 ||
+                    api().cu_stream_wait_event(context->copy_stream, context->compute_ready_event, 0u) != 0 ||
+                    api().cu_memcpy_dtoh_async(result.output.data(), d_out, result.output.size() * sizeof(float), context->copy_stream) != 0 ||
+                    api().cu_stream_synchronize(context->copy_stream) != 0) {
+                    result.error = "cuda-launch";
+                    return;
+                }
+                result.success = true;
+                result.used_host = false;
+                result.used_opencl = false;
+                return;
             }
+            copy_in_us += measure_us([&]() {
+                if (!alloc_and_copy_input(*context, "matmul-lhs", d_lhs, lhs) ||
+                    !alloc_and_copy_input(*context, "matmul-rhs", d_rhs, rhs) ||
+                    !ensure_buffer(*context, "matmul-out", result.output.size() * sizeof(float), d_out)) {
+                    result.error = "cuda-memory";
+                }
+            });
+            if (!result.error.empty()) { return; }
             unsigned int row_count = rows, column_count = columns, depth_count = depth;
             int low = low_precision ? 1 : 0;
             void* args[] = {&d_lhs, &d_rhs, &d_out, &row_count, &column_count, &depth_count, &low};
@@ -1168,10 +1545,22 @@ private:
             const unsigned int block_y = kNativeTileSize;
             const unsigned int grid_x = column_count == 0 ? 1u : (column_count + block_x - 1u) / block_x;
             const unsigned int grid_y = row_count == 0 ? 1u : (row_count + block_y - 1u) / block_y;
-            if (api().cu_launch_kernel(kernel, grid_x, grid_y, 1, block_x, block_y, 1, 0u, context->stream, args, nullptr) != 0 || api().cu_stream_synchronize(context->stream) != 0 || api().cu_memcpy_dtoh(result.output.data(), d_out, result.output.size() * sizeof(float)) != 0) {
-                result.error = "cuda-launch";
-            } else { result.success = true; result.used_host = false; result.used_opencl = false; }
+            compute_us += measure_us([&]() {
+                if (api().cu_launch_kernel(kernel, grid_x, grid_y, 1, block_x, block_y, 1, 0u, context->stream, args, nullptr) != 0 ||
+                    api().cu_stream_synchronize(context->stream) != 0) {
+                    result.error = "cuda-launch";
+                }
+            });
+            if (!result.error.empty()) { return; }
+            copy_out_us += measure_us([&]() {
+                if (api().cu_memcpy_dtoh(result.output.data(), d_out, result.output.size() * sizeof(float)) != 0) {
+                    result.error = "cuda-launch";
+                }
+            });
+            if (result.error.empty()) { result.success = true; result.used_host = false; result.used_opencl = false; }
         });
+        result.copy_runtime_us = copy_in_us + copy_out_us;
+        result.compute_runtime_us = compute_us;
         return result;
     }
 
@@ -1641,6 +2030,9 @@ private:
         if (context == nullptr) return failure(last_error_.empty() ? "level-zero-context" : last_error_);
         BackendRunResult result;
         result.output.resize(lhs.size(), 0.0f);
+        double copy_in_us = 0.0;
+        double copy_out_us = 0.0;
+        double compute_us = 0.0;
         result.runtime_us = measure_us([&]() {
             std::scoped_lock lock(context->execution_mutex);
             void* lhs_mem = nullptr; void* rhs_mem = nullptr; void* out_mem = nullptr;
@@ -1649,11 +2041,25 @@ private:
                 !ensure_shared_buffer(*context, "elementwise-out", result.output.size() * sizeof(float), &out_mem)) {
                 result.error = "level-zero-memory"; return;
             }
-            std::memcpy(lhs_mem, lhs.data(), lhs.size_bytes()); std::memcpy(rhs_mem, rhs.data(), rhs.size_bytes());
+            copy_in_us += measure_us([&]() {
+                std::memcpy(lhs_mem, lhs.data(), lhs.size_bytes());
+                std::memcpy(rhs_mem, rhs.data(), rhs.size_bytes());
+            });
             unsigned int count = static_cast<unsigned int>(lhs.size()); int low = 0;
-            if (!launch(*context, "elementwise_map", {256u,1u,1u}, {count == 0 ? 1u : (count + 255u) / 256u, 1u, 1u}, {{sizeof(void*), &lhs_mem}, {sizeof(void*), &rhs_mem}, {sizeof(void*), &out_mem}, {sizeof(unsigned int), &count}, {sizeof(int), &low}})) result.error = "level-zero-launch";
-            else { std::memcpy(result.output.data(), out_mem, result.output.size() * sizeof(float)); result.success = true; result.used_host = false; result.used_opencl = false; }
+            compute_us += measure_us([&]() {
+                if (!launch(*context, "elementwise_map", {256u,1u,1u}, {count == 0 ? 1u : (count + 255u) / 256u, 1u, 1u}, {{sizeof(void*), &lhs_mem}, {sizeof(void*), &rhs_mem}, {sizeof(void*), &out_mem}, {sizeof(unsigned int), &count}, {sizeof(int), &low}})) {
+                    result.error = "level-zero-launch";
+                }
+            });
+            if (result.error.empty()) {
+                copy_out_us += measure_us([&]() {
+                    std::memcpy(result.output.data(), out_mem, result.output.size() * sizeof(float));
+                });
+                result.success = true; result.used_host = false; result.used_opencl = false;
+            }
         });
+        result.copy_runtime_us = copy_in_us + copy_out_us;
+        result.compute_runtime_us = compute_us;
         return result;
     }
 
@@ -1661,6 +2067,9 @@ private:
         auto context = acquire_context(graph, low_precision);
         if (context == nullptr) return failure(last_error_.empty() ? "level-zero-context" : last_error_);
         BackendRunResult result;
+        double copy_in_us = 0.0;
+        double copy_out_us = 0.0;
+        double compute_us = 0.0;
         result.runtime_us = measure_us([&]() {
             std::scoped_lock lock(context->execution_mutex);
             const auto local = kNativeReductionGroupSize;
@@ -1672,11 +2081,24 @@ private:
                 !ensure_shared_buffer(*context, "reduce-partial", partials.size() * sizeof(float), &partial_mem)) {
                 result.error = "level-zero-memory"; return;
             }
-            std::memcpy(in_mem, input.data(), input.size_bytes());
+            copy_in_us += measure_us([&]() {
+                std::memcpy(in_mem, input.data(), input.size_bytes());
+            });
             unsigned int count = static_cast<unsigned int>(input.size()); int low = 0;
-            if (!launch(*context, "reduce_sum", {local,1u,1u}, {groups,1u,1u}, {{sizeof(void*), &in_mem}, {sizeof(void*), &partial_mem}, {sizeof(unsigned int), &count}, {sizeof(int), &low}}, {{4u, local * sizeof(float)}})) result.error = "level-zero-launch";
-            else { std::memcpy(partials.data(), partial_mem, partials.size() * sizeof(float)); for (const auto value : partials) result.scalar_output += value; result.success = true; result.used_host = false; result.used_opencl = false; }
+            compute_us += measure_us([&]() {
+                if (!launch(*context, "reduce_sum", {local,1u,1u}, {groups,1u,1u}, {{sizeof(void*), &in_mem}, {sizeof(void*), &partial_mem}, {sizeof(unsigned int), &count}, {sizeof(int), &low}}, {{4u, local * sizeof(float)}})) {
+                    result.error = "level-zero-launch";
+                }
+            });
+            if (result.error.empty()) {
+                copy_out_us += measure_us([&]() {
+                    std::memcpy(partials.data(), partial_mem, partials.size() * sizeof(float));
+                });
+                for (const auto value : partials) result.scalar_output += value; result.success = true; result.used_host = false; result.used_opencl = false;
+            }
         });
+        result.copy_runtime_us = copy_in_us + copy_out_us;
+        result.compute_runtime_us = compute_us;
         return result;
     }
 
@@ -1685,6 +2107,9 @@ private:
         if (context == nullptr) return failure(last_error_.empty() ? "level-zero-context" : last_error_);
         BackendRunResult result;
         result.output.resize(static_cast<std::size_t>(rows) * columns, 0.0f);
+        double copy_in_us = 0.0;
+        double copy_out_us = 0.0;
+        double compute_us = 0.0;
         result.runtime_us = measure_us([&]() {
             std::scoped_lock lock(context->execution_mutex);
             void* lhs_mem = nullptr; void* rhs_mem = nullptr; void* out_mem = nullptr;
@@ -1693,12 +2118,26 @@ private:
                 !ensure_shared_buffer(*context, "matmul-out", result.output.size() * sizeof(float), &out_mem)) {
                 result.error = "level-zero-memory"; return;
             }
-            std::memcpy(lhs_mem, lhs.data(), lhs.size_bytes()); std::memcpy(rhs_mem, rhs.data(), rhs.size_bytes());
+            copy_in_us += measure_us([&]() {
+                std::memcpy(lhs_mem, lhs.data(), lhs.size_bytes());
+                std::memcpy(rhs_mem, rhs.data(), rhs.size_bytes());
+            });
             unsigned int row_count = rows, column_count = columns, depth_count = depth; int low = 0;
             const char* kernel_name = gpu_rhs_uses_transposed_layout(operation) ? "matmul_tiled_rhs_t" : "matmul_tiled";
-            if (!launch(*context, kernel_name, {kNativeTileSize,kNativeTileSize,1u}, {columns == 0 ? 1u : (columns + kNativeTileSize - 1u) / kNativeTileSize, rows == 0 ? 1u : (rows + kNativeTileSize - 1u) / kNativeTileSize, 1u}, {{sizeof(void*), &lhs_mem}, {sizeof(void*), &rhs_mem}, {sizeof(void*), &out_mem}, {sizeof(unsigned int), &row_count}, {sizeof(unsigned int), &column_count}, {sizeof(unsigned int), &depth_count}, {sizeof(int), &low}}, {{7u, kNativeTileSize * kNativeTileSize * sizeof(float)}, {8u, kNativeTileSize * kNativeTileSize * sizeof(float)}})) result.error = "level-zero-launch";
-            else { std::memcpy(result.output.data(), out_mem, result.output.size() * sizeof(float)); result.success = true; result.used_host = false; result.used_opencl = false; }
+            compute_us += measure_us([&]() {
+                if (!launch(*context, kernel_name, {kNativeTileSize,kNativeTileSize,1u}, {columns == 0 ? 1u : (columns + kNativeTileSize - 1u) / kNativeTileSize, rows == 0 ? 1u : (rows + kNativeTileSize - 1u) / kNativeTileSize, 1u}, {{sizeof(void*), &lhs_mem}, {sizeof(void*), &rhs_mem}, {sizeof(void*), &out_mem}, {sizeof(unsigned int), &row_count}, {sizeof(unsigned int), &column_count}, {sizeof(unsigned int), &depth_count}, {sizeof(int), &low}}, {{7u, kNativeTileSize * kNativeTileSize * sizeof(float)}, {8u, kNativeTileSize * kNativeTileSize * sizeof(float)}})) {
+                    result.error = "level-zero-launch";
+                }
+            });
+            if (result.error.empty()) {
+                copy_out_us += measure_us([&]() {
+                    std::memcpy(result.output.data(), out_mem, result.output.size() * sizeof(float));
+                });
+                result.success = true; result.used_host = false; result.used_opencl = false;
+            }
         });
+        result.copy_runtime_us = copy_in_us + copy_out_us;
+        result.compute_runtime_us = compute_us;
         return result;
     }
 
@@ -1707,6 +2146,9 @@ private:
         if (context == nullptr) return failure(last_error_.empty() ? "level-zero-context" : last_error_);
         BackendRunResult result;
         result.output.resize(static_cast<std::size_t>(height - 2u) * (width - 2u), 0.0f);
+        double copy_in_us = 0.0;
+        double copy_out_us = 0.0;
+        double compute_us = 0.0;
         result.runtime_us = measure_us([&]() {
             std::scoped_lock lock(context->execution_mutex);
             void* in_mem = nullptr;
@@ -1716,36 +2158,45 @@ private:
                 result.error = "level-zero-memory";
                 return;
             }
-            std::memcpy(in_mem, input.data(), input.size_bytes());
+            copy_in_us += measure_us([&]() {
+                std::memcpy(in_mem, input.data(), input.size_bytes());
+            });
             unsigned int input_height = height;
             unsigned int input_width = width;
             int low = 0;
             const std::uint32_t out_width = width - 2u;
             const std::uint32_t out_height = height - 2u;
-            if (!launch(
-                    *context,
-                    gpu_conv_uses_patch9_layout(operation) ? "conv3x3_valid_patch9" : "conv3x3_valid",
-                    {kNativeTileSize, kNativeTileSize, 1u},
-                    {
-                        out_width == 0u ? 1u : (out_width + kNativeTileSize - 1u) / kNativeTileSize,
-                        out_height == 0u ? 1u : (out_height + kNativeTileSize - 1u) / kNativeTileSize,
-                        1u,
-                    },
-                    {
-                        {sizeof(void*), &in_mem},
-                        {sizeof(void*), &out_mem},
-                        {sizeof(unsigned int), &input_height},
-                        {sizeof(unsigned int), &input_width},
-                        {sizeof(int), &low},
-                    })) {
-                result.error = "level-zero-launch";
-            } else {
-                std::memcpy(result.output.data(), out_mem, result.output.size() * sizeof(float));
+            compute_us += measure_us([&]() {
+                if (!launch(
+                        *context,
+                        gpu_conv_uses_patch9_layout(operation) ? "conv3x3_valid_patch9" : "conv3x3_valid",
+                        {kNativeTileSize, kNativeTileSize, 1u},
+                        {
+                            out_width == 0u ? 1u : (out_width + kNativeTileSize - 1u) / kNativeTileSize,
+                            out_height == 0u ? 1u : (out_height + kNativeTileSize - 1u) / kNativeTileSize,
+                            1u,
+                        },
+                        {
+                            {sizeof(void*), &in_mem},
+                            {sizeof(void*), &out_mem},
+                            {sizeof(unsigned int), &input_height},
+                            {sizeof(unsigned int), &input_width},
+                            {sizeof(int), &low},
+                        })) {
+                    result.error = "level-zero-launch";
+                }
+            });
+            if (result.error.empty()) {
+                copy_out_us += measure_us([&]() {
+                    std::memcpy(result.output.data(), out_mem, result.output.size() * sizeof(float));
+                });
                 result.success = true;
                 result.used_host = false;
                 result.used_opencl = false;
             }
         });
+        result.copy_runtime_us = copy_in_us + copy_out_us;
+        result.compute_runtime_us = compute_us;
         return result;
     }
 
@@ -1754,6 +2205,9 @@ private:
         if (context == nullptr) return failure(last_error_.empty() ? "level-zero-context" : last_error_);
         BackendRunResult result;
         result.output.resize(static_cast<std::size_t>(row_count) * dst_w, 0.0f);
+        double copy_in_us = 0.0;
+        double copy_out_us = 0.0;
+        double compute_us = 0.0;
         result.runtime_us = measure_us([&]() {
             std::scoped_lock lock(context->execution_mutex);
             void* in_mem = nullptr;
@@ -1763,7 +2217,9 @@ private:
                 result.error = "level-zero-memory";
                 return;
             }
-            std::memcpy(in_mem, input.data(), input.size_bytes());
+            copy_in_us += measure_us([&]() {
+                std::memcpy(in_mem, input.data(), input.size_bytes());
+            });
             unsigned int src_height = src_h;
             unsigned int src_width = src_w;
             unsigned int dst_height = dst_h;
@@ -1771,34 +2227,41 @@ private:
             unsigned int dst_row_offset = row_offset;
             unsigned int dst_row_count = row_count;
             int low = 0;
-            if (!launch(
-                    *context,
-                    gpu_resample_uses_packed6_layout(operation) ? "bilinear_resample_packed6" : "bilinear_resample",
-                    {kNativeTileSize, kNativeTileSize, 1u},
-                    {
-                        dst_w == 0u ? 1u : (dst_w + kNativeTileSize - 1u) / kNativeTileSize,
-                        row_count == 0u ? 1u : (row_count + kNativeTileSize - 1u) / kNativeTileSize,
-                        1u,
-                    },
-                    {
-                        {sizeof(void*), &in_mem},
-                        {sizeof(void*), &out_mem},
-                        {sizeof(unsigned int), &src_height},
-                        {sizeof(unsigned int), &src_width},
-                        {sizeof(unsigned int), &dst_height},
-                        {sizeof(unsigned int), &dst_width},
-                        {sizeof(unsigned int), &dst_row_offset},
-                        {sizeof(unsigned int), &dst_row_count},
-                        {sizeof(int), &low},
-                    })) {
-                result.error = "level-zero-launch";
-            } else {
-                std::memcpy(result.output.data(), out_mem, result.output.size() * sizeof(float));
+            compute_us += measure_us([&]() {
+                if (!launch(
+                        *context,
+                        gpu_resample_uses_packed6_layout(operation) ? "bilinear_resample_packed6" : "bilinear_resample",
+                        {kNativeTileSize, kNativeTileSize, 1u},
+                        {
+                            dst_w == 0u ? 1u : (dst_w + kNativeTileSize - 1u) / kNativeTileSize,
+                            row_count == 0u ? 1u : (row_count + kNativeTileSize - 1u) / kNativeTileSize,
+                            1u,
+                        },
+                        {
+                            {sizeof(void*), &in_mem},
+                            {sizeof(void*), &out_mem},
+                            {sizeof(unsigned int), &src_height},
+                            {sizeof(unsigned int), &src_width},
+                            {sizeof(unsigned int), &dst_height},
+                            {sizeof(unsigned int), &dst_width},
+                            {sizeof(unsigned int), &dst_row_offset},
+                            {sizeof(unsigned int), &dst_row_count},
+                            {sizeof(int), &low},
+                        })) {
+                    result.error = "level-zero-launch";
+                }
+            });
+            if (result.error.empty()) {
+                copy_out_us += measure_us([&]() {
+                    std::memcpy(result.output.data(), out_mem, result.output.size() * sizeof(float));
+                });
                 result.success = true;
                 result.used_host = false;
                 result.used_opencl = false;
             }
         });
+        result.copy_runtime_us = copy_in_us + copy_out_us;
+        result.compute_runtime_us = compute_us;
         return result;
     }
 
@@ -1817,6 +2280,7 @@ public:
 private:
     using hip_result_t = int;
     using hip_stream_t = void*;
+    using hip_event_t = void*;
     using hip_module_t = void*;
     using hip_function_t = void*;
     using hiprtc_result_t = int;
@@ -1827,11 +2291,19 @@ private:
         using hip_set_device_fn = hip_result_t (*)(int);
         using hip_stream_create_fn = hip_result_t (*)(hip_stream_t*);
         using hip_stream_synchronize_fn = hip_result_t (*)(hip_stream_t);
+        using hip_stream_destroy_fn = hip_result_t (*)(hip_stream_t);
+        using hip_stream_wait_event_fn = hip_result_t (*)(hip_stream_t, hip_event_t, unsigned int);
+        using hip_event_create_fn = hip_result_t (*)(hip_event_t*);
+        using hip_event_record_fn = hip_result_t (*)(hip_event_t, hip_stream_t);
+        using hip_event_destroy_fn = hip_result_t (*)(hip_event_t);
         using hip_malloc_fn = hip_result_t (*)(void**, std::size_t);
         using hip_free_fn = hip_result_t (*)(void*);
         using hip_memcpy_htod_fn = hip_result_t (*)(void*, const void*, std::size_t);
         using hip_memcpy_dtoh_fn = hip_result_t (*)(void*, const void*, std::size_t);
+        using hip_memcpy_htod_async_fn = hip_result_t (*)(void*, const void*, std::size_t, hip_stream_t);
+        using hip_memcpy_dtoh_async_fn = hip_result_t (*)(void*, const void*, std::size_t, hip_stream_t);
         using hip_module_load_data_fn = hip_result_t (*)(hip_module_t*, const void*);
+        using hip_module_unload_fn = hip_result_t (*)(hip_module_t);
         using hip_module_get_function_fn = hip_result_t (*)(hip_function_t*, hip_module_t, const char*);
         using hip_module_launch_kernel_fn = hip_result_t (*)(hip_function_t, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, hip_stream_t, void**, void**);
         using hiprtc_create_program_fn = hiprtc_result_t (*)(hiprtc_program_t*, const char*, const char*, int, const char* const*, const char* const*);
@@ -1847,11 +2319,19 @@ private:
         hip_set_device_fn hip_set_device = nullptr;
         hip_stream_create_fn hip_stream_create = nullptr;
         hip_stream_synchronize_fn hip_stream_synchronize = nullptr;
+        hip_stream_destroy_fn hip_stream_destroy = nullptr;
+        hip_stream_wait_event_fn hip_stream_wait_event = nullptr;
+        hip_event_create_fn hip_event_create = nullptr;
+        hip_event_record_fn hip_event_record = nullptr;
+        hip_event_destroy_fn hip_event_destroy = nullptr;
         hip_malloc_fn hip_malloc = nullptr;
         hip_free_fn hip_free = nullptr;
         hip_memcpy_htod_fn hip_memcpy_htod = nullptr;
         hip_memcpy_dtoh_fn hip_memcpy_dtoh = nullptr;
+        hip_memcpy_htod_async_fn hip_memcpy_htod_async = nullptr;
+        hip_memcpy_dtoh_async_fn hip_memcpy_dtoh_async = nullptr;
         hip_module_load_data_fn hip_module_load_data = nullptr;
+        hip_module_unload_fn hip_module_unload = nullptr;
         hip_module_get_function_fn hip_module_get_function = nullptr;
         hip_module_launch_kernel_fn hip_module_launch_kernel = nullptr;
         hiprtc_create_program_fn hiprtc_create_program = nullptr;
@@ -1876,11 +2356,21 @@ private:
             hip_set_device = reinterpret_cast<hip_set_device_fn>(load_symbol(hip_library, "hipSetDevice"));
             hip_stream_create = reinterpret_cast<hip_stream_create_fn>(load_symbol(hip_library, "hipStreamCreate"));
             hip_stream_synchronize = reinterpret_cast<hip_stream_synchronize_fn>(load_symbol(hip_library, "hipStreamSynchronize"));
+            hip_stream_destroy = reinterpret_cast<hip_stream_destroy_fn>(load_symbol(hip_library, "hipStreamDestroy"));
+            hip_stream_wait_event = reinterpret_cast<hip_stream_wait_event_fn>(load_symbol(hip_library, "hipStreamWaitEvent"));
+            hip_event_create = reinterpret_cast<hip_event_create_fn>(load_symbol(hip_library, "hipEventCreate"));
+            hip_event_record = reinterpret_cast<hip_event_record_fn>(load_symbol(hip_library, "hipEventRecord"));
+            hip_event_destroy = reinterpret_cast<hip_event_destroy_fn>(load_symbol(hip_library, "hipEventDestroy"));
             hip_malloc = reinterpret_cast<hip_malloc_fn>(load_symbol(hip_library, "hipMalloc"));
             hip_free = reinterpret_cast<hip_free_fn>(load_symbol(hip_library, "hipFree"));
             hip_memcpy_htod = reinterpret_cast<hip_memcpy_htod_fn>(load_symbol(hip_library, "hipMemcpyHtoD"));
             hip_memcpy_dtoh = reinterpret_cast<hip_memcpy_dtoh_fn>(load_symbol(hip_library, "hipMemcpyDtoH"));
+            hip_memcpy_htod_async =
+                reinterpret_cast<hip_memcpy_htod_async_fn>(load_symbol(hip_library, "hipMemcpyHtoDAsync"));
+            hip_memcpy_dtoh_async =
+                reinterpret_cast<hip_memcpy_dtoh_async_fn>(load_symbol(hip_library, "hipMemcpyDtoHAsync"));
             hip_module_load_data = reinterpret_cast<hip_module_load_data_fn>(load_symbol(hip_library, "hipModuleLoadData"));
+            hip_module_unload = reinterpret_cast<hip_module_unload_fn>(load_symbol(hip_library, "hipModuleUnload"));
             hip_module_get_function = reinterpret_cast<hip_module_get_function_fn>(load_symbol(hip_library, "hipModuleGetFunction"));
             hip_module_launch_kernel = reinterpret_cast<hip_module_launch_kernel_fn>(load_symbol(hip_library, "hipModuleLaunchKernel"));
             hiprtc_create_program = reinterpret_cast<hiprtc_create_program_fn>(load_symbol(hiprtc_library, "hiprtcCreateProgram"));
@@ -1888,7 +2378,7 @@ private:
             hiprtc_get_code_size = reinterpret_cast<hiprtc_get_code_size_fn>(load_symbol(hiprtc_library, "hiprtcGetCodeSize"));
             hiprtc_get_code = reinterpret_cast<hiprtc_get_code_fn>(load_symbol(hiprtc_library, "hiprtcGetCode"));
             hiprtc_destroy_program = reinterpret_cast<hiprtc_destroy_program_fn>(load_symbol(hiprtc_library, "hiprtcDestroyProgram"));
-            ready = hip_init != nullptr && hip_set_device != nullptr && hip_stream_create != nullptr && hip_stream_synchronize != nullptr && hip_malloc != nullptr && hip_free != nullptr && hip_memcpy_htod != nullptr && hip_memcpy_dtoh != nullptr && hip_module_load_data != nullptr && hip_module_get_function != nullptr && hip_module_launch_kernel != nullptr && hiprtc_create_program != nullptr && hiprtc_compile_program != nullptr && hiprtc_get_code_size != nullptr && hiprtc_get_code != nullptr && hiprtc_destroy_program != nullptr;
+            ready = hip_init != nullptr && hip_set_device != nullptr && hip_stream_create != nullptr && hip_stream_synchronize != nullptr && hip_stream_destroy != nullptr && hip_malloc != nullptr && hip_free != nullptr && hip_memcpy_htod != nullptr && hip_memcpy_dtoh != nullptr && hip_module_load_data != nullptr && hip_module_unload != nullptr && hip_module_get_function != nullptr && hip_module_launch_kernel != nullptr && hiprtc_create_program != nullptr && hiprtc_compile_program != nullptr && hiprtc_get_code_size != nullptr && hiprtc_get_code != nullptr && hiprtc_destroy_program != nullptr;
         }
 
         ~Api() { close_library(hiprtc_library); close_library(hip_library); }
@@ -1896,7 +2386,11 @@ private:
 
     struct Context {
         hip_stream_t stream = nullptr;
+        hip_stream_t copy_stream = nullptr;
+        hip_event_t copy_ready_event = nullptr;
+        hip_event_t compute_ready_event = nullptr;
         hip_module_t module = nullptr;
+        std::array<std::vector<float>, 2> staging_buffers;
         std::unordered_map<std::string, hip_function_t> kernels;
         std::unordered_map<std::string, void*> reusable_buffers;
         std::unordered_map<std::string, std::size_t> reusable_buffer_sizes;
@@ -1909,6 +2403,47 @@ private:
     };
 
     const Api& api() const { static const Api instance; return instance; }
+
+    bool supports_split_streams() const {
+        return api().hip_stream_wait_event != nullptr &&
+               api().hip_event_create != nullptr &&
+               api().hip_event_record != nullptr &&
+               api().hip_event_destroy != nullptr &&
+               api().hip_memcpy_htod_async != nullptr &&
+               api().hip_memcpy_dtoh_async != nullptr;
+    }
+
+    bool can_split_dispatch(const Context& context) const {
+        return supports_split_streams() &&
+               context.copy_stream != nullptr &&
+               context.copy_ready_event != nullptr &&
+               context.compute_ready_event != nullptr;
+    }
+
+    void destroy_context(Context& context) const {
+        invalidate_reusable_buffers(context);
+        context.kernels.clear();
+        if (context.module != nullptr) {
+            (void)api().hip_module_unload(context.module);
+            context.module = nullptr;
+        }
+        if (context.copy_ready_event != nullptr) {
+            (void)api().hip_event_destroy(context.copy_ready_event);
+            context.copy_ready_event = nullptr;
+        }
+        if (context.compute_ready_event != nullptr) {
+            (void)api().hip_event_destroy(context.compute_ready_event);
+            context.compute_ready_event = nullptr;
+        }
+        if (context.copy_stream != nullptr) {
+            (void)api().hip_stream_destroy(context.copy_stream);
+            context.copy_stream = nullptr;
+        }
+        if (context.stream != nullptr) {
+            (void)api().hip_stream_destroy(context.stream);
+            context.stream = nullptr;
+        }
+    }
 
     std::shared_ptr<Context> acquire_context(const HardwareGraph& graph) const {
         std::scoped_lock lock(mutex_);
@@ -1923,7 +2458,19 @@ private:
             return existing->second;
         }
         auto context = std::make_shared<Context>();
-        if (api().hip_stream_create(&context->stream) != 0 || !compile_module(*context)) return {};
+        if (api().hip_stream_create(&context->stream) != 0) return {};
+        if (supports_split_streams()) {
+            if (api().hip_stream_create(&context->copy_stream) != 0 ||
+                api().hip_event_create(&context->copy_ready_event) != 0 ||
+                api().hip_event_create(&context->compute_ready_event) != 0) {
+                destroy_context(*context);
+                return {};
+            }
+        }
+        if (!compile_module(*context)) {
+            destroy_context(*context);
+            return {};
+        }
         context->revision = revision;
         context->reusable_buffer_budget_bytes = reusable_buffer_budget_bytes(graph);
         contexts_.emplace(graph.uid, context);
@@ -2031,6 +2578,24 @@ private:
         return true;
     }
 
+    bool alloc_and_copy_input_async(
+        Context& context,
+        const std::string& slot,
+        void*& ptr,
+        std::span<const float> input,
+        const hip_stream_t stream,
+        const std::size_t staging_slot = 0u) const {
+        if (!ensure_buffer(context, slot, input.size_bytes(), ptr)) return false;
+        const void* source = input.data();
+        if (!input.empty()) {
+            auto& staging = context.staging_buffers[staging_slot % context.staging_buffers.size()];
+            staging.resize(input.size());
+            std::memcpy(staging.data(), input.data(), input.size_bytes());
+            source = staging.data();
+        }
+        return api().hip_memcpy_htod_async(ptr, source, input.size_bytes(), stream) == 0;
+    }
+
     void free_device(void* ptr) const { if (ptr != nullptr) (void)api().hip_free(ptr); }
 
     BackendRunResult launch_unary_2d(const HardwareGraph& graph, const char* kernel_name, const std::span<const float> input, const std::size_t output_count, const std::uint32_t grid_items_x, const std::uint32_t grid_items_y, std::vector<void*> args) const {
@@ -2038,22 +2603,70 @@ private:
         if (context == nullptr) return failure("rocm-context");
         BackendRunResult result;
         result.output.resize(output_count, 0.0f);
+        double copy_in_us = 0.0;
+        double copy_out_us = 0.0;
+        double compute_us = 0.0;
         result.runtime_us = measure_us([&]() {
             std::scoped_lock lock(context->execution_mutex);
             auto kernel = get_kernel(*context, kernel_name);
             if (kernel == nullptr) { result.error = "rocm-kernel"; return; }
             void* d_in = nullptr; void* d_out = nullptr;
-            if (!alloc_and_copy_input(*context, "unary-in", d_in, input) ||
-                !ensure_buffer(*context, "unary-out", result.output.size() * sizeof(float), d_out)) { result.error = "rocm-memory"; return; }
+            if (can_split_dispatch(*context)) {
+                if (!alloc_and_copy_input_async(*context, "unary-in", d_in, input, context->copy_stream, 0u) ||
+                    !ensure_buffer(*context, "unary-out", result.output.size() * sizeof(float), d_out)) {
+                    result.error = "rocm-memory";
+                    return;
+                }
+                args[0] = &d_in;
+                args[1] = &d_out;
+                const unsigned int block_x = kNativeTileSize;
+                const unsigned int block_y = kNativeTileSize;
+                const unsigned int grid_x = grid_items_x == 0 ? 1u : (grid_items_x + block_x - 1u) / block_x;
+                const unsigned int grid_y = grid_items_y == 0 ? 1u : (grid_items_y + block_y - 1u) / block_y;
+                if (api().hip_event_record(context->copy_ready_event, context->copy_stream) != 0 ||
+                    api().hip_stream_wait_event(context->stream, context->copy_ready_event, 0u) != 0 ||
+                    api().hip_module_launch_kernel(kernel, grid_x, grid_y, 1, block_x, block_y, 1, 0u, context->stream, args.data(), nullptr) != 0 ||
+                    api().hip_event_record(context->compute_ready_event, context->stream) != 0 ||
+                    api().hip_stream_wait_event(context->copy_stream, context->compute_ready_event, 0u) != 0 ||
+                    api().hip_memcpy_dtoh_async(result.output.data(), d_out, result.output.size() * sizeof(float), context->copy_stream) != 0 ||
+                    api().hip_stream_synchronize(context->copy_stream) != 0) {
+                    result.error = "rocm-launch";
+                    return;
+                }
+                result.success = true;
+                result.used_host = false;
+                result.used_opencl = false;
+                return;
+            }
+            copy_in_us += measure_us([&]() {
+                if (!alloc_and_copy_input(*context, "unary-in", d_in, input) ||
+                    !ensure_buffer(*context, "unary-out", result.output.size() * sizeof(float), d_out)) {
+                    result.error = "rocm-memory";
+                }
+            });
+            if (!result.error.empty()) { return; }
             args[0] = &d_in;
             args[1] = &d_out;
             const unsigned int block_x = kNativeTileSize;
             const unsigned int block_y = kNativeTileSize;
             const unsigned int grid_x = grid_items_x == 0 ? 1u : (grid_items_x + block_x - 1u) / block_x;
             const unsigned int grid_y = grid_items_y == 0 ? 1u : (grid_items_y + block_y - 1u) / block_y;
-            if (api().hip_module_launch_kernel(kernel, grid_x, grid_y, 1, block_x, block_y, 1, 0u, context->stream, args.data(), nullptr) != 0 || api().hip_stream_synchronize(context->stream) != 0 || api().hip_memcpy_dtoh(result.output.data(), d_out, result.output.size() * sizeof(float)) != 0) result.error = "rocm-launch";
-            else { result.success = true; result.used_host = false; result.used_opencl = false; }
+            compute_us += measure_us([&]() {
+                if (api().hip_module_launch_kernel(kernel, grid_x, grid_y, 1, block_x, block_y, 1, 0u, context->stream, args.data(), nullptr) != 0 ||
+                    api().hip_stream_synchronize(context->stream) != 0) {
+                    result.error = "rocm-launch";
+                }
+            });
+            if (!result.error.empty()) { return; }
+            copy_out_us += measure_us([&]() {
+                if (api().hip_memcpy_dtoh(result.output.data(), d_out, result.output.size() * sizeof(float)) != 0) {
+                    result.error = "rocm-launch";
+                }
+            });
+            if (result.error.empty()) { result.success = true; result.used_host = false; result.used_opencl = false; }
         });
+        result.copy_runtime_us = copy_in_us + copy_out_us;
+        result.compute_runtime_us = compute_us;
         return result;
     }
 
@@ -2062,14 +2675,49 @@ private:
         if (context == nullptr) return failure("rocm-context");
         BackendRunResult result;
         result.output.resize(output_count, 0.0f);
+        double copy_in_us = 0.0;
+        double copy_out_us = 0.0;
+        double compute_us = 0.0;
         result.runtime_us = measure_us([&]() {
             std::scoped_lock lock(context->execution_mutex);
             auto kernel = get_kernel(*context, kernel_name);
             if (kernel == nullptr) { result.error = "rocm-kernel"; return; }
             void* d_lhs = nullptr; void* d_rhs = nullptr; void* d_out = nullptr;
-            if (!alloc_and_copy_input(*context, "binary-lhs", d_lhs, lhs) ||
-                !alloc_and_copy_input(*context, "binary-rhs", d_rhs, rhs) ||
-                !ensure_buffer(*context, "binary-out", result.output.size() * sizeof(float), d_out)) { result.error = "rocm-memory"; return; }
+            if (can_split_dispatch(*context)) {
+                if (!alloc_and_copy_input_async(*context, "binary-lhs", d_lhs, lhs, context->copy_stream, 0u) ||
+                    !alloc_and_copy_input_async(*context, "binary-rhs", d_rhs, rhs, context->copy_stream, 1u) ||
+                    !ensure_buffer(*context, "binary-out", result.output.size() * sizeof(float), d_out)) {
+                    result.error = "rocm-memory";
+                    return;
+                }
+                args[0] = &d_lhs;
+                args[1] = &d_rhs;
+                args[2] = &d_out;
+                const unsigned int block_x = kNativeTileSize;
+                const unsigned int block_y = kNativeTileSize;
+                const unsigned int grid_x = grid_items_x == 0 ? 1u : (grid_items_x + block_x - 1u) / block_x;
+                const unsigned int grid_y = grid_items_y == 0 ? 1u : (grid_items_y + block_y - 1u) / block_y;
+                if (api().hip_event_record(context->copy_ready_event, context->copy_stream) != 0 ||
+                    api().hip_stream_wait_event(context->stream, context->copy_ready_event, 0u) != 0 ||
+                    api().hip_module_launch_kernel(kernel, grid_x, grid_y, 1, block_x, block_y, 1, 0u, context->stream, args.data(), nullptr) != 0 ||
+                    api().hip_event_record(context->compute_ready_event, context->stream) != 0 ||
+                    api().hip_stream_wait_event(context->copy_stream, context->compute_ready_event, 0u) != 0 ||
+                    api().hip_memcpy_dtoh_async(result.output.data(), d_out, result.output.size() * sizeof(float), context->copy_stream) != 0 ||
+                    api().hip_stream_synchronize(context->copy_stream) != 0) {
+                    result.error = "rocm-launch";
+                    return;
+                }
+                result.success = true;
+                result.used_host = false;
+                result.used_opencl = false;
+                return;
+            }
+            copy_in_us += measure_us([&]() {
+                if (!alloc_and_copy_input(*context, "binary-lhs", d_lhs, lhs) ||
+                    !alloc_and_copy_input(*context, "binary-rhs", d_rhs, rhs) ||
+                    !ensure_buffer(*context, "binary-out", result.output.size() * sizeof(float), d_out)) { result.error = "rocm-memory"; }
+            });
+            if (!result.error.empty()) { return; }
             args[0] = &d_lhs;
             args[1] = &d_rhs;
             args[2] = &d_out;
@@ -2077,9 +2725,22 @@ private:
             const unsigned int block_y = kNativeTileSize;
             const unsigned int grid_x = grid_items_x == 0 ? 1u : (grid_items_x + block_x - 1u) / block_x;
             const unsigned int grid_y = grid_items_y == 0 ? 1u : (grid_items_y + block_y - 1u) / block_y;
-            if (api().hip_module_launch_kernel(kernel, grid_x, grid_y, 1, block_x, block_y, 1, 0u, context->stream, args.data(), nullptr) != 0 || api().hip_stream_synchronize(context->stream) != 0 || api().hip_memcpy_dtoh(result.output.data(), d_out, result.output.size() * sizeof(float)) != 0) result.error = "rocm-launch";
-            else { result.success = true; result.used_host = false; result.used_opencl = false; }
+            compute_us += measure_us([&]() {
+                if (api().hip_module_launch_kernel(kernel, grid_x, grid_y, 1, block_x, block_y, 1, 0u, context->stream, args.data(), nullptr) != 0 ||
+                    api().hip_stream_synchronize(context->stream) != 0) {
+                    result.error = "rocm-launch";
+                }
+            });
+            if (!result.error.empty()) { return; }
+            copy_out_us += measure_us([&]() {
+                if (api().hip_memcpy_dtoh(result.output.data(), d_out, result.output.size() * sizeof(float)) != 0) {
+                    result.error = "rocm-launch";
+                }
+            });
+            if (result.error.empty()) { result.success = true; result.used_host = false; result.used_opencl = false; }
         });
+        result.copy_runtime_us = copy_in_us + copy_out_us;
+        result.compute_runtime_us = compute_us;
         return result;
     }
 
@@ -2088,11 +2749,41 @@ private:
         if (context == nullptr) return failure("rocm-context");
         BackendRunResult result;
         result.output.resize(lhs.size(), 0.0f);
+        double copy_in_us = 0.0;
+        double copy_out_us = 0.0;
+        double compute_us = 0.0;
         result.runtime_us = measure_us([&]() {
             std::scoped_lock lock(context->execution_mutex);
             auto kernel = get_kernel(*context, "elementwise_map");
             if (kernel == nullptr) { result.error = "rocm-kernel"; return; }
             void* d_lhs = nullptr; void* d_rhs = nullptr; void* d_out = nullptr;
+            if (can_split_dispatch(*context)) {
+                if (!alloc_and_copy_input_async(*context, "elementwise-lhs", d_lhs, lhs, context->copy_stream, 0u) ||
+                    !alloc_and_copy_input_async(*context, "elementwise-rhs", d_rhs, rhs, context->copy_stream, 1u) ||
+                    !ensure_buffer(*context, "elementwise-out", result.output.size() * sizeof(float), d_out)) {
+                    result.error = "rocm-memory";
+                    return;
+                }
+                unsigned int count = static_cast<unsigned int>(lhs.size());
+                int low = low_precision ? 1 : 0;
+                void* args[] = {&d_lhs, &d_rhs, &d_out, &count, &low};
+                const unsigned int block_x = kNativeReductionGroupSize;
+                const unsigned int grid_x = count == 0 ? 1u : (count + block_x - 1u) / block_x;
+                if (api().hip_event_record(context->copy_ready_event, context->copy_stream) != 0 ||
+                    api().hip_stream_wait_event(context->stream, context->copy_ready_event, 0u) != 0 ||
+                    api().hip_module_launch_kernel(kernel, grid_x, 1, 1, block_x, 1, 1, 0u, context->stream, args, nullptr) != 0 ||
+                    api().hip_event_record(context->compute_ready_event, context->stream) != 0 ||
+                    api().hip_stream_wait_event(context->copy_stream, context->compute_ready_event, 0u) != 0 ||
+                    api().hip_memcpy_dtoh_async(result.output.data(), d_out, result.output.size() * sizeof(float), context->copy_stream) != 0 ||
+                    api().hip_stream_synchronize(context->copy_stream) != 0) {
+                    result.error = "rocm-launch";
+                    return;
+                }
+                result.success = true;
+                result.used_host = false;
+                result.used_opencl = false;
+                return;
+            }
             if (!alloc_and_copy_input(*context, "elementwise-lhs", d_lhs, lhs) ||
                 !alloc_and_copy_input(*context, "elementwise-rhs", d_rhs, rhs) ||
                 !ensure_buffer(*context, "elementwise-out", result.output.size() * sizeof(float), d_out)) { result.error = "rocm-memory"; return; }
@@ -2101,6 +2792,8 @@ private:
             if (api().hip_module_launch_kernel(kernel, grid_x, 1, 1, block_x, 1, 1, 0u, context->stream, args, nullptr) != 0 || api().hip_stream_synchronize(context->stream) != 0 || api().hip_memcpy_dtoh(result.output.data(), d_out, result.output.size() * sizeof(float)) != 0) result.error = "rocm-launch";
             else { result.success = true; result.used_host = false; result.used_opencl = false; }
         });
+        result.copy_runtime_us = copy_in_us + copy_out_us;
+        result.compute_runtime_us = compute_us;
         return result;
     }
 
@@ -2108,6 +2801,9 @@ private:
         auto context = acquire_context(graph);
         if (context == nullptr) return failure("rocm-context");
         BackendRunResult result;
+        double copy_in_us = 0.0;
+        double copy_out_us = 0.0;
+        double compute_us = 0.0;
         result.runtime_us = measure_us([&]() {
             std::scoped_lock lock(context->execution_mutex);
             auto kernel = get_kernel(*context, "reduce_sum");
@@ -2117,12 +2813,41 @@ private:
             const auto groups = global / local;
             std::vector<float> partials(groups, 0.0f);
             void* d_in = nullptr; void* d_partial = nullptr;
+            if (can_split_dispatch(*context)) {
+                if (!alloc_and_copy_input_async(*context, "reduce-in", d_in, input, context->copy_stream, 0u) ||
+                    !ensure_buffer(*context, "reduce-partial", partials.size() * sizeof(float), d_partial)) {
+                    result.error = "rocm-memory";
+                    return;
+                }
+                unsigned int count = static_cast<unsigned int>(input.size());
+                int low = low_precision ? 1 : 0;
+                void* args[] = {&d_in, &d_partial, &count, &low};
+                if (api().hip_event_record(context->copy_ready_event, context->copy_stream) != 0 ||
+                    api().hip_stream_wait_event(context->stream, context->copy_ready_event, 0u) != 0 ||
+                    api().hip_module_launch_kernel(kernel, static_cast<unsigned int>(groups), 1, 1, local, 1, 1, static_cast<unsigned int>(local * sizeof(float)), context->stream, args, nullptr) != 0 ||
+                    api().hip_event_record(context->compute_ready_event, context->stream) != 0 ||
+                    api().hip_stream_wait_event(context->copy_stream, context->compute_ready_event, 0u) != 0 ||
+                    api().hip_memcpy_dtoh_async(partials.data(), d_partial, partials.size() * sizeof(float), context->copy_stream) != 0 ||
+                    api().hip_stream_synchronize(context->copy_stream) != 0) {
+                    result.error = "rocm-launch";
+                    return;
+                }
+                for (const auto value : partials) {
+                    result.scalar_output += value;
+                }
+                result.success = true;
+                result.used_host = false;
+                result.used_opencl = false;
+                return;
+            }
             if (!alloc_and_copy_input(*context, "reduce-in", d_in, input) ||
                 !ensure_buffer(*context, "reduce-partial", partials.size() * sizeof(float), d_partial)) { result.error = "rocm-memory"; return; }
             unsigned int count = static_cast<unsigned int>(input.size()); int low = low_precision ? 1 : 0; void* args[] = {&d_in, &d_partial, &count, &low};
             if (api().hip_module_launch_kernel(kernel, static_cast<unsigned int>(groups), 1, 1, local, 1, 1, static_cast<unsigned int>(local * sizeof(float)), context->stream, args, nullptr) != 0 || api().hip_stream_synchronize(context->stream) != 0 || api().hip_memcpy_dtoh(partials.data(), d_partial, partials.size() * sizeof(float)) != 0) result.error = "rocm-launch";
             else { for (const auto value : partials) result.scalar_output += value; result.success = true; result.used_host = false; result.used_opencl = false; }
         });
+        result.copy_runtime_us = copy_in_us + copy_out_us;
+        result.compute_runtime_us = compute_us;
         return result;
     }
 

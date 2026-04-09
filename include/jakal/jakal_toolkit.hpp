@@ -16,6 +16,8 @@ struct JakalToolkitVariant {
     std::string rationale;
 };
 
+[[nodiscard]] bool jakal_variant_executes_directly(const JakalToolkitVariant& variant);
+
 struct JakalToolkitIndexEntry {
     std::string device_uid;
     std::string graph_fingerprint;

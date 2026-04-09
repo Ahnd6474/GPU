@@ -92,6 +92,10 @@ public:
 
 [[nodiscard]] std::string to_string(JakalVendorFamily vendor);
 [[nodiscard]] std::string to_string(JakalBackendKind backend);
+[[nodiscard]] bool backend_kind_supports_direct_execution(JakalBackendKind backend);
+[[nodiscard]] bool backend_kind_supports_operation(
+    JakalBackendKind backend,
+    OperationClass op_class);
 [[nodiscard]] std::vector<std::unique_ptr<IJakalL0Adapter>> make_default_jakal_l0_adapters();
 
 }  // namespace jakal

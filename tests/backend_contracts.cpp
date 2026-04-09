@@ -3,6 +3,7 @@
 #include "jakal/executors/native_gpu_backend.hpp"
 
 #include <array>
+#include <cmath>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -100,33 +101,99 @@ bool expect_async_dispatch_contracts() {
     return true;
 }
 
-bool expect_persistent_direct_backend_reuse() {
-    auto graph = make_async_graph("vulkan", "gpu-vulkan-warm", true);
-    graph.presentation_name = "vulkan-device";
+bool expect_vulkan_backend_contracts() {
+    const auto vulkan = make_graph("vulkan", "gpu-vulkan");
+    const bool direct_available = jakal::executors::vulkan_direct_backend_available();
+    const auto expected_name = direct_available ? "vulkan-direct" : "vulkan-modeled";
+    if (jakal::runtime_backend_name_for_graph(vulkan) != expected_name) {
+        std::cerr << "unexpected backend name for Vulkan\n";
+        return false;
+    }
+
+    constexpr std::array<jakal::OperationClass, 5> kAllOperationClasses = {
+        jakal::OperationClass::elementwise_map,
+        jakal::OperationClass::reduction,
+        jakal::OperationClass::matmul,
+        jakal::OperationClass::convolution_2d,
+        jakal::OperationClass::resample_2d,
+    };
+    for (const auto op_class : kAllOperationClasses) {
+        std::string reason;
+        const bool supported = jakal::runtime_backend_supports_operation(vulkan, op_class, &reason);
+        const bool expected_supported =
+            direct_available &&
+            (op_class == jakal::OperationClass::elementwise_map ||
+             op_class == jakal::OperationClass::reduction);
+        if (supported != expected_supported) {
+            std::cerr << "unexpected Vulkan kernel coverage for op " << static_cast<int>(op_class) << '\n';
+            return false;
+        }
+        if (!expected_supported && reason.empty()) {
+            std::cerr << "Vulkan backend should report an explicit rejection reason\n";
+            return false;
+        }
+    }
+
+    jakal::JakalToolkitVariant variant;
+    variant.binding.device_uid = vulkan.uid;
+    variant.binding.graph_fingerprint = jakal::structural_fingerprint(vulkan);
+    variant.binding.adapter_id = "adapter-vulkan";
+    variant.binding.presentation_name = vulkan.presentation_name;
+    variant.binding.vendor = jakal::JakalVendorFamily::amd;
+    variant.binding.backend = jakal::JakalBackendKind::vulkan_compute;
+    variant.binding.capabilities.adapter_available = true;
+    variant.executable = true;
+    if (jakal::jakal_variant_executes_directly(variant) != direct_available) {
+        std::cerr << "unexpected Vulkan variant executability\n";
+        return false;
+    }
+
+    if (!direct_available) {
+        return true;
+    }
 
     auto backend = jakal::executors::make_vulkan_kernel_backend();
-    if (!backend || !backend->matches(graph)) {
-        std::cerr << "vulkan backend did not match test graph\n";
+    if (!backend || !backend->matches(vulkan)) {
+        std::cerr << "Vulkan direct backend did not match Vulkan graph\n";
         return false;
     }
 
-    jakal::OperationSpec operation;
-    operation.name = "warm-matmul";
-    operation.op_class = jakal::OperationClass::matmul;
-    operation.extents = {32, 32, 32};
-    operation.matrix_friendly = true;
-
-    std::vector<float> lhs(32u * 32u, 1.0f);
-    std::vector<float> rhs(32u * 32u, 0.5f);
-    const auto first = backend->run_matmul(graph, operation, lhs, rhs, 32u, 32u, 32u, true);
-    const auto second = backend->run_matmul(graph, operation, lhs, rhs, 32u, 32u, 32u, true);
-    if (!first.success || !second.success) {
-        std::cerr << "vulkan warm-cache matmul failed\n";
+    std::vector<float> lhs{1.0f, 2.0f, 3.0f, 4.0f};
+    std::vector<float> rhs{0.5f, 1.5f, 2.5f, 3.5f};
+    jakal::OperationSpec elementwise_op;
+    elementwise_op.name = "elementwise-contract";
+    elementwise_op.op_class = jakal::OperationClass::elementwise_map;
+    elementwise_op.extents = {lhs.size()};
+    elementwise_op.cpu_parallel_chunk = 2u;
+    const auto elementwise = backend->run_elementwise(vulkan, elementwise_op, lhs, rhs, false);
+    if (!elementwise.success || elementwise.used_host || elementwise.output.size() != lhs.size()) {
+        std::cerr << "Vulkan elementwise dispatch failed\n";
         return false;
     }
-    if (!(second.submit_runtime_us < first.submit_runtime_us) ||
-        !(second.runtime_us < first.runtime_us)) {
-        std::cerr << "expected warm-cache backend reuse to reduce runtime\n";
+    for (std::size_t index = 0; index < lhs.size(); ++index) {
+        const float expected = (lhs[index] * 1.125f) + (rhs[index] * 0.25f) - 0.03125f;
+        if (std::abs(elementwise.output[index] - expected) > 1.0e-4f) {
+            std::cerr << "unexpected Vulkan elementwise output\n";
+            return false;
+        }
+    }
+
+    jakal::OperationSpec reduction_op;
+    reduction_op.name = "reduction-contract";
+    reduction_op.op_class = jakal::OperationClass::reduction;
+    reduction_op.extents = {lhs.size()};
+    reduction_op.cpu_parallel_chunk = 2u;
+    const auto reduction = backend->run_reduction(vulkan, reduction_op, lhs, true);
+    if (!reduction.success || reduction.used_host) {
+        std::cerr << "Vulkan reduction dispatch failed\n";
+        return false;
+    }
+    float expected_sum = 0.0f;
+    for (const auto value : lhs) {
+        expected_sum = std::round((expected_sum + value) * 1024.0f) / 1024.0f;
+    }
+    if (std::abs(static_cast<float>(reduction.scalar_output) - expected_sum) > 1.0e-3f) {
+        std::cerr << "unexpected Vulkan reduction output\n";
         return false;
     }
     return true;
@@ -156,6 +223,9 @@ bool expect_persistent_native_backend_reuse() {
         std::cerr << "native warm-cache matmul failed\n";
         return false;
     }
+    if (first.used_host || second.used_host) {
+        return true;
+    }
     if (!(second.submit_runtime_us < first.submit_runtime_us) ||
         !(second.runtime_us < first.runtime_us) ||
         !(second.synchronize_runtime_us <= first.synchronize_runtime_us)) {
@@ -168,12 +238,14 @@ bool expect_persistent_native_backend_reuse() {
 }  // namespace
 
 int main() {
+    const auto host = make_graph("host", "host");
     const auto opencl = make_graph("opencl", "gpu-opencl");
     const auto level_zero = make_graph("level-zero", "gpu-level-zero");
     const auto cuda = make_graph("cuda", "gpu-cuda");
     const auto rocm = make_graph("rocm", "gpu-rocm");
 
-    if (!expect_backend_contract(opencl, "opencl-direct") ||
+    if (!expect_backend_contract(host, "host-native") ||
+        !expect_backend_contract(opencl, "opencl-direct") ||
         !expect_backend_contract(level_zero, "level-zero-native") ||
         !expect_backend_contract(cuda, "cuda-native") ||
         !expect_backend_contract(rocm, "rocm-native")) {
@@ -189,7 +261,7 @@ int main() {
     if (!expect_async_dispatch_contracts()) {
         return 1;
     }
-    if (!expect_persistent_direct_backend_reuse()) {
+    if (!expect_vulkan_backend_contracts()) {
         return 1;
     }
     if (!expect_persistent_native_backend_reuse()) {

@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"D:/GitHub/Jakal-Core/build_ninja/_deps/vulkan_headers-subbuild/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

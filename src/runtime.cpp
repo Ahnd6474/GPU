@@ -1,16 +1,26 @@
 #include "jakal/runtime.hpp"
+#include "jakal/executors/direct_backends.hpp"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cctype>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
+#include <functional>
 #include <fstream>
+#include <limits>
+#include <memory>
 #include <numeric>
 #include <optional>
+#include <mutex>
+#include <shared_mutex>
 #include <set>
 #include <sstream>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -74,7 +84,90 @@ struct TelemetryBudgetSignal {
     double average_transfer_overlap_ratio = 0.0;
     double average_copy_share = 0.0;
     double budget_exhaustion_ratio = 0.0;
+    double average_queue_separation_ratio = 0.0;
 };
+
+struct UnifiedRuntimeSignal {
+    TelemetryBudgetSignal signal;
+    std::string source = "telemetry";
+};
+
+struct TelemetryBudgetCacheEntry {
+    std::string kind;
+    std::string phase;
+    std::string shape_bucket;
+    TelemetryBudgetSignal signal;
+    std::uint32_t last_optimizer_budget_ms = 0u;
+    std::uint64_t last_epoch = 0u;
+};
+
+struct TelemetryBudgetCacheState {
+    std::unordered_map<std::string, TelemetryBudgetCacheEntry> entries;
+    std::uint32_t delta_rows = 0u;
+    std::chrono::steady_clock::time_point last_compaction = std::chrono::steady_clock::now();
+    bool loaded = false;
+};
+
+class AsyncFileWriter final {
+public:
+    AsyncFileWriter()
+        : worker_([this]() { run(); }) {}
+
+    ~AsyncFileWriter() {
+        {
+            std::scoped_lock lock(mutex_);
+            stopping_ = true;
+        }
+        condition_.notify_all();
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+    AsyncFileWriter(const AsyncFileWriter&) = delete;
+    AsyncFileWriter& operator=(const AsyncFileWriter&) = delete;
+
+    void enqueue(std::function<void()> task) {
+        {
+            std::scoped_lock lock(mutex_);
+            tasks_.push_back(std::move(task));
+        }
+        condition_.notify_one();
+    }
+
+private:
+    void run() {
+        while (true) {
+            std::function<void()> task;
+            {
+                std::unique_lock lock(mutex_);
+                condition_.wait(lock, [&]() { return stopping_ || !tasks_.empty(); });
+                if (stopping_ && tasks_.empty()) {
+                    break;
+                }
+                task = std::move(tasks_.front());
+                tasks_.pop_front();
+            }
+            if (task) {
+                task();
+            }
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    std::deque<std::function<void()>> tasks_;
+    std::thread worker_;
+    bool stopping_ = false;
+};
+
+AsyncFileWriter& telemetry_writer() {
+    static AsyncFileWriter writer;
+    return writer;
+}
+
+std::shared_mutex g_telemetry_budget_cache_mutex;
+std::unordered_map<std::string, TelemetryBudgetCacheState> g_telemetry_budget_cache;
 
 bool is_host_graph(const HardwareGraph& graph) {
     return graph.probe == "host";
@@ -112,6 +205,41 @@ std::filesystem::path default_runtime_telemetry_path() {
     }
 }
 
+std::filesystem::path telemetry_budget_cache_path(const std::filesystem::path& telemetry_path) {
+    if (telemetry_path.empty()) {
+        return {};
+    }
+    auto sidecar_path = telemetry_path;
+    sidecar_path += ".budget.tsv";
+    return sidecar_path;
+}
+
+std::filesystem::path telemetry_budget_delta_path(const std::filesystem::path& telemetry_path) {
+    if (telemetry_path.empty()) {
+        return {};
+    }
+    auto sidecar_path = telemetry_path;
+    sidecar_path += ".budget.delta.tsv";
+    return sidecar_path;
+}
+
+std::filesystem::path runtime_graph_family_cache_path(const std::filesystem::path& execution_cache_path) {
+    if (execution_cache_path.empty()) {
+        return {};
+    }
+    auto family_path = execution_cache_path;
+    family_path += ".perf.family";
+    return family_path;
+}
+
+std::size_t header_index_or(
+    const std::unordered_map<std::string, std::size_t>& header_index,
+    const std::string& key,
+    const std::size_t fallback = std::numeric_limits<std::size_t>::max());
+TelemetryBudgetSignal load_runtime_budget_signal(
+    const std::filesystem::path& telemetry_path,
+    const WorkloadSpec& workload);
+
 std::vector<std::string> split_tab_fields(const std::string& line) {
     std::vector<std::string> fields;
     std::stringstream stream(line);
@@ -138,10 +266,433 @@ std::uint32_t parse_uint32_or(const std::string& value, const std::uint32_t fall
     }
 }
 
+std::uint64_t parse_uint64_or(const std::string& value, const std::uint64_t fallback = 0u) {
+    try {
+        return static_cast<std::uint64_t>(std::stoull(value));
+    } catch (const std::exception&) {
+        return fallback;
+    }
+}
+
+void merge_budget_signal_sample(
+    TelemetryBudgetSignal& signal,
+    const double speedup_vs_reference,
+    const double transfer_overlap_ratio,
+    const double copy_share,
+    const double budget_pressure,
+    const double queue_separation_ratio,
+    const double sample_weight = 1.0) {
+    const auto weight = std::max(1.0, sample_weight);
+    const auto next_samples = signal.samples + static_cast<std::size_t>(std::llround(weight));
+    const auto update_average = [&](double& average, const double sample) {
+        average += (sample - average) * (weight / static_cast<double>(next_samples));
+    };
+    update_average(signal.average_speedup_vs_reference, speedup_vs_reference);
+    update_average(signal.average_transfer_overlap_ratio, transfer_overlap_ratio);
+    update_average(signal.average_copy_share, copy_share);
+    update_average(signal.budget_exhaustion_ratio, budget_pressure);
+    update_average(signal.average_queue_separation_ratio, queue_separation_ratio);
+    signal.samples = next_samples;
+}
+
+std::unordered_map<std::string, std::size_t> build_header_index(const std::string& header_line) {
+    std::string normalized = header_line;
+    if (!normalized.empty() && normalized.front() == '#') {
+        normalized.erase(normalized.begin());
+        if (!normalized.empty() && normalized.front() == ' ') {
+            normalized.erase(normalized.begin());
+        }
+    }
+    const auto fields = split_tab_fields(normalized);
+    std::unordered_map<std::string, std::size_t> header_index;
+    for (std::size_t index = 0; index < fields.size(); ++index) {
+        header_index.emplace(fields[index], index);
+    }
+    return header_index;
+}
+
+std::string field_or_empty(const std::vector<std::string>& fields, const std::size_t index) {
+    return index < fields.size() ? fields[index] : std::string();
+}
+
+std::string telemetry_budget_entry_key(
+    const std::string& kind,
+    const std::string& phase,
+    const std::string& shape_bucket) {
+    return kind + "|" + phase + "|" + shape_bucket;
+}
+
+void load_budget_snapshot_entries(
+    const std::filesystem::path& path,
+    std::unordered_map<std::string, TelemetryBudgetCacheEntry>& entries) {
+    if (path.empty() || !std::filesystem::exists(path)) {
+        return;
+    }
+    std::ifstream input(path);
+    std::string header_line;
+    if (!input.is_open() || !std::getline(input, header_line)) {
+        return;
+    }
+    const auto header_index = build_header_index(header_line);
+    const auto kind_index = header_index_or(header_index, "kind");
+    const auto phase_index = header_index_or(header_index, "phase");
+    const auto bucket_index = header_index_or(header_index, "shape_bucket");
+    const auto samples_index = header_index_or(header_index, "samples");
+    const auto speedup_index = header_index_or(header_index, "average_speedup_vs_reference");
+    const auto overlap_index = header_index_or(header_index, "average_transfer_overlap_ratio");
+    const auto copy_share_index = header_index_or(header_index, "average_copy_share");
+    const auto exhausted_index = header_index_or(header_index, "budget_exhaustion_ratio");
+    const auto queue_index = header_index_or(header_index, "average_queue_separation_ratio");
+    const auto budget_index = header_index_or(header_index, "last_optimizer_budget_ms");
+    const auto epoch_index = header_index_or(header_index, "last_epoch");
+    std::string line;
+    while (std::getline(input, line)) {
+        const auto fields = split_tab_fields(line);
+        TelemetryBudgetCacheEntry entry;
+        entry.kind = field_or_empty(fields, kind_index);
+        entry.phase = field_or_empty(fields, phase_index);
+        entry.shape_bucket = field_or_empty(fields, bucket_index);
+        entry.signal.samples = parse_uint32_or(field_or_empty(fields, samples_index), 0u);
+        entry.signal.average_speedup_vs_reference = parse_double_or(field_or_empty(fields, speedup_index), 0.0);
+        entry.signal.average_transfer_overlap_ratio = parse_double_or(field_or_empty(fields, overlap_index), 0.0);
+        entry.signal.average_copy_share = parse_double_or(field_or_empty(fields, copy_share_index), 0.0);
+        entry.signal.budget_exhaustion_ratio = parse_double_or(field_or_empty(fields, exhausted_index), 0.0);
+        entry.signal.average_queue_separation_ratio = parse_double_or(field_or_empty(fields, queue_index), 0.0);
+        entry.last_optimizer_budget_ms = parse_uint32_or(field_or_empty(fields, budget_index), 0u);
+        entry.last_epoch = parse_uint64_or(field_or_empty(fields, epoch_index), 0u);
+        if (!entry.kind.empty() && !entry.phase.empty() && !entry.shape_bucket.empty()) {
+            entries[telemetry_budget_entry_key(entry.kind, entry.phase, entry.shape_bucket)] = std::move(entry);
+        }
+    }
+}
+
+std::uint32_t load_budget_delta_entries(
+    const std::filesystem::path& path,
+    std::unordered_map<std::string, TelemetryBudgetCacheEntry>& entries) {
+    if (path.empty() || !std::filesystem::exists(path)) {
+        return 0u;
+    }
+    std::ifstream input(path);
+    std::string header_line;
+    if (!input.is_open() || !std::getline(input, header_line)) {
+        return 0u;
+    }
+    const auto header_index = build_header_index(header_line);
+    const auto epoch_index = header_index_or(header_index, "epoch");
+    const auto kind_index = header_index_or(header_index, "kind");
+    const auto phase_index = header_index_or(header_index, "phase");
+    const auto bucket_index = header_index_or(header_index, "shape_bucket");
+    const auto speedup_index = header_index_or(header_index, "speedup_vs_reference");
+    const auto overlap_index = header_index_or(header_index, "transfer_overlap_ratio");
+    const auto copy_share_index = header_index_or(header_index, "copy_share");
+    const auto exhausted_index = header_index_or(header_index, "budget_pressure");
+    const auto queue_index = header_index_or(header_index, "queue_separation_ratio");
+    const auto budget_index = header_index_or(header_index, "optimizer_budget_ms");
+    std::uint32_t rows = 0u;
+    std::string line;
+    while (std::getline(input, line)) {
+        const auto fields = split_tab_fields(line);
+        const auto kind = field_or_empty(fields, kind_index);
+        const auto phase = field_or_empty(fields, phase_index);
+        const auto bucket = field_or_empty(fields, bucket_index);
+        if (kind.empty() || phase.empty() || bucket.empty()) {
+            continue;
+        }
+        auto& entry = entries[telemetry_budget_entry_key(kind, phase, bucket)];
+        entry.kind = kind;
+        entry.phase = phase;
+        entry.shape_bucket = bucket;
+        merge_budget_signal_sample(
+            entry.signal,
+            parse_double_or(field_or_empty(fields, speedup_index), 0.0),
+            parse_double_or(field_or_empty(fields, overlap_index), 0.0),
+            parse_double_or(field_or_empty(fields, copy_share_index), 0.0),
+            parse_double_or(field_or_empty(fields, exhausted_index), 0.0),
+            parse_double_or(field_or_empty(fields, queue_index), 0.0));
+        entry.last_optimizer_budget_ms = parse_uint32_or(field_or_empty(fields, budget_index), 0u);
+        entry.last_epoch = parse_uint64_or(field_or_empty(fields, epoch_index), 0u);
+        ++rows;
+    }
+    return rows;
+}
+
+TelemetryBudgetCacheState& ensure_budget_cache_state_loaded(const std::filesystem::path& telemetry_path) {
+    const auto key = telemetry_path.string();
+    auto& state = g_telemetry_budget_cache[key];
+    if (state.loaded) {
+        return state;
+    }
+    state.entries.clear();
+    load_budget_snapshot_entries(telemetry_budget_cache_path(telemetry_path), state.entries);
+    state.delta_rows = load_budget_delta_entries(telemetry_budget_delta_path(telemetry_path), state.entries);
+    state.last_compaction = std::chrono::steady_clock::now();
+    state.loaded = true;
+    return state;
+}
+
+void persist_budget_cache_snapshot(
+    const std::filesystem::path& telemetry_path,
+    TelemetryBudgetCacheState& state) {
+    const auto cache_path = telemetry_budget_cache_path(telemetry_path);
+    if (cache_path.empty()) {
+        return;
+    }
+    const auto parent = cache_path.parent_path();
+    if (!parent.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(parent, ec);
+    }
+    std::ofstream output(cache_path, std::ios::trunc);
+    if (!output.is_open()) {
+        return;
+    }
+    output << "# kind\tphase\tshape_bucket\tsamples\taverage_speedup_vs_reference\taverage_transfer_overlap_ratio\taverage_copy_share\tbudget_exhaustion_ratio\taverage_queue_separation_ratio\tlast_optimizer_budget_ms\tlast_epoch\n";
+    for (const auto& [key, entry] : state.entries) {
+        (void)key;
+        output << entry.kind << '\t'
+               << entry.phase << '\t'
+               << entry.shape_bucket << '\t'
+               << entry.signal.samples << '\t'
+               << entry.signal.average_speedup_vs_reference << '\t'
+               << entry.signal.average_transfer_overlap_ratio << '\t'
+               << entry.signal.average_copy_share << '\t'
+               << entry.signal.budget_exhaustion_ratio << '\t'
+               << entry.signal.average_queue_separation_ratio << '\t'
+               << entry.last_optimizer_budget_ms << '\t'
+               << entry.last_epoch << '\n';
+    }
+    output.close();
+    std::error_code ec;
+    std::filesystem::remove(telemetry_budget_delta_path(telemetry_path), ec);
+    state.delta_rows = 0u;
+    state.last_compaction = std::chrono::steady_clock::now();
+}
+
+void append_tsv_line(
+    const std::filesystem::path& path,
+    const std::string& header,
+    const std::string& line) {
+    if (path.empty()) {
+        return;
+    }
+    const auto parent = path.parent_path();
+    if (!parent.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(parent, ec);
+    }
+    const bool write_header = !std::filesystem::exists(path);
+    std::ofstream output(path, std::ios::app);
+    if (!output.is_open()) {
+        return;
+    }
+    if (write_header && !header.empty()) {
+        output << header;
+    }
+    output << line;
+}
+
+void persist_budget_cache_snapshot_copy(
+    const std::filesystem::path& telemetry_path,
+    const std::unordered_map<std::string, TelemetryBudgetCacheEntry>& entries) {
+    const auto cache_path = telemetry_budget_cache_path(telemetry_path);
+    if (cache_path.empty()) {
+        return;
+    }
+    const auto parent = cache_path.parent_path();
+    if (!parent.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(parent, ec);
+    }
+    std::ofstream output(cache_path, std::ios::trunc);
+    if (!output.is_open()) {
+        return;
+    }
+    output << "# kind\tphase\tshape_bucket\tsamples\taverage_speedup_vs_reference\taverage_transfer_overlap_ratio\taverage_copy_share\tbudget_exhaustion_ratio\taverage_queue_separation_ratio\tlast_optimizer_budget_ms\tlast_epoch\n";
+    for (const auto& [key, entry] : entries) {
+        (void)key;
+        output << entry.kind << '\t'
+               << entry.phase << '\t'
+               << entry.shape_bucket << '\t'
+               << entry.signal.samples << '\t'
+               << entry.signal.average_speedup_vs_reference << '\t'
+               << entry.signal.average_transfer_overlap_ratio << '\t'
+               << entry.signal.average_copy_share << '\t'
+               << entry.signal.budget_exhaustion_ratio << '\t'
+               << entry.signal.average_queue_separation_ratio << '\t'
+               << entry.last_optimizer_budget_ms << '\t'
+               << entry.last_epoch << '\n';
+    }
+    output.close();
+    std::error_code ec;
+    std::filesystem::remove(telemetry_budget_delta_path(telemetry_path), ec);
+}
+
+std::string runtime_shape_bucket_for(const OperationSpec& operation) {
+    std::ostringstream stream;
+    stream << to_string(operation.op_class);
+    for (const auto extent : operation.extents) {
+        std::uint64_t bucket = 1u;
+        while (bucket < extent) {
+            bucket <<= 1u;
+        }
+        stream << ':' << bucket;
+    }
+    const auto bytes_bucket = std::max<std::uint64_t>(1ull, operation.input_bytes / (4ull * 1024ull * 1024ull));
+    stream << "|b" << bytes_bucket
+           << "|cpuv:" << operation.cpu_vectorized
+           << "|gput:" << operation.gpu_tensorized
+           << "|cpu.in:" << operation.cpu_input_layout
+           << "|cpu.w:" << operation.cpu_weight_layout
+           << "|cpu.out:" << operation.cpu_output_layout
+           << "|gpu.in:" << operation.gpu_input_layout
+           << "|gpu.w:" << operation.gpu_weight_layout
+           << "|gpu.out:" << operation.gpu_output_layout
+           << "|cpu.pack:" << operation.cpu_pack_weights
+           << "|gpu.pack:" << operation.gpu_pack_weights
+           << "|cpu.preT:" << operation.cpu_pretranspose_rhs
+           << "|gpu.preT:" << operation.gpu_pretranspose_rhs
+           << "|cpu.u" << std::max(operation.cpu_micro_kernel_unroll, 1u)
+           << "|cpu.tm" << std::max(operation.cpu_tile_m, 1u)
+           << "|cpu.tn" << std::max(operation.cpu_tile_n, 1u)
+           << "|cpu.tk" << std::max(operation.cpu_tile_k, 1u)
+           << "|cpu.chunk" << std::max(operation.cpu_parallel_chunk, 1u)
+           << "|gpu.u" << std::max(operation.gpu_micro_kernel_unroll, 1u);
+    for (const auto& fused : operation.fused_operation_names) {
+        stream << "|f:" << fused;
+    }
+    return stream.str();
+}
+
+TelemetryBudgetSignal load_graph_family_budget_signal(
+    const std::filesystem::path& execution_cache_path,
+    const WorkloadGraph* workload_graph) {
+    TelemetryBudgetSignal signal;
+    if (workload_graph == nullptr || workload_graph->operations.empty()) {
+        return signal;
+    }
+
+    const auto family_path = runtime_graph_family_cache_path(execution_cache_path);
+    if (family_path.empty() || !std::filesystem::exists(family_path)) {
+        return signal;
+    }
+
+    std::unordered_set<std::string> target_buckets;
+    for (const auto& operation : workload_graph->operations) {
+        target_buckets.insert(runtime_shape_bucket_for(operation));
+    }
+
+    std::ifstream input(family_path);
+    if (!input.is_open()) {
+        return signal;
+    }
+
+    std::string header_line;
+    if (!std::getline(input, header_line)) {
+        return signal;
+    }
+    const auto header_index = build_header_index(header_line);
+    const auto bucket_index =
+        header_index_or(header_index, "shape_bucket", std::numeric_limits<std::size_t>::max());
+    const auto observations_index =
+        header_index_or(header_index, "observations", std::numeric_limits<std::size_t>::max());
+    const auto speedup_index =
+        header_index_or(header_index, "avg_reward", std::numeric_limits<std::size_t>::max());
+    const auto overlap_index =
+        header_index_or(header_index, "avg_transfer_overlap_ratio", std::numeric_limits<std::size_t>::max());
+    const auto copy_share_index =
+        header_index_or(header_index, "avg_copy_share", std::numeric_limits<std::size_t>::max());
+    const auto budget_index =
+        header_index_or(header_index, "avg_budget_pressure", std::numeric_limits<std::size_t>::max());
+    const auto queue_index =
+        header_index_or(header_index, "avg_queue_separation_ratio", std::numeric_limits<std::size_t>::max());
+    if (bucket_index == std::numeric_limits<std::size_t>::max() ||
+        observations_index == std::numeric_limits<std::size_t>::max()) {
+        return signal;
+    }
+
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty() || line.front() == '#') {
+            continue;
+        }
+        const auto fields = split_tab_fields(line);
+        const auto bucket = field_or_empty(fields, bucket_index);
+        if (target_buckets.find(bucket) == target_buckets.end()) {
+            continue;
+        }
+        const auto observations = parse_uint32_or(field_or_empty(fields, observations_index), 0u);
+        if (observations == 0u) {
+            continue;
+        }
+        const double reward = parse_double_or(field_or_empty(fields, speedup_index), 0.0);
+        const double implied_speedup = std::clamp(std::exp(reward), 0.25, 4.0);
+        merge_budget_signal_sample(
+            signal,
+            implied_speedup,
+            parse_double_or(field_or_empty(fields, overlap_index), 0.0),
+            parse_double_or(field_or_empty(fields, copy_share_index), 0.0),
+            parse_double_or(field_or_empty(fields, budget_index), 0.0),
+            parse_double_or(field_or_empty(fields, queue_index), 0.0),
+            static_cast<double>(observations));
+    }
+
+    return signal;
+}
+
+void seed_budget_cache_from_signal(
+    const std::filesystem::path& telemetry_path,
+    const WorkloadSpec& workload,
+    const TelemetryBudgetSignal& signal) {
+    if (telemetry_path.empty() || signal.samples == 0u) {
+        return;
+    }
+    std::unique_lock lock(g_telemetry_budget_cache_mutex);
+    auto& state = ensure_budget_cache_state_loaded(telemetry_path);
+    const auto key = telemetry_budget_entry_key(
+        to_string(workload.kind),
+        to_string(canonical_workload_phase(workload)),
+        canonical_workload_shape_bucket(workload));
+    auto& entry = state.entries[key];
+    if (entry.signal.samples >= signal.samples) {
+        return;
+    }
+    entry.kind = to_string(workload.kind);
+    entry.phase = to_string(canonical_workload_phase(workload));
+    entry.shape_bucket = canonical_workload_shape_bucket(workload);
+    entry.signal = signal;
+}
+
+UnifiedRuntimeSignal load_unified_runtime_signal(
+    const std::filesystem::path& telemetry_path,
+    const std::filesystem::path& execution_cache_path,
+    const WorkloadSpec& workload,
+    const WorkloadGraph* workload_graph) {
+    UnifiedRuntimeSignal unified;
+    unified.signal = load_runtime_budget_signal(telemetry_path, workload);
+    const auto family_signal = load_graph_family_budget_signal(execution_cache_path, workload_graph);
+    if (unified.signal.samples == 0u && family_signal.samples > 0u) {
+        unified.signal = family_signal;
+        unified.source = "graph-family";
+        seed_budget_cache_from_signal(telemetry_path, workload, family_signal);
+    } else if (unified.signal.samples > 0u && family_signal.samples > 0u) {
+        merge_budget_signal_sample(
+            unified.signal,
+            family_signal.average_speedup_vs_reference,
+            family_signal.average_transfer_overlap_ratio,
+            family_signal.average_copy_share,
+            family_signal.budget_exhaustion_ratio,
+            family_signal.average_queue_separation_ratio,
+            static_cast<double>(family_signal.samples));
+        unified.source = "telemetry+family";
+        seed_budget_cache_from_signal(telemetry_path, workload, unified.signal);
+    }
+    return unified;
+}
+
 std::size_t header_index_or(
     const std::unordered_map<std::string, std::size_t>& header_index,
     const std::string& key,
-    const std::size_t fallback = std::numeric_limits<std::size_t>::max()) {
+    const std::size_t fallback) {
     if (const auto it = header_index.find(key); it != header_index.end()) {
         return it->second;
     }
@@ -152,6 +703,31 @@ TelemetryBudgetSignal load_runtime_budget_signal(
     const std::filesystem::path& telemetry_path,
     const WorkloadSpec& workload) {
     TelemetryBudgetSignal signal;
+    const auto expected_kind = to_string(workload.kind);
+    const auto expected_phase = to_string(canonical_workload_phase(workload));
+    const auto expected_bucket = canonical_workload_shape_bucket(workload);
+
+    if (!telemetry_path.empty()) {
+        const auto cache_key = telemetry_path.string();
+        {
+            std::shared_lock lock(g_telemetry_budget_cache_mutex);
+            const auto state_it = g_telemetry_budget_cache.find(cache_key);
+            if (state_it != g_telemetry_budget_cache.end() && state_it->second.loaded) {
+                const auto entry_it = state_it->second.entries.find(
+                    telemetry_budget_entry_key(expected_kind, expected_phase, expected_bucket));
+                if (entry_it != state_it->second.entries.end()) {
+                    return entry_it->second.signal;
+                }
+            }
+        }
+        std::unique_lock lock(g_telemetry_budget_cache_mutex);
+        auto& state = ensure_budget_cache_state_loaded(telemetry_path);
+        const auto it = state.entries.find(telemetry_budget_entry_key(expected_kind, expected_phase, expected_bucket));
+        if (it != state.entries.end()) {
+            return it->second.signal;
+        }
+    }
+
     if (telemetry_path.empty() || !std::filesystem::exists(telemetry_path)) {
         return signal;
     }
@@ -194,9 +770,6 @@ TelemetryBudgetSignal load_runtime_budget_signal(
         return signal;
     }
 
-    const auto expected_kind = to_string(workload.kind);
-    const auto expected_phase = to_string(canonical_workload_phase(workload));
-    const auto expected_bucket = canonical_workload_shape_bucket(workload);
     std::string line;
     while (std::getline(input, line)) {
         const auto fields = split_tab_fields(line);
@@ -213,20 +786,107 @@ TelemetryBudgetSignal load_runtime_budget_signal(
         const double copy_runtime_us = parse_double_or(field_at(copy_index), 0.0);
         const double compute_runtime_us = parse_double_or(field_at(compute_index), 0.0);
         const double total_copy_compute = std::max(copy_runtime_us + compute_runtime_us, 1.0);
-        ++signal.samples;
-        const double sample_count = static_cast<double>(signal.samples);
-        signal.average_speedup_vs_reference +=
-            (parse_double_or(field_at(speedup_index), 0.0) - signal.average_speedup_vs_reference) / sample_count;
-        signal.average_transfer_overlap_ratio +=
-            (parse_double_or(field_at(overlap_index), 0.0) - signal.average_transfer_overlap_ratio) / sample_count;
-        signal.average_copy_share += ((copy_runtime_us / total_copy_compute) - signal.average_copy_share) / sample_count;
-        signal.budget_exhaustion_ratio +=
-            ((parse_uint32_or(field_at(exhausted_index), 0u) > 0u ? 1.0 : 0.0) - signal.budget_exhaustion_ratio) /
-            sample_count;
+        merge_budget_signal_sample(
+            signal,
+            parse_double_or(field_at(speedup_index), 0.0),
+            parse_double_or(field_at(overlap_index), 0.0),
+            copy_runtime_us / total_copy_compute,
+            parse_uint32_or(field_at(exhausted_index), 0u) > 0u ? 1.0 : 0.0,
+            parse_double_or(field_at(header_index_or(header_index, "copy_overlap_ratio")), 0.0));
         (void)budget_index;
     }
 
     return signal;
+}
+
+void update_runtime_budget_cache(
+    const std::filesystem::path& telemetry_path,
+    const std::uint64_t epoch,
+    const WorkloadSpec& workload,
+    const ManagedExecutionReport& report) {
+    if (telemetry_path.empty() || !report.executed) {
+        return;
+    }
+
+    const auto delta_path = telemetry_budget_delta_path(telemetry_path);
+    if (delta_path.empty()) {
+        return;
+    }
+
+    const std::string expected_kind = to_string(workload.kind);
+    const std::string expected_phase = to_string(canonical_workload_phase(workload));
+    const std::string expected_bucket = canonical_workload_shape_bucket(workload);
+    const double copy_runtime_us = report.execution.total_copy_runtime_us;
+    const double compute_runtime_us = report.execution.total_compute_runtime_us;
+    const double total_copy_compute = std::max(copy_runtime_us + compute_runtime_us, 1.0);
+    const double sample_copy_share = copy_runtime_us / total_copy_compute;
+    const double sample_queue_separation = report.execution.queue_separation_ratio;
+    const double sample_overlap_ratio = report.execution.transfer_overlap_ratio;
+    const double sample_speedup = report.execution.speedup_vs_reference;
+    const double sample_budget_exhaustion =
+        report.execution.optimization.graph_optimization.budget_exhausted ? 1.0 : 0.0;
+
+    std::uint32_t last_optimizer_budget_ms = 0u;
+    bool persist_snapshot = false;
+    std::unordered_map<std::string, TelemetryBudgetCacheEntry> snapshot_entries;
+    {
+        std::unique_lock lock(g_telemetry_budget_cache_mutex);
+        auto& state = ensure_budget_cache_state_loaded(telemetry_path);
+        const auto key = telemetry_budget_entry_key(expected_kind, expected_phase, expected_bucket);
+        auto& entry = state.entries[key];
+        entry.kind = expected_kind;
+        entry.phase = expected_phase;
+        entry.shape_bucket = expected_bucket;
+        merge_budget_signal_sample(
+            entry.signal,
+            sample_speedup,
+            sample_overlap_ratio,
+            sample_copy_share,
+            sample_budget_exhaustion,
+            sample_queue_separation);
+        entry.last_optimizer_budget_ms = report.execution.optimization.graph_optimization.time_budget_ms;
+        entry.last_epoch = epoch;
+        last_optimizer_budget_ms = entry.last_optimizer_budget_ms;
+        state.delta_rows += 1u;
+
+        const auto now = std::chrono::steady_clock::now();
+        const bool compact_by_rows = state.delta_rows >= 8u;
+        const bool compact_by_age =
+            state.delta_rows >= 2u &&
+            (now - state.last_compaction) >= std::chrono::seconds(30);
+        const bool compact_by_cardinality =
+            state.entries.size() >= 32u && state.delta_rows >= 4u;
+        persist_snapshot =
+            compact_by_rows || compact_by_age || compact_by_cardinality ||
+            !std::filesystem::exists(telemetry_budget_cache_path(telemetry_path));
+        if (persist_snapshot) {
+            snapshot_entries = state.entries;
+            state.delta_rows = 0u;
+            state.last_compaction = now;
+        }
+    }
+
+    const std::string delta_header =
+        "# epoch\tkind\tphase\tshape_bucket\tspeedup_vs_reference\ttransfer_overlap_ratio\tcopy_share\tbudget_pressure\tqueue_separation_ratio\toptimizer_budget_ms\n";
+    std::ostringstream delta_line;
+    delta_line << epoch << '\t'
+               << expected_kind << '\t'
+               << expected_phase << '\t'
+               << expected_bucket << '\t'
+               << sample_speedup << '\t'
+               << sample_overlap_ratio << '\t'
+               << sample_copy_share << '\t'
+               << sample_budget_exhaustion << '\t'
+               << sample_queue_separation << '\t'
+               << last_optimizer_budget_ms << '\n';
+
+    telemetry_writer().enqueue([telemetry_path, delta_path, delta_header, delta_payload = delta_line.str(), persist_snapshot, snapshot_entries = std::move(snapshot_entries)]() mutable {
+        if (persist_snapshot) {
+            persist_budget_cache_snapshot_copy(telemetry_path, snapshot_entries);
+            return;
+        }
+        append_tsv_line(delta_path, delta_header, delta_payload);
+    });
 }
 
 std::uint32_t clamp_runtime_optimizer_budget(
@@ -292,7 +952,8 @@ ResolvedOptimizerBudget choose_runtime_optimizer_budget_ms(
     const WorkloadSpec& workload,
     const WorkloadGraph* workload_graph,
     const std::optional<std::uint32_t>& configured_budget_ms,
-    const std::filesystem::path& telemetry_path) {
+    const std::filesystem::path& telemetry_path,
+    const std::filesystem::path& execution_cache_path) {
     ResolvedOptimizerBudget resolved;
     if (configured_budget_ms.has_value()) {
         resolved.budget_ms = configured_budget_ms;
@@ -318,16 +979,25 @@ ResolvedOptimizerBudget choose_runtime_optimizer_budget_ms(
         budget_ms = 55u;
     }
 
-    const auto signal = load_runtime_budget_signal(telemetry_path, workload);
+    const auto unified_signal =
+        load_unified_runtime_signal(telemetry_path, execution_cache_path, workload, workload_graph);
+    const auto& signal = unified_signal.signal;
+    const auto& signal_source = unified_signal.source;
     if (signal.samples >= 2u) {
         int delta_ms = 0;
         if (signal.budget_exhaustion_ratio >= 0.30) {
             delta_ms += workload.latency_sensitive ? 12 : 24;
-            resolved.source = "telemetry-expand";
+            resolved.source = signal_source + "-expand";
         }
         if (signal.average_copy_share >= 0.30 && signal.average_transfer_overlap_ratio <= 0.25) {
             delta_ms += workload.latency_sensitive ? 8 : 16;
-            resolved.source = resolved.source == "heuristic" ? "telemetry-overlap" : resolved.source;
+            resolved.source = resolved.source == "heuristic" ? signal_source + "-overlap" : resolved.source;
+        }
+        if (signal.average_queue_separation_ratio >= 0.45 && signal.average_transfer_overlap_ratio >= 0.45) {
+            delta_ms -= workload.latency_sensitive ? 3 : 6;
+            if (resolved.source == "heuristic") {
+                resolved.source = signal_source + "-queue";
+            }
         }
         if (signal.budget_exhaustion_ratio <= 0.05 &&
             signal.average_speedup_vs_reference >= 1.20 &&
@@ -335,7 +1005,7 @@ ResolvedOptimizerBudget choose_runtime_optimizer_budget_ms(
             signal.average_transfer_overlap_ratio >= 0.50) {
             delta_ms -= workload.latency_sensitive ? 5 : 10;
             if (resolved.source == "heuristic") {
-                resolved.source = "telemetry-shrink";
+                resolved.source = signal_source + "-shrink";
             }
         }
         budget_ms = clamp_runtime_optimizer_budget(
@@ -609,7 +1279,10 @@ RuntimeOptimizationContext resolve_runtime_optimization_context(
         context.requested_workload,
         workload_graph,
         options.optimization.execution.optimizer_wall_time_budget_ms,
-        telemetry_path);
+        telemetry_path,
+        options.execution_cache_path.empty()
+            ? ExecutionOptimizer::default_cache_path()
+            : options.execution_cache_path);
     context.execution_tuning.optimizer_wall_time_budget_ms = resolved_budget.budget_ms;
     context.optimizer_budget_source = resolved_budget.source;
 
@@ -618,6 +1291,14 @@ RuntimeOptimizationContext resolve_runtime_optimization_context(
     }
 
     const auto meta = derive_graph_aware_meta_policy(context.requested_workload, *workload_graph);
+    std::string seeded_tuning_reason;
+    const auto unified_signal = load_unified_runtime_signal(
+        telemetry_path,
+        options.execution_cache_path.empty()
+            ? ExecutionOptimizer::default_cache_path()
+            : options.execution_cache_path,
+        context.requested_workload,
+        workload_graph);
     if (options.optimization.enable_graph_aware_strategy_hints &&
         !context.requested_workload.disable_heuristic_partition_hint &&
         !options.optimization.forced_partition_strategy.has_value() &&
@@ -642,9 +1323,48 @@ RuntimeOptimizationContext resolve_runtime_optimization_context(
         }
         context.execution_tuning.graph_rewrite_level =
             std::max(context.execution_tuning.graph_rewrite_level, meta.tuning_graph_rewrite_level);
+
+        if (unified_signal.signal.samples >= 3u) {
+            if (unified_signal.signal.average_copy_share >= 0.24 &&
+                unified_signal.signal.average_transfer_overlap_ratio <= 0.30) {
+                context.execution_tuning.graph_rewrite_level =
+                    std::max<std::uint32_t>(context.execution_tuning.graph_rewrite_level, 5u);
+                if (!context.execution_tuning.graph_optimization_passes_override.has_value()) {
+                    context.execution_tuning.graph_optimization_passes_override = 3u;
+                }
+                seeded_tuning_reason = unified_signal.source + "-fusion-seed";
+            }
+            if (unified_signal.signal.average_speedup_vs_reference >= 1.08 &&
+                unified_signal.signal.budget_exhaustion_ratio <= 0.15) {
+                context.effective_workload.disable_strategy_exploration = true;
+                if (!context.execution_tuning.initial_state_override.has_value()) {
+                    context.execution_tuning.initial_state_override =
+                        tuning_profile_state(
+                            unified_signal.signal.average_queue_separation_ratio >= 0.35
+                                ? "accelerator-throughput"
+                                : "hybrid-balanced");
+                }
+                if (!context.execution_tuning.graph_optimization_passes_override.has_value()) {
+                    context.execution_tuning.graph_optimization_passes_override =
+                        workload_graph->operations.size() <= 3u ? 1u : 2u;
+                } else {
+                    context.execution_tuning.graph_optimization_passes_override =
+                        std::min<std::uint32_t>(
+                            *context.execution_tuning.graph_optimization_passes_override,
+                            workload_graph->operations.size() <= 3u ? 1u : 2u);
+                }
+                if (seeded_tuning_reason.empty()) {
+                    seeded_tuning_reason = unified_signal.source + "-steady-seed";
+                } else {
+                    seeded_tuning_reason += "+";
+                    seeded_tuning_reason += unified_signal.source;
+                    seeded_tuning_reason += "-steady-seed";
+                }
+            }
+        }
     }
 
-    if (!meta.strategy_reason.empty() || !meta.tuning_reason.empty()) {
+    if (!meta.strategy_reason.empty() || !meta.tuning_reason.empty() || !seeded_tuning_reason.empty()) {
         std::ostringstream summary;
         if (!meta.strategy_reason.empty()) {
             summary << meta.strategy_reason;
@@ -669,6 +1389,19 @@ RuntimeOptimizationContext resolve_runtime_optimization_context(
                 summary << "auto";
             }
         }
+        if (!seeded_tuning_reason.empty()) {
+            if (summary.tellp() > 0) {
+                summary << "; ";
+            }
+            summary << "cache tuning " << seeded_tuning_reason
+                    << " rewrite=" << context.execution_tuning.graph_rewrite_level
+                    << " passes=";
+            if (context.execution_tuning.graph_optimization_passes_override.has_value()) {
+                summary << *context.execution_tuning.graph_optimization_passes_override;
+            } else {
+                summary << "auto";
+            }
+        }
         context.meta_summary = summary.str();
     } else if (context.execution_tuning.optimizer_wall_time_budget_ms.has_value() &&
                context.optimizer_budget_source != "heuristic") {
@@ -686,6 +1419,7 @@ std::vector<ExecutionFeedbackRecord> make_feedback_records(const DirectExecution
     std::vector<ExecutionFeedbackRecord> feedback;
     feedback.reserve(report.operations.size());
     for (const auto& operation : report.operations) {
+        const auto total_copy_compute = std::max(operation.copy_runtime_us + operation.compute_runtime_us, 1.0);
         feedback.push_back(ExecutionFeedbackRecord{
             operation.operation_name,
             operation.backend_name,
@@ -697,7 +1431,13 @@ std::vector<ExecutionFeedbackRecord> make_feedback_records(const DirectExecution
             operation.used_host,
             operation.used_opencl,
             operation.used_multiple_devices,
-            operation.logical_partitions_used});
+            operation.logical_partitions_used,
+            operation.copy_runtime_us / total_copy_compute,
+            operation.transfer_overlap_ratio,
+            report.optimization.graph_optimization.budget_exhausted ? 1.0 : 0.0,
+            operation.queue_separation_ratio,
+            operation.dispatch_count,
+            operation.event_wait_count});
     }
     return feedback;
 }
@@ -1250,7 +1990,7 @@ bool has_level_zero_graph(const std::vector<HardwareGraph>& graphs) {
 
 std::string backend_name_for_graph(const HardwareGraph& graph) {
     if (graph.probe == "host") {
-        return "host-direct";
+        return "host-native";
     }
     if (graph.probe == "level-zero") {
         return "level-zero-native";
@@ -1262,7 +2002,7 @@ std::string backend_name_for_graph(const HardwareGraph& graph) {
         return "rocm-native";
     }
     if (graph.probe == "vulkan") {
-        return "vulkan-direct";
+        return executors::vulkan_direct_backend_available() ? "vulkan-direct" : "vulkan-modeled";
     }
     if (graph.probe == "opencl") {
         return "opencl-direct";
@@ -1270,14 +2010,50 @@ std::string backend_name_for_graph(const HardwareGraph& graph) {
     return graph.probe + "-direct";
 }
 
+std::optional<JakalBackendKind> backend_kind_for_probe(const std::string& probe) {
+    if (probe == "opencl") {
+        return JakalBackendKind::opencl;
+    }
+    if (probe == "level-zero") {
+        return JakalBackendKind::level_zero;
+    }
+    if (probe == "vulkan") {
+        return JakalBackendKind::vulkan_compute;
+    }
+    if (probe == "cuda") {
+        return JakalBackendKind::cuda;
+    }
+    if (probe == "rocm") {
+        return JakalBackendKind::rocm;
+    }
+    return std::nullopt;
+}
+
 bool backend_supports_operation(
     const HardwareGraph& graph,
     const OperationClass op_class,
     std::string* reason = nullptr) {
-    (void)op_class;
-    if (graph.probe == "host" || graph.probe == "opencl" || graph.probe == "vulkan" || graph.probe == "cuda" ||
-        graph.probe == "rocm" || graph.probe == "level-zero") {
+    if (graph.probe == "host" || graph.probe == "host-emulated") {
         return true;
+    }
+    if (const auto backend_kind = backend_kind_for_probe(graph.probe)) {
+        if (*backend_kind == JakalBackendKind::vulkan_compute &&
+            !executors::vulkan_direct_backend_available()) {
+            if (reason != nullptr) {
+                *reason = "vulkan direct backend unavailable";
+            }
+            return false;
+        }
+        if (backend_kind_supports_operation(*backend_kind, op_class)) {
+            return true;
+        }
+        if (reason != nullptr) {
+            *reason =
+                *backend_kind == JakalBackendKind::vulkan_compute
+                    ? "vulkan direct backend supports only elementwise_map and reduction"
+                    : "backend lacks direct kernel coverage";
+        }
+        return false;
     }
     if (reason != nullptr) {
         *reason = "unknown backend kernel coverage";
@@ -1364,7 +2140,9 @@ Runtime::Runtime(RuntimeOptions options)
     if (options_.enable_rocm_probe) {
         probes_.push_back(make_rocm_probe());
     }
-    refresh_hardware();
+    if (options_.eager_hardware_refresh) {
+        refresh_hardware();
+    }
 }
 
 void Runtime::refresh_hardware() {
@@ -1409,20 +2187,27 @@ void Runtime::refresh_hardware() {
     });
 
     jakal_toolkit_index_ = jakal_toolkit_.build_index(devices_);
+    hardware_refreshed_ = true;
+}
+
+void Runtime::ensure_hardware_refreshed() const {
+    if (!hardware_refreshed_) {
+        const_cast<Runtime*>(this)->refresh_hardware();
+    }
 }
 
 const std::vector<HardwareGraph>& Runtime::devices() const {
+    ensure_hardware_refreshed();
     return devices_;
 }
 
 const std::vector<JakalToolkitIndexEntry>& Runtime::jakal_toolkit_index() const {
+    ensure_hardware_refreshed();
     return jakal_toolkit_index_;
 }
 
 ExecutionPlan Runtime::plan(const WorkloadSpec& workload) {
-    if (devices_.empty()) {
-        refresh_hardware();
-    }
+    ensure_hardware_refreshed();
 
     const auto workload_graph = default_workload_graph(workload);
     const auto context = resolve_runtime_optimization_context(options_, workload, &workload_graph);
@@ -1430,9 +2215,7 @@ ExecutionPlan Runtime::plan(const WorkloadSpec& workload) {
 }
 
 OptimizationReport Runtime::optimize(const WorkloadSpec& workload) {
-    if (devices_.empty()) {
-        refresh_hardware();
-    }
+    ensure_hardware_refreshed();
 
     const auto workload_graph = default_workload_graph(workload);
     const auto context = resolve_runtime_optimization_context(options_, workload, &workload_graph);
@@ -1446,9 +2229,7 @@ OptimizationReport Runtime::optimize(const WorkloadSpec& workload) {
 }
 
 OptimizationReport Runtime::optimize(const WorkloadSpec& workload, const WorkloadGraph& workload_graph) {
-    if (devices_.empty()) {
-        refresh_hardware();
-    }
+    ensure_hardware_refreshed();
 
     const auto context = resolve_runtime_optimization_context(options_, workload, &workload_graph);
     const auto placement = planner_.build_plan(context.effective_workload, devices_);
@@ -1507,9 +2288,7 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload) {
 }
 
 ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, const WorkloadGraph& workload_graph) {
-    if (devices_.empty()) {
-        refresh_hardware();
-    }
+    ensure_hardware_refreshed();
 
     ++execution_epoch_;
 
@@ -2387,57 +3166,55 @@ void Runtime::persist_telemetry(
     }
 
     const auto path = telemetry_path();
-    const auto parent = path.parent_path();
-    if (!parent.empty()) {
-        std::error_code ec;
-        std::filesystem::create_directories(parent, ec);
+    const std::string header =
+        "# epoch\tworkload\tkind\tphase\tshape_bucket\trequested_strategy\tselected_strategy\tfinal_strategy\tplanner_source\tplanner_confidence\tplanner_risk\texecuted\tall_succeeded\tblocked_by_memory\trolled_back_to_auto\tblacklisted_before_run\tpeak_pressure_ratio\tspill_bytes\treload_bytes\tforced_spills\tprefetch_bytes\thost_io_bytes\th2d_bytes\ttotal_runtime_us\tspeedup_vs_reference\tcopy_runtime_us\tcompute_runtime_us\tcopy_overlap_ratio\ttransfer_us\toverlapped_transfer_us\ttransfer_overlap_gain_us\ttransfer_overlap_ratio\toptimizer_budget_ms\tbudget_exhausted\tsummary\n";
+
+    std::ostringstream line;
+    line << execution_epoch_ << '\t'
+         << workload.name << '\t'
+         << to_string(workload.kind) << '\t'
+         << to_string(canonical_workload_phase(workload)) << '\t'
+         << canonical_workload_shape_bucket(workload) << '\t'
+         << to_string(report.safety.requested_strategy) << '\t'
+         << to_string(report.safety.selected_strategy) << '\t'
+         << to_string(report.safety.final_strategy) << '\t'
+         << to_string(report.safety.planner_strategy_source) << '\t'
+         << report.safety.planner_confidence << '\t'
+         << report.safety.planner_risk_score << '\t'
+         << (report.executed ? 1 : 0) << '\t'
+         << (report.executed && report.execution.all_succeeded ? 1 : 0) << '\t'
+         << (report.safety.blocked_by_memory ? 1 : 0) << '\t'
+         << (report.safety.rolled_back_to_auto ? 1 : 0) << '\t'
+         << (report.safety.blacklisted_before_run ? 1 : 0) << '\t'
+         << report.memory_preflight.peak_pressure_ratio << '\t'
+         << report.residency_sequence.spill_bytes << '\t'
+         << report.residency_sequence.reload_bytes << '\t'
+         << report.residency_sequence.forced_spill_count << '\t'
+         << report.asset_prefetch.total_prefetch_bytes << '\t'
+         << report.asset_prefetch.total_host_io_bytes << '\t'
+         << report.asset_prefetch.total_host_to_device_bytes << '\t'
+         << (report.executed ? report.execution.total_runtime_us : 0.0) << '\t'
+         << (report.executed ? report.execution.speedup_vs_reference : 0.0) << '\t'
+         << (report.executed ? report.execution.total_copy_runtime_us : 0.0) << '\t'
+         << (report.executed ? report.execution.total_compute_runtime_us : 0.0) << '\t'
+         << (report.executed ? report.execution.copy_overlap_ratio : 0.0) << '\t'
+         << (report.executed ? report.execution.total_predicted_transfer_runtime_us : 0.0) << '\t'
+         << (report.executed ? report.execution.total_overlapped_transfer_runtime_us : 0.0) << '\t'
+         << (report.executed ? report.execution.total_transfer_overlap_gain_us : 0.0) << '\t'
+         << (report.executed ? report.execution.transfer_overlap_ratio : 0.0) << '\t'
+         << (report.executed ? report.execution.optimization.graph_optimization.time_budget_ms : 0u) << '\t'
+         << (report.executed && report.execution.optimization.graph_optimization.budget_exhausted ? 1 : 0) << '\t'
+         << report.safety.summary << '\n';
+
+    if (options_.product.observability.async_telemetry_flush) {
+        telemetry_writer().enqueue([path, header, payload = line.str()]() {
+            append_tsv_line(path, header, payload);
+        });
+    } else {
+        append_tsv_line(path, header, line.str());
     }
 
-    const bool write_header = !std::filesystem::exists(path);
-    std::ofstream output(path, std::ios::app);
-    if (!output.is_open()) {
-        return;
-    }
-
-    if (write_header) {
-        output << "# epoch\tworkload\tkind\tphase\tshape_bucket\trequested_strategy\tselected_strategy\tfinal_strategy\tplanner_source\tplanner_confidence\tplanner_risk\texecuted\tall_succeeded\tblocked_by_memory\trolled_back_to_auto\tblacklisted_before_run\tpeak_pressure_ratio\tspill_bytes\treload_bytes\tforced_spills\tprefetch_bytes\thost_io_bytes\th2d_bytes\ttotal_runtime_us\tspeedup_vs_reference\tcopy_runtime_us\tcompute_runtime_us\tcopy_overlap_ratio\ttransfer_us\toverlapped_transfer_us\ttransfer_overlap_gain_us\ttransfer_overlap_ratio\toptimizer_budget_ms\tbudget_exhausted\tsummary\n";
-    }
-
-    output << execution_epoch_ << '\t'
-           << workload.name << '\t'
-           << to_string(workload.kind) << '\t'
-           << to_string(canonical_workload_phase(workload)) << '\t'
-           << canonical_workload_shape_bucket(workload) << '\t'
-           << to_string(report.safety.requested_strategy) << '\t'
-           << to_string(report.safety.selected_strategy) << '\t'
-           << to_string(report.safety.final_strategy) << '\t'
-           << to_string(report.safety.planner_strategy_source) << '\t'
-           << report.safety.planner_confidence << '\t'
-           << report.safety.planner_risk_score << '\t'
-           << (report.executed ? 1 : 0) << '\t'
-           << (report.executed && report.execution.all_succeeded ? 1 : 0) << '\t'
-           << (report.safety.blocked_by_memory ? 1 : 0) << '\t'
-           << (report.safety.rolled_back_to_auto ? 1 : 0) << '\t'
-           << (report.safety.blacklisted_before_run ? 1 : 0) << '\t'
-           << report.memory_preflight.peak_pressure_ratio << '\t'
-           << report.residency_sequence.spill_bytes << '\t'
-           << report.residency_sequence.reload_bytes << '\t'
-           << report.residency_sequence.forced_spill_count << '\t'
-           << report.asset_prefetch.total_prefetch_bytes << '\t'
-           << report.asset_prefetch.total_host_io_bytes << '\t'
-           << report.asset_prefetch.total_host_to_device_bytes << '\t'
-           << (report.executed ? report.execution.total_runtime_us : 0.0) << '\t'
-           << (report.executed ? report.execution.speedup_vs_reference : 0.0) << '\t'
-           << (report.executed ? report.execution.total_copy_runtime_us : 0.0) << '\t'
-           << (report.executed ? report.execution.total_compute_runtime_us : 0.0) << '\t'
-           << (report.executed ? report.execution.copy_overlap_ratio : 0.0) << '\t'
-           << (report.executed ? report.execution.total_predicted_transfer_runtime_us : 0.0) << '\t'
-           << (report.executed ? report.execution.total_overlapped_transfer_runtime_us : 0.0) << '\t'
-           << (report.executed ? report.execution.total_transfer_overlap_gain_us : 0.0) << '\t'
-           << (report.executed ? report.execution.transfer_overlap_ratio : 0.0) << '\t'
-           << (report.executed ? report.execution.optimization.graph_optimization.time_budget_ms : 0u) << '\t'
-           << (report.executed && report.execution.optimization.graph_optimization.budget_exhausted ? 1 : 0) << '\t'
-           << report.safety.summary << '\n';
+    update_runtime_budget_cache(path, execution_epoch_, workload, report);
 }
 
 bool Runtime::should_include_descriptor(const HardwareGraph& candidate) const {

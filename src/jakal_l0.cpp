@@ -537,6 +537,38 @@ std::string to_string(const JakalBackendKind backend_kind) {
     return "unknown";
 }
 
+bool backend_kind_supports_direct_execution(const JakalBackendKind backend_kind) {
+    switch (backend_kind) {
+    case JakalBackendKind::opencl:
+    case JakalBackendKind::level_zero:
+    case JakalBackendKind::vulkan_compute:
+    case JakalBackendKind::cuda:
+    case JakalBackendKind::rocm:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool backend_kind_supports_operation(
+    const JakalBackendKind backend_kind,
+    const OperationClass op_class) {
+    if (backend_kind == JakalBackendKind::vulkan_compute) {
+        return op_class == OperationClass::elementwise_map ||
+               op_class == OperationClass::reduction;
+    }
+    switch (op_class) {
+    case OperationClass::elementwise_map:
+    case OperationClass::reduction:
+    case OperationClass::matmul:
+    case OperationClass::convolution_2d:
+    case OperationClass::resample_2d:
+        return backend_kind_supports_direct_execution(backend_kind);
+    default:
+        return false;
+    }
+}
+
 std::vector<std::unique_ptr<IJakalL0Adapter>> make_default_jakal_l0_adapters() {
     std::vector<std::unique_ptr<IJakalL0Adapter>> adapters;
     adapters.push_back(std::make_unique<LevelZeroJakalL0Adapter>());

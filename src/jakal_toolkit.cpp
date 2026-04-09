@@ -1,4 +1,5 @@
 #include "jakal/jakal_toolkit.hpp"
+#include "jakal/executors/direct_backends.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -61,6 +62,17 @@ std::string make_rationale(const JakalToolkitVariant& variant) {
 
 }  // namespace
 
+bool jakal_variant_executes_directly(const JakalToolkitVariant& variant) {
+    if (!variant.binding.capabilities.adapter_available ||
+        !backend_kind_supports_direct_execution(variant.binding.backend)) {
+        return false;
+    }
+    if (variant.binding.backend == JakalBackendKind::vulkan_compute) {
+        return executors::vulkan_direct_backend_available();
+    }
+    return true;
+}
+
 JakalToolkit::JakalToolkit() : adapters_(make_default_jakal_l0_adapters()) {}
 
 JakalToolkit::JakalToolkit(std::vector<std::unique_ptr<IJakalL0Adapter>> adapters)
@@ -78,7 +90,7 @@ std::vector<JakalToolkitVariant> JakalToolkit::rank_variants(
         JakalToolkitVariant variant;
         variant.binding = adapter->describe(graph);
         variant.tuning = adapter->suggest_tuning(graph, workload);
-        variant.executable = variant.binding.capabilities.adapter_available;
+        variant.executable = jakal_variant_executes_directly(variant);
         variant.toolkit_score = variant.binding.suitability_score + workload_bias(variant, workload);
         if (!variant.executable) {
             variant.toolkit_score -= 0.25;

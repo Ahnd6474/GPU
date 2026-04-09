@@ -30,7 +30,7 @@ Jakal-Core is not a production runtime yet. It is a small CMake library with exa
 
 ## Installation
 
-Jakal-Core is source-first right now. There are no install rules or published packages in this tree yet, so the normal way to use it is to build from source or add it to another CMake project with `add_subdirectory(...)`.
+Jakal-Core is still source-first, but the tree now also exposes local install rules, exported CMake package files, and CPack package generation for downstream use.
 
 ### Requirements
 
@@ -48,10 +48,12 @@ From the repository root:
 ```powershell
 cmake -S . -B build
 cmake --build build
+cmake --install build --config Release
 ```
 
-The default build produces the `jakal_core` library plus these executables when examples and tests are enabled:
+The default build produces the `jakal_core` library plus these executables when product tools, examples, and tests are enabled:
 
+- tools: `jakal_bootstrap`
 - examples: `jakal_inspect`, `jakal_profile_workloads`, `jakal_explore_cpu_dl`, `jakal_partition_roles`
 - test binaries: `jakal_smoke`, `jakal_optimization`, `jakal_planner_learning`, `jakal_partition_strategies`, `jakal_runtime_product`, `jakal_workload_import_adapters`, `jakal_backend_contracts`, `jakal_live_backend_smoke`, `jakal_preset_execution_diag`
 
@@ -59,6 +61,13 @@ Useful CMake switches:
 
 ```powershell
 cmake -S . -B build -DJAKAL_CORE_BUILD_EXAMPLES=OFF -DJAKAL_CORE_BUILD_TESTS=OFF
+```
+
+To generate a distributable package:
+
+```powershell
+cmake -S . -B build -DJAKAL_CORE_BUILD_TESTS=OFF
+cmake --build build --config Release --target package
 ```
 
 If you are using a multi-config generator such as Visual Studio, CTest also needs a configuration name:
@@ -105,6 +114,12 @@ If you just want to see what the repository does without writing code, build the
 ```
 
 On single-config generators, the executable is typically `./build/jakal_inspect`.
+
+For install and first-run diagnostics, the bootstrap tool is:
+
+```powershell
+.\build\Debug\jakal_bootstrap.exe --status --self-check
+```
 
 ## What is this repository?
 
@@ -170,7 +185,7 @@ What is still missing:
 
 - real tensor allocators and residency movement beyond the current planning and diagnostics layer
 - framework bridges for PyTorch, TensorFlow, or similar runtimes
-- packaging and install rules for downstream consumers
+- polished production packaging beyond the current local install and CPack flow
 - a stable production execution stack with mature backend coverage
 
 ## API
@@ -415,6 +430,19 @@ This prints:
 - a sample placement plan
 - optimization summaries
 - direct execution results
+
+### Bootstrap install and self-check
+
+```powershell
+.\build\Debug\jakal_bootstrap.exe --status --self-check
+```
+
+This prints:
+
+- install, update, and remove paths
+- supported runtime backends detected on the machine
+- active backends discovered by `jakal::Runtime`
+- toolkit variants and the latest first-run self-check marker
 
 ### Profile canonical workload presets
 

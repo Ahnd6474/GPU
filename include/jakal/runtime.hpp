@@ -37,6 +37,7 @@ struct RuntimeSafetyPolicy {
 
 struct RuntimeObservabilityOptions {
     bool persist_telemetry = true;
+    bool async_telemetry_flush = true;
     std::filesystem::path telemetry_path;
 };
 
@@ -60,6 +61,7 @@ struct RuntimeOptions {
     bool enable_cuda_probe = true;
     bool enable_rocm_probe = true;
     bool prefer_level_zero_over_opencl = true;
+    bool eager_hardware_refresh = true;
     std::filesystem::path cache_path;
     std::filesystem::path execution_cache_path;
     RuntimeProductPolicy product;
@@ -215,6 +217,7 @@ public:
 
 private:
     [[nodiscard]] bool should_include_descriptor(const HardwareGraph& candidate) const;
+    void ensure_hardware_refreshed() const;
     [[nodiscard]] std::filesystem::path telemetry_path() const;
     [[nodiscard]] std::string strategy_safety_key(
         const WorkloadSpec& workload,
@@ -246,6 +249,7 @@ private:
     std::vector<std::unique_ptr<IDeviceProbe>> probes_;
     std::vector<HardwareGraph> devices_;
     std::vector<JakalToolkitIndexEntry> jakal_toolkit_index_;
+    bool hardware_refreshed_ = false;
     std::uint64_t execution_epoch_ = 0;
     std::unordered_map<std::string, std::uint32_t> strategy_failure_counts_;
     std::unordered_map<std::string, std::uint64_t> strategy_blacklist_until_epoch_;

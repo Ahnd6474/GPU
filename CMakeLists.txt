@@ -5,8 +5,18 @@ project(JakalCore
     DESCRIPTION "Structural-descriptor runtime skeleton for heterogeneous compute"
     LANGUAGES CXX)
 
+include(FetchContent)
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
 option(JAKAL_CORE_BUILD_EXAMPLES "Build example applications" ON)
 option(JAKAL_CORE_BUILD_TESTS "Build test targets" ON)
+option(JAKAL_CORE_BUILD_PRODUCT_TOOLS "Build bootstrap and maintenance tools" ON)
+option(JAKAL_CORE_ENABLE_CODE_SIGNING "Sign installable Windows executables after build" OFF)
+
+set(JAKAL_CORE_SIGNTOOL_PATH "" CACHE FILEPATH "Path to signtool.exe")
+set(JAKAL_CORE_CODESIGN_CERT_SHA1 "" CACHE STRING "Certificate thumbprint used for Windows code signing")
+set(JAKAL_CORE_CODESIGN_TIMESTAMP_URL "http://timestamp.digicert.com" CACHE STRING "RFC3161 timestamp URL for Windows code signing")
 
 add_library(jakal_core
     src/device.cpp
@@ -20,6 +30,7 @@ add_library(jakal_core
     src/executors/host_native_kernels.cpp
     src/executors/host_native_kernels_bf16.cpp
     src/executors/native_gpu_backends.cpp
+    src/executors/vulkan_direct_backend.cpp
     src/planner.cpp
     src/workloads.cpp
     src/runtime.cpp
@@ -33,7 +44,16 @@ add_library(jakal::runtime ALIAS jakal_core)
 
 target_include_directories(jakal_core
     PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+
+FetchContent_Declare(
+    vulkan_headers
+    URL https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.4.321.zip
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+)
+FetchContent_MakeAvailable(vulkan_headers)
+target_include_directories(jakal_core PRIVATE ${vulkan_headers_SOURCE_DIR}/include)
 
 target_compile_features(jakal_core PUBLIC cxx_std_20)
 
@@ -43,6 +63,33 @@ if(MSVC)
 else()
     target_compile_options(jakal_core PRIVATE -Wall -Wextra -Wpedantic)
 endif()
+
+if(WIN32 AND JAKAL_CORE_ENABLE_CODE_SIGNING)
+    if(NOT JAKAL_CORE_SIGNTOOL_PATH)
+        find_program(JAKAL_CORE_SIGNTOOL_PATH signtool)
+    endif()
+    if(NOT JAKAL_CORE_SIGNTOOL_PATH)
+        message(FATAL_ERROR "JAKAL_CORE_ENABLE_CODE_SIGNING requires signtool.exe")
+    endif()
+    if(NOT JAKAL_CORE_CODESIGN_CERT_SHA1)
+        message(FATAL_ERROR "JAKAL_CORE_ENABLE_CODE_SIGNING requires JAKAL_CORE_CODESIGN_CERT_SHA1")
+    endif()
+endif()
+
+function(jakal_enable_codesign target_name)
+    if(WIN32 AND JAKAL_CORE_ENABLE_CODE_SIGNING)
+        add_custom_command(
+            TARGET ${target_name}
+            POST_BUILD
+            COMMAND "${JAKAL_CORE_SIGNTOOL_PATH}" sign
+                /fd SHA256
+                /sha1 "${JAKAL_CORE_CODESIGN_CERT_SHA1}"
+                /tr "${JAKAL_CORE_CODESIGN_TIMESTAMP_URL}"
+                /td SHA256
+                "$<TARGET_FILE:${target_name}>"
+            VERBATIM)
+    endif()
+endfunction()
 
 if(MSVC)
     set_source_files_properties(
@@ -68,9 +115,16 @@ if(UNIX AND NOT APPLE)
     target_link_libraries(jakal_core PRIVATE dl)
 endif()
 
+if(JAKAL_CORE_BUILD_PRODUCT_TOOLS)
+    add_executable(jakal_bootstrap examples/bootstrap_runtime.cpp)
+    target_link_libraries(jakal_bootstrap PRIVATE jakal::core)
+    jakal_enable_codesign(jakal_bootstrap)
+endif()
+
 if(JAKAL_CORE_BUILD_EXAMPLES)
     add_executable(jakal_inspect examples/inspect_runtime.cpp)
     target_link_libraries(jakal_inspect PRIVATE jakal::core)
+    jakal_enable_codesign(jakal_inspect)
 
     add_executable(jakal_profile_workloads examples/profile_workloads.cpp)
     target_link_libraries(jakal_profile_workloads PRIVATE jakal::core)
@@ -92,6 +146,10 @@ endif()
 
 if(JAKAL_CORE_BUILD_TESTS)
     enable_testing()
+
+    if(JAKAL_CORE_BUILD_PRODUCT_TOOLS)
+        add_test(NAME jakal_bootstrap_status COMMAND jakal_bootstrap --status --no-persist)
+    endif()
 
     add_executable(jakal_smoke tests/smoke.cpp)
     target_link_libraries(jakal_smoke PRIVATE jakal::core)
@@ -147,4 +205,115 @@ if(JAKAL_CORE_BUILD_TESTS)
     add_executable(jakal_preset_execution_diag tests/preset_execution_diag.cpp)
     target_link_libraries(jakal_preset_execution_diag PRIVATE jakal::core)
 endif()
+
+set(jakal_installable_runtime_targets jakal_core)
+if(TARGET jakal_bootstrap)
+    list(APPEND jakal_installable_runtime_targets jakal_bootstrap)
+endif()
+if(TARGET jakal_inspect)
+    list(APPEND jakal_installable_runtime_targets jakal_inspect)
+endif()
+
+install(
+    TARGETS ${jakal_installable_runtime_targets}
+    EXPORT JakalCoreTargets
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT runtime
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT runtime
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT development
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+install(
+    DIRECTORY include/jakal
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    COMPONENT development)
+
+install(
+    FILES
+        README.md
+        LICENSE
+        docs/distribution.md
+    DESTINATION ${CMAKE_INSTALL_DOCDIR}
+    COMPONENT docs)
+
+install(
+    FILES
+        packaging/update-jakal-core.ps1
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/jakal-core/update
+    COMPONENT maintenance)
+
+install(
+    FILES
+        packaging/remove-jakal-core.ps1
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/jakal-core/remove
+    COMPONENT maintenance)
+
+configure_package_config_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/JakalCoreConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/JakalCoreConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/JakalCore)
+
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/JakalCoreConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion)
+
+install(
+    EXPORT JakalCoreTargets
+    FILE JakalCoreTargets.cmake
+    NAMESPACE jakal::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/JakalCore
+    COMPONENT development)
+
+install(
+    FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/JakalCoreConfig.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/JakalCoreConfigVersion.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/JakalCore
+    COMPONENT development)
+
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/cmake_uninstall.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake
+    IMMEDIATE
+    @ONLY)
+
+add_custom_target(
+    uninstall
+    COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake)
+
+set(CPACK_PACKAGE_NAME "Jakal-Core")
+set(CPACK_PACKAGE_VENDOR "Jakal")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Graph-first heterogeneous compute runtime skeleton")
+set(CPACK_PACKAGE_INSTALL_DIRECTORY "Jakal-Core")
+set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
+set(CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
+set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+set(CPACK_RESOURCE_FILE_README "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
+set(CPACK_COMPONENTS_ALL runtime development docs maintenance)
+set(CPACK_COMPONENT_RUNTIME_DISPLAY_NAME "Runtime")
+set(CPACK_COMPONENT_DEVELOPMENT_DISPLAY_NAME "Development Files")
+set(CPACK_COMPONENT_DOCS_DISPLAY_NAME "Documentation")
+set(CPACK_COMPONENT_MAINTENANCE_DISPLAY_NAME "Maintenance Tools")
+
+if(WIN32)
+    set(_jakal_cpack_generators ZIP)
+    find_program(JAKAL_CORE_MAKENSIS_EXECUTABLE makensis)
+    if(JAKAL_CORE_MAKENSIS_EXECUTABLE)
+        list(APPEND _jakal_cpack_generators NSIS)
+        set(CPACK_NSIS_DISPLAY_NAME "Jakal-Core")
+        set(CPACK_NSIS_PACKAGE_NAME "Jakal-Core")
+        set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
+        set(CPACK_NSIS_MODIFY_PATH OFF)
+        if(TARGET jakal_bootstrap)
+            set(CPACK_NSIS_MENU_LINKS
+                "bin\\\\jakal_bootstrap.exe" "Jakal Bootstrap"
+                "share\\\\doc\\\\JakalCore\\\\README.md" "README")
+        endif()
+    endif()
+    set(CPACK_GENERATOR "${_jakal_cpack_generators}")
+else()
+    set(CPACK_GENERATOR "TGZ;ZIP")
+endif()
+
+include(CPack)
 

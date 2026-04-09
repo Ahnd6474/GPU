@@ -41,7 +41,11 @@ struct BackendRunResult {
     double copy_runtime_us = 0.0;
     double compute_runtime_us = 0.0;
     double copy_overlap_ratio = 0.0;
+    double queue_separation_ratio = 0.0;
     std::uint32_t persistent_resource_reuse_hits = 0;
+    std::uint32_t copy_queue_count = 0;
+    std::uint32_t compute_queue_count = 0;
+    std::uint32_t event_wait_count = 0;
     bool success = false;
     bool used_host = true;
     bool used_opencl = false;
@@ -59,12 +63,14 @@ public:
 
     virtual BackendRunResult run_elementwise(
         const HardwareGraph& graph,
+        const OperationSpec& operation,
         std::span<const float> lhs,
         std::span<const float> rhs,
         bool low_precision) const = 0;
 
     virtual BackendRunResult run_reduction(
         const HardwareGraph& graph,
+        const OperationSpec& operation,
         std::span<const float> input,
         bool low_precision) const = 0;
 

@@ -1,0 +1,21 @@
+# ninja log v7
+2	107	7974227642384042	vulkan_headers-populate-prefix/src/vulkan_headers-populate-stamp/vulkan_headers-populate-mkdir	eac89cb451e286b6
+2	107	7974227642384042	D:/GitHub/Jakal-Core/build_ninja/_deps/vulkan_headers-subbuild/vulkan_headers-populate-prefix/src/vulkan_headers-populate-stamp/vulkan_headers-populate-mkdir	eac89cb451e286b6
+107	2598	7974227667335754	vulkan_headers-populate-prefix/src/vulkan_headers-populate-stamp/vulkan_headers-populate-download	c7251e2c99cb9cd6
+107	2598	7974227667335754	D:/GitHub/Jakal-Core/build_ninja/_deps/vulkan_headers-subbuild/vulkan_headers-populate-prefix/src/vulkan_headers-populate-stamp/vulkan_headers-populate-download	c7251e2c99cb9cd6
+2598	2676	7974227668122871	vulkan_headers-populate-prefix/src/vulkan_headers-populate-stamp/vulkan_headers-populate-update	662f762fd4cdc1ba
+2598	2676	7974227668122871	D:/GitHub/Jakal-Core/build_ninja/_deps/vulkan_headers-subbuild/vulkan_headers-populate-prefix/src/vulkan_headers-populate-stamp/vulkan_headers-populate-update	662f762fd4cdc1ba
+2677	2795	7974227669283859	vulkan_headers-populate-prefix/src/vulkan_headers-populate-stamp/vulkan_headers-populate-patch	7f4929cbd43cdb52
+2677	2795	7974227669283859	D:/GitHub/Jakal-Core/build_ninja/_deps/vulkan_headers-subbuild/vulkan_headers-populate-prefix/src/vulkan_headers-populate-stamp/vulkan_headers-populate-patch	7f4929cbd43cdb52
+2795	2874	7974227670114111	vulkan_headers-populate-prefix/src/vulkan_headers-populate-stamp/vulkan_headers-populate-configure	aaf9a0e8820a29a
+2795	2874	7974227670114111	D:/GitHub/Jakal-Core/build_ninja/_deps/vulkan_headers-subbuild/vulkan_headers-populate-prefix/src/vulkan_headers-populate-stamp/vulkan_headers-populate-configure	aaf9a0e8820a29a
+2875	2969	7974227671043894	vulkan_headers-populate-prefix/src/vulkan_headers-populate-stamp/vulkan_headers-populate-build	d58cb1c5452561b4
+2875	2969	7974227671043894	D:/GitHub/Jakal-Core/build_ninja/_deps/vulkan_headers-subbuild/vulkan_headers-populate-prefix/src/vulkan_headers-populate-stamp/vulkan_headers-populate-build	d58cb1c5452561b4
+2969	3046	7974227671811277	vulkan_headers-populate-prefix/src/vulkan_headers-populate-stamp/vulkan_headers-populate-install	2364de9aec37c19a
+2969	3046	7974227671811277	D:/GitHub/Jakal-Core/build_ninja/_deps/vulkan_headers-subbuild/vulkan_headers-populate-prefix/src/vulkan_headers-populate-stamp/vulkan_headers-populate-install	2364de9aec37c19a
+3047	3160	7974227672961098	vulkan_headers-populate-prefix/src/vulkan_headers-populate-stamp/vulkan_headers-populate-test	c7a963499f7a444d
+3047	3160	7974227672961098	D:/GitHub/Jakal-Core/build_ninja/_deps/vulkan_headers-subbuild/vulkan_headers-populate-prefix/src/vulkan_headers-populate-stamp/vulkan_headers-populate-test	c7a963499f7a444d
+3160	3311	7974227674425577	CMakeFiles/vulkan_headers-populate-complete	33175c852c8631c4
+3160	3311	7974227674425577	vulkan_headers-populate-prefix/src/vulkan_headers-populate-stamp/vulkan_headers-populate-done	33175c852c8631c4
+3160	3311	7974227674425577	D:/GitHub/Jakal-Core/build_ninja/_deps/vulkan_headers-subbuild/CMakeFiles/vulkan_headers-populate-complete	33175c852c8631c4
+3160	3311	7974227674425577	D:/GitHub/Jakal-Core/build_ninja/_deps/vulkan_headers-subbuild/vulkan_headers-populate-prefix/src/vulkan_headers-populate-stamp/vulkan_headers-populate-done	33175c852c8631c4
