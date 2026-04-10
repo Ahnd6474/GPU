@@ -211,6 +211,23 @@ std::vector<std::filesystem::path> shader_compiler_roots() {
     if (const char* sdk = std::getenv("VULKAN_SDK")) {
         push_root(std::filesystem::path(sdk));
     }
+#if defined(_WIN32)
+    {
+        const auto sdk_root = std::filesystem::path("C:\\VulkanSDK");
+        std::error_code ec;
+        if (std::filesystem::exists(sdk_root, ec)) {
+            push_root(sdk_root);
+            for (const auto& entry : std::filesystem::directory_iterator(sdk_root, ec)) {
+                if (ec) {
+                    break;
+                }
+                if (entry.is_directory(ec)) {
+                    push_root(entry.path());
+                }
+            }
+        }
+    }
+#endif
 
     const auto module_dir = current_module_directory();
     push_root(module_dir);

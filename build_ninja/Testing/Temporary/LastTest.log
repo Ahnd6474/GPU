@@ -1,35 +1,36 @@
-Start testing: Apr 09 23:09 대한민국 표준시
+Start testing: Apr 10 09:58 대한민국 표준시
 ----------------------------------------------------------
-11/12 Testing: jakal_runtime_install_smoke
-11/12 Test: jakal_runtime_install_smoke
-Command: "D:/GitHub/Jakal-Core/build_ninja/jakal_runtime_install_smoke.exe"
+2/13 Testing: jakal_smoke
+2/13 Test: jakal_smoke
+Command: "D:/GitHub/Jakal-Core/build_ninja/jakal_smoke.exe"
 Directory: D:/GitHub/Jakal-Core/build_ninja
-"jakal_runtime_install_smoke" start time: Apr 09 23:09 대한민국 표준시
+"jakal_smoke" start time: Apr 10 09:58 대한민국 표준시
 Output:
 ----------------------------------------------------------
-runtime install smoke ok
+Graphs=3 allocations=2 operations=7 executed=7 cache=hit
 <end of output>
-Test time =   0.38 sec
+Test time =  12.26 sec
 ----------------------------------------------------------
 Test Passed.
-"jakal_runtime_install_smoke" end time: Apr 09 23:09 대한민국 표준시
-"jakal_runtime_install_smoke" time elapsed: 00:00:00
+"jakal_smoke" end time: Apr 10 09:58 대한민국 표준시
+"jakal_smoke" time elapsed: 00:00:12
 ----------------------------------------------------------
 
-12/12 Testing: jakal_core_cli_doctor_json
-12/12 Test: jakal_core_cli_doctor_json
-Command: "D:/GitHub/Jakal-Core/build_ninja/jakal_core_cli.exe" "doctor" "--json" "--host-only"
+12/13 Testing: jakal_workload_bench
+12/13 Test: jakal_workload_bench
+Command: "D:/GitHub/Jakal-Core/build_ninja/jakal_workload_bench.exe" "--smoke" "--host-only"
 Directory: D:/GitHub/Jakal-Core/build_ninja
-"jakal_core_cli_doctor_json" start time: Apr 09 23:09 대한민국 표준시
+"jakal_workload_bench" start time: Apr 10 09:58 대한민국 표준시
 Output:
 ----------------------------------------------------------
-{"schema_version":1,"recommended_backend_id":"cpu-only","paths":{"install_root":"","writable_root":"C:\\Users\\ahnd6\\AppData\\Local\\Jakal-Core","config_dir":"C:\\Users\\ahnd6\\AppData\\Roaming\\Jakal-Core\\config","cache_dir":"C:\\Users\\ahnd6\\AppData\\Local\\Jakal-Core\\cache","logs_dir":"C:\\Users\\ahnd6\\AppData\\Local\\Jakal-Core\\logs","telemetry_path":"C:\\Users\\ahnd6\\AppData\\Local\\Jakal-Core\\logs\\runtime-telemetry.tsv","planner_cache_path":"C:\\Users\\ahnd6\\AppData\\Local\\Jakal-Core\\cache\\planner-cache.tsv","execution_cache_path":"C:\\Users\\ahnd6\\AppData\\Local\\Jakal-Core\\cache\\execution-cache.tsv","python_dir":"C:\\Users\\ahnd6\\AppData\\Local\\Jakal-Core\\python"},"summary":{"device_count":1,"ready_direct_count":1,"ready_modeled_count":0,"unavailable_count":0},"backends":[{"backend_name":"host","code":"ready-direct","enabled":true,"available":true,"direct_execution":true,"modeled_fallback":false,"device_uid":"host:0","detail":"host probe enabled"},{"backend_name":"opencl","code":"disabled","enabled":false,"available":false,"direct_execution":true,"modeled_fallback":false,"device_uid":"","detail":"opencl probe disabled"},{"backend_name":"level-zero","code":"disabled","enabled":false,"available":false,"direct_execution":true,"modeled_fallback":false,"device_uid":"","detail":"level-zero probe disabled"},{"backend_name":"cuda","code":"disabled","enabled":false,"available":false,"direct_execution":true,"modeled_fallback":false,"device_uid":"","detail":"cuda probe disabled"},{"backend_name":"rocm","code":"disabled","enabled":false,"available":false,"direct_execution":true,"modeled_fallback":false,"device_uid":"","detail":"rocm probe disabled"},{"backend_name":"vulkan","code":"disabled","enabled":false,"available":false,"direct_execution":false,"modeled_fallback":true,"device_uid":"","detail":"shader compile/cache failed for v3.matmul: no shader compiler found"}],"devices":[{"uid":"host:0","probe":"host","name":"12th Gen Intel(R) Core(TM) i5-1240P","execution_objects":16,"native_vector_bits":256,"addressable_bytes":16847327232}],"recommendations":[{"id":"auto","label":"Auto (recommended)","description":"Keep host and viable accelerators enabled so Jakal can choose per workload.","reason":"No accelerator is currently usable, so auto will behave like host-only until drivers are added.","available":true,"recommended":false,"prerequisite_ids":[]},{"id":"cpu-only","label":"CPU only","description":"Run entirely on the host-native backend.","reason":"Host execution is always available.","available":true,"recommended":true,"prerequisite_ids":[]},{"id":"intel-level-zero","label":"Intel GPU + Level Zero","description":"Prefer Intel GPU execution through Level Zero with host fallback.","reason":"Intel accelerator detected but Level Zero is not ready yet.","available":false,"recommended":false,"prerequisite_ids":["intel-level-zero-runtime"]},{"id":"vulkan-runtime","label":"Vulkan runtime only","description":"Use the Vulkan backend path when direct driver support is present.","reason":"Vulkan support is not ready yet and would need repair or driver install.","available":false,"recommended":false,"prerequisite_ids":["vulkan-support"]},{"id":"opencl-fallback","label":"OpenCL fallback","description":"Use OpenCL as the accelerator fallback path with host backup.","reason":"OpenCL is not ready yet and would need a vendor runtime.","available":false,"recommended":false,"prerequisite_ids":["opencl-runtime"]}],"prerequisite_choices":[{"id":"vulkan-support","label":"Install/repair Vulkan support","description":"Repair or install GPU vendor Vulkan components used by Jakal's Vulkan backend.","reason":"Vulkan already looks usable.","available":true,"recommended":false,"selected_by_default":false,"support_urls":["https://www.nvidia.com/Download/index.aspx","https://www.intel.com/content/www/us/en/download-center/home.html","https://www.amd.com/en/support/download/drivers.html"]},{"id":"intel-level-zero-runtime","label":"Install Intel Level Zero runtime","description":"Install or repair Intel GPU runtime support for Level Zero.","reason":"Level Zero is already ready or no Intel accelerator was detected.","available":false,"recommended":false,"selected_by_default":false,"support_urls":["https://www.intel.com/content/www/us/en/download-center/home.html"]},{"id":"opencl-runtime","label":"Install OpenCL runtime","description":"Install or repair a vendor OpenCL runtime as accelerator fallback.","reason":"OpenCL is already ready or no accelerator was detected.","available":false,"recommended":false,"selected_by_default":false,"support_urls":["https://www.intel.com/content/www/us/en/download-center/home.html","https://www.nvidia.com/Download/index.aspx","https://www.amd.com/en/support/download/drivers.html"]},{"id":"skip-existing-drivers","label":"Skip and use existing drivers","description":"Keep the current machine drivers and install only the Jakal runtime.","reason":"Existing drivers already cover the recommended backend.","available":true,"recommended":true,"selected_by_default":true,"support_urls":[]}]}
+decode optimize_ms=227.055 execute_ms=285.692 ops=8 host_ops=8 gpu_ops=0 mixed_ops=0 cache=miss
+prefill optimize_ms=193.419 execute_ms=5456.26 ops=8 host_ops=8 gpu_ops=0 mixed_ops=0 cache=hit
 <end of output>
-Test time =   0.38 sec
+Test time =   7.37 sec
 ----------------------------------------------------------
 Test Passed.
-"jakal_core_cli_doctor_json" end time: Apr 09 23:09 대한민국 표준시
-"jakal_core_cli_doctor_json" time elapsed: 00:00:00
+"jakal_workload_bench" end time: Apr 10 09:58 대한민국 표준시
+"jakal_workload_bench" time elapsed: 00:00:07
 ----------------------------------------------------------
 
-End testing: Apr 09 23:09 대한민국 표준시
+End testing: Apr 10 09:58 대한민국 표준시

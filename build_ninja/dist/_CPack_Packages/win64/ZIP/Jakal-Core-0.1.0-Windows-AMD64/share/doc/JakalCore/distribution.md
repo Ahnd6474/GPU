@@ -47,6 +47,12 @@ For automation:
 .\bin\jakal_core_cli.exe doctor --json
 ```
 
+For NSIS package generation with a portable `makensis.exe`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\packaging\build-nsis-package.ps1
+```
+
 ## Package generation
 
 Typical flow:

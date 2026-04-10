@@ -149,6 +149,7 @@ struct OperationSpec {
     bool cpu_use_avx512 = false;
     std::uint64_t cpu_pack_budget_bytes = 0;
     std::uint32_t cpu_single_thread_cutoff = 0;
+    std::string cpu_kernel_family = "auto";
     std::string cpu_low_precision_kernel_family = "auto";
     std::uint32_t attention_head_count = 0;
     std::uint32_t attention_head_group_size = 0;
@@ -295,6 +296,11 @@ struct ExecutionConfig {
     double overlap_ratio = 0.0;
     double partition_intensity = 0.0;
     double precision_mix = 0.0;
+    double telemetry_staging_hit_rate = 0.0;
+    double telemetry_cross_device_sync_cost_us = 0.0;
+    double telemetry_residency_pressure = 0.0;
+    bool semantic_head_partitioning = false;
+    bool semantic_token_partitioning = false;
 };
 
 struct SystemProfile {
@@ -365,6 +371,8 @@ struct CpuRuntimeHintSummary {
     std::uint32_t preferred_tile_m = 0;
     std::uint32_t preferred_tile_n = 0;
     std::uint32_t preferred_tile_k = 0;
+    std::uint32_t preferred_single_thread_cutoff = 0;
+    std::string preferred_kernel_family = "auto";
     bool preferred_use_avx512 = false;
     std::uint32_t observations = 0;
     double average_effective_latency_us = 0.0;

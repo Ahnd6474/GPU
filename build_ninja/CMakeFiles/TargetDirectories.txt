@@ -18,6 +18,7 @@ D:/GitHub/Jakal-Core/build_ninja/CMakeFiles/jakal_backend_contracts.dir
 D:/GitHub/Jakal-Core/build_ninja/CMakeFiles/jakal_live_backend_smoke.dir
 D:/GitHub/Jakal-Core/build_ninja/CMakeFiles/jakal_preset_execution_diag.dir
 D:/GitHub/Jakal-Core/build_ninja/CMakeFiles/jakal_runtime_install_smoke.dir
+D:/GitHub/Jakal-Core/build_ninja/CMakeFiles/jakal_workload_bench.dir
 D:/GitHub/Jakal-Core/build_ninja/CMakeFiles/uninstall.dir
 D:/GitHub/Jakal-Core/build_ninja/CMakeFiles/package.dir
 D:/GitHub/Jakal-Core/build_ninja/CMakeFiles/package_source.dir

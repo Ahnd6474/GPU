@@ -128,13 +128,13 @@ int main() {
     }
 
     const jakal::WorkloadSpec workload{
-        "smoke",
-        jakal::WorkloadKind::tensor,
-        "",
-        128ull * 1024ull * 1024ull,
-        64ull * 1024ull * 1024ull,
-        2.0e11,
-        4,
+        "llm-prefill-context-lite",
+        jakal::WorkloadKind::inference,
+        "llm-prefill-context-lite",
+        896ull * 1024ull * 1024ull,
+        48ull * 1024ull,
+        2.8e11,
+        1,
         false,
         false,
         true};
@@ -225,15 +225,15 @@ int main() {
     }
 
     const jakal_core_workload_spec c_workload{
-        "smoke",
-        "tensor",
-        "smoke-lite",
+        "llm-prefill-context-lite",
+        "inference",
+        "llm-prefill-context-lite",
         "prefill",
-        "b4-lite",
-        128ull * 1024ull * 1024ull,
-        64ull * 1024ull * 1024ull,
-        2.0e11,
-        4,
+        "b1",
+        896ull * 1024ull * 1024ull,
+        48ull * 1024ull,
+        2.8e11,
+        1,
         0,
         0,
         1};

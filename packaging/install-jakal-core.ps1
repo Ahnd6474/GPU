@@ -245,6 +245,12 @@ function Invoke-PrerequisiteAction {
         return
     }
 
+    $bundledTools = @()
+    foreach ($pattern in @($ManifestEntry.runtime_tool_globs)) {
+        $fullPattern = Join-Path $InstallerAssetRootPath $pattern
+        $bundledTools += @(Get-ChildItem -Path $fullPattern -File -ErrorAction SilentlyContinue)
+    }
+
     $installerPath = $null
     foreach ($pattern in @($ManifestEntry.local_installer_globs)) {
         $fullPattern = Join-Path $InstallerAssetRootPath $pattern
@@ -265,6 +271,13 @@ function Invoke-PrerequisiteAction {
     }
 
     Write-Host ("No bundled installer found for {0}." -f $ManifestEntry.label)
+    if ($bundledTools.Count -gt 0) {
+        Write-Host ("Bundled runtime tools detected for {0}:" -f $ManifestEntry.label)
+        foreach ($tool in $bundledTools) {
+            Write-Host ("  Tool asset: {0}" -f $tool.FullName)
+        }
+        Write-Host "The Jakal runtime will probe these tool locations automatically after install."
+    }
     foreach ($url in @($ManifestEntry.support_urls)) {
         Write-Host ("  Support URL: {0}" -f $url)
         if (-not $UseQuiet) {

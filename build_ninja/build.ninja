@@ -1082,6 +1082,47 @@ build jakal_runtime_install_smoke.exe: CXX_EXECUTABLE_LINKER__jakal_runtime_inst
   TARGET_PDB = jakal_runtime_install_smoke.pdb
   TARGET_SUPPORT_DIR = CMakeFiles\jakal_runtime_install_smoke.dir
 
+# =============================================================================
+# Object build statements for EXECUTABLE target jakal_workload_bench
+
+
+#############################################
+# Order-only phony target for jakal_workload_bench
+
+build cmake_object_order_depends_target_jakal_workload_bench: phony || cmake_object_order_depends_target_jakal_core
+
+build CMakeFiles\jakal_workload_bench.dir\tests\workload_bench.cpp.obj: CXX_COMPILER__jakal_workload_bench_unscanned_Debug D$:\GitHub\Jakal-Core\tests\workload_bench.cpp || cmake_object_order_depends_target_jakal_workload_bench
+  CONFIG = Debug
+  FLAGS = -std:c++20 -MDd
+  INCLUDES = -ID:\GitHub\Jakal-Core\include
+  OBJECT_DIR = CMakeFiles\jakal_workload_bench.dir
+  OBJECT_FILE_DIR = CMakeFiles\jakal_workload_bench.dir\tests
+  TARGET_COMPILE_PDB = CMakeFiles\jakal_workload_bench.dir\
+  TARGET_PDB = jakal_workload_bench.pdb
+  TARGET_SUPPORT_DIR = CMakeFiles\jakal_workload_bench.dir
+
+
+# =============================================================================
+# Link build statements for EXECUTABLE target jakal_workload_bench
+
+
+#############################################
+# Link the executable jakal_workload_bench.exe
+
+build jakal_workload_bench.exe: CXX_EXECUTABLE_LINKER__jakal_workload_bench_Debug CMakeFiles\jakal_workload_bench.dir\tests\workload_bench.cpp.obj | jakal_core.lib || jakal_core.lib
+  CONFIG = Debug
+  FLAGS = -MDd
+  LINK_FLAGS = /subsystem:console
+  LINK_LIBRARIES = jakal_core.lib  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib
+  OBJECT_DIR = CMakeFiles\jakal_workload_bench.dir
+  POST_BUILD = cd .
+  PRE_LINK = cd .
+  TARGET_COMPILE_PDB = CMakeFiles\jakal_workload_bench.dir\
+  TARGET_FILE = jakal_workload_bench.exe
+  TARGET_IMPLIB = jakal_workload_bench.lib
+  TARGET_PDB = jakal_workload_bench.pdb
+  TARGET_SUPPORT_DIR = CMakeFiles\jakal_workload_bench.dir
+
 
 #############################################
 # Utility command for uninstall
@@ -1321,6 +1362,8 @@ build jakal_runtime_product: phony jakal_runtime_product.exe
 
 build jakal_smoke: phony jakal_smoke.exe
 
+build jakal_workload_bench: phony jakal_workload_bench.exe
+
 build jakal_workload_import_adapters: phony jakal_workload_import_adapters.exe
 
 # =============================================================================
@@ -1331,7 +1374,7 @@ build jakal_workload_import_adapters: phony jakal_workload_import_adapters.exe
 #############################################
 # Folder: D:/GitHub/Jakal-Core/build_ninja
 
-build all: phony jakal_core.lib jakal_runtime.dll jakal_core_cli.exe jakal_bootstrap.exe jakal_inspect.exe jakal_profile_workloads.exe jakal_explore_cpu_dl.exe jakal_partition_roles.exe jakal_profile_manifest.exe jakal_directml_manifest_bench.exe jakal_smoke.exe jakal_optimization.exe jakal_planner_learning.exe jakal_partition_strategies.exe jakal_runtime_product.exe jakal_workload_import_adapters.exe jakal_backend_contracts.exe jakal_live_backend_smoke.exe jakal_preset_execution_diag.exe jakal_runtime_install_smoke.exe _deps\vulkan_headers-build\all
+build all: phony jakal_core.lib jakal_runtime.dll jakal_core_cli.exe jakal_bootstrap.exe jakal_inspect.exe jakal_profile_workloads.exe jakal_explore_cpu_dl.exe jakal_partition_roles.exe jakal_profile_manifest.exe jakal_directml_manifest_bench.exe jakal_smoke.exe jakal_optimization.exe jakal_planner_learning.exe jakal_partition_strategies.exe jakal_runtime_product.exe jakal_workload_import_adapters.exe jakal_backend_contracts.exe jakal_live_backend_smoke.exe jakal_preset_execution_diag.exe jakal_runtime_install_smoke.exe jakal_workload_bench.exe _deps\vulkan_headers-build\all
 
 # =============================================================================
 

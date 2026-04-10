@@ -237,6 +237,10 @@ if(JAKAL_CORE_BUILD_TESTS)
     target_link_libraries(jakal_runtime_install_smoke PRIVATE jakal::runtime)
     add_test(NAME jakal_runtime_install_smoke COMMAND jakal_runtime_install_smoke)
 
+    add_executable(jakal_workload_bench tests/workload_bench.cpp)
+    target_link_libraries(jakal_workload_bench PRIVATE jakal::core)
+    add_test(NAME jakal_workload_bench COMMAND jakal_workload_bench --smoke --host-only)
+
     add_test(NAME jakal_core_cli_doctor_json COMMAND jakal_core_cli doctor --json --host-only)
 endif()
 

@@ -25,6 +25,7 @@ D:/GitHub/Jakal-Core/build_ninja/dist/_CPack_Packages/win64/ZIP/Jakal-Core-0.1.0
 D:/GitHub/Jakal-Core/build_ninja/dist/_CPack_Packages/win64/ZIP/Jakal-Core-0.1.0-Windows-AMD64/share/doc/JakalCore/LICENSE
 D:/GitHub/Jakal-Core/build_ninja/dist/_CPack_Packages/win64/ZIP/Jakal-Core-0.1.0-Windows-AMD64/share/doc/JakalCore/distribution.md
 D:/GitHub/Jakal-Core/build_ninja/dist/_CPack_Packages/win64/ZIP/Jakal-Core-0.1.0-Windows-AMD64/share/jakal-core/install/install-jakal-core.ps1
+D:/GitHub/Jakal-Core/build_ninja/dist/_CPack_Packages/win64/ZIP/Jakal-Core-0.1.0-Windows-AMD64/share/jakal-core/install/build-nsis-package.ps1
 D:/GitHub/Jakal-Core/build_ninja/dist/_CPack_Packages/win64/ZIP/Jakal-Core-0.1.0-Windows-AMD64/share/jakal-core/install/jakal-prerequisites.json
 D:/GitHub/Jakal-Core/build_ninja/dist/_CPack_Packages/win64/ZIP/Jakal-Core-0.1.0-Windows-AMD64/share/jakal-core/install/prereqs/intel-level-zero-runtime/README.txt
 D:/GitHub/Jakal-Core/build_ninja/dist/_CPack_Packages/win64/ZIP/Jakal-Core-0.1.0-Windows-AMD64/share/jakal-core/install/prereqs/opencl-runtime/README.txt

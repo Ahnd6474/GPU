@@ -8,9 +8,18 @@
       "local_installer_globs": [
         "prereqs/vulkan-support/*.msi",
         "prereqs/vulkan-support/*.exe",
-        "prereqs/vulkan-support/*.zip"
+        "prereqs/vulkan-support/*.zip",
+        "prereqs/vulkan-support/sdk/*.exe",
+        "prereqs/vulkan-support/sdk/*.zip"
+      ],
+      "runtime_tool_globs": [
+        "prereqs/vulkan-support/bin/glslc.exe",
+        "prereqs/vulkan-support/bin/glslangValidator.exe",
+        "tools/vulkan/bin/glslc.exe",
+        "tools/vulkan/bin/glslangValidator.exe"
       ],
       "support_urls": [
+        "https://vulkan.lunarg.com/sdk/home",
         "https://www.nvidia.com/Download/index.aspx",
         "https://www.intel.com/content/www/us/en/download-center/home.html",
         "https://www.amd.com/en/support/download/drivers.html"
@@ -25,6 +34,7 @@
         "prereqs/intel-level-zero-runtime/*.exe",
         "prereqs/intel-level-zero-runtime/*.zip"
       ],
+      "runtime_tool_globs": [],
       "support_urls": [
         "https://www.intel.com/content/www/us/en/download-center/home.html"
       ]
@@ -38,6 +48,7 @@
         "prereqs/opencl-runtime/*.exe",
         "prereqs/opencl-runtime/*.zip"
       ],
+      "runtime_tool_globs": [],
       "support_urls": [
         "https://www.intel.com/content/www/us/en/download-center/home.html",
         "https://www.nvidia.com/Download/index.aspx",
@@ -49,6 +60,7 @@
       "label": "Skip and use existing drivers",
       "description": "Keep the current machine drivers and install only the Jakal runtime.",
       "local_installer_globs": [],
+      "runtime_tool_globs": [],
       "support_urls": []
     }
   ]

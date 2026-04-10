@@ -358,6 +358,11 @@ const JakalToolkitVariant* find_preferred_gpu_variant(
             if (traits.matrix_friendly && variant.binding.capabilities.subgroup_matrix) {
                 score += 0.05;
             }
+            if ((traits.op_class == OperationClass::matmul ||
+                 traits.op_class == OperationClass::convolution_2d) &&
+                variant.binding.backend == JakalBackendKind::level_zero) {
+                score += 0.08;
+            }
             if (operation.gpu_tensorized && traits.op_class == OperationClass::matmul &&
                 variant.binding.capabilities.subgroup_matrix) {
                 score += 0.08;
@@ -378,10 +383,18 @@ const JakalToolkitVariant* find_preferred_gpu_variant(
                     traits.op_class == OperationClass::resample_2d) {
                     score += 0.05;
                 }
+                if (traits.op_class == OperationClass::convolution_2d &&
+                    operation.gpu_input_layout.find("patch9") != std::string::npos) {
+                    score += 0.06;
+                }
                 if (traits.op_class == OperationClass::matmul &&
                     operation.preferred_token_block > 0u &&
                     operation.preferred_token_block <= 64u) {
                     score += 0.03;
+                }
+                if (traits.op_class == OperationClass::matmul &&
+                    (operation.gpu_pack_weights || operation.gpu_pretranspose_rhs)) {
+                    score += 0.05;
                 }
                 if (operation.preferred_kv_residency == "shared" ||
                     operation.preferred_kv_residency == "host") {
@@ -394,6 +407,10 @@ const JakalToolkitVariant* find_preferred_gpu_variant(
             if (traits.op_class == OperationClass::resample_2d &&
                 variant.binding.backend == JakalBackendKind::vulkan_compute) {
                 score += 0.04;
+            } else if ((traits.op_class == OperationClass::matmul ||
+                        traits.op_class == OperationClass::convolution_2d) &&
+                       variant.binding.backend == JakalBackendKind::vulkan_compute) {
+                score -= 0.05;
             }
             if (best == nullptr || score > best_score) {
                 best = &variant;
@@ -1100,7 +1117,9 @@ private:
             return nullptr;
         }
 
-        const char* options = low_precision ? "-cl-fast-relaxed-math" : "";
+        const char* options = low_precision
+            ? "-cl-fast-relaxed-math -cl-mad-enable -D JAKAL_OPENCL_DIRECT=1"
+            : "-D JAKAL_OPENCL_DIRECT=1";
         error = api_.build_program()(program, 1, &binding->device, options, nullptr, nullptr);
         if (error != CL_SUCCESS) {
             size_t log_size = 0;
@@ -1719,8 +1738,7 @@ BackendRunResult dispatch_backend(
         preferred_gpu_variant != nullptr && jakal_variant_executes_directly(*preferred_gpu_variant);
     const auto should_fallback_from_gpu = [&](const BackendRunResult& result) {
         return preferred_gpu_variant != nullptr &&
-               preferred_gpu_variant->binding.backend == JakalBackendKind::level_zero &&
-               !backend_result_is_usable(result);
+               (!result.success || !backend_result_is_usable(result));
     };
 
     const auto dispatch_gpu = [&](const auto& invoke) -> std::optional<BackendRunResult> {
@@ -1731,13 +1749,14 @@ BackendRunResult dispatch_backend(
         switch (preferred_gpu_variant->binding.backend) {
         case JakalBackendKind::level_zero:
             return invoke(level_zero);
+        case JakalBackendKind::opencl:
+            return invoke(opencl);
         case JakalBackendKind::cuda:
             return invoke(cuda);
         case JakalBackendKind::rocm:
             return invoke(rocm);
         case JakalBackendKind::vulkan_compute:
             return invoke(vulkan);
-        case JakalBackendKind::opencl:
         default:
             return std::nullopt;
         }

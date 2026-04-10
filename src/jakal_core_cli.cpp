@@ -304,7 +304,7 @@ DoctorSummary summarize_doctor(const jakal::Runtime& runtime) {
         recommendation.recommended = recommendation.id == summary.recommended_backend_id;
     }
 
-    const bool vulkan_needs_repair = has_any_accelerator && !vulkan_ready;
+    const bool vulkan_needs_repair = has_any_accelerator && !vulkan_ready_direct;
     const bool level_zero_needs_repair = has_intel_accelerator && !level_zero_ready;
     const bool opencl_needs_repair = has_any_accelerator && !opencl_ready;
     const bool skip_selected = !vulkan_needs_repair && !level_zero_needs_repair && !opencl_needs_repair;
@@ -314,7 +314,9 @@ DoctorSummary summarize_doctor(const jakal::Runtime& runtime) {
             "vulkan-support",
             "Install/repair Vulkan support",
             "Repair or install GPU vendor Vulkan components used by Jakal's Vulkan backend.",
-            vulkan_needs_repair ? "Vulkan is not currently ready on this machine." : "Vulkan already looks usable.",
+            vulkan_needs_repair
+                ? "Vulkan is not currently ready for direct execution on this machine."
+                : "Vulkan direct execution already looks usable.",
             true,
             vulkan_needs_repair,
             false,

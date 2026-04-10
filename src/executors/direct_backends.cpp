@@ -257,11 +257,21 @@ bool cpu_resample_uses_packed6_layout(const OperationSpec& operation, const std:
 }
 
 std::size_t choose_host_linear_chunk(
+    const OperationSpec& operation,
     const HardwareGraph& graph,
     const std::size_t items,
     const bool reduction_like) {
     const auto summary = summarize_graph(graph);
     const std::size_t vector_bonus = summary.native_vector_bits >= 512u ? 2u : 1u;
+    const bool attention_tail =
+        operation.cpu_kernel_family == "attention-tail-simd" ||
+        operation.cpu_kernel_family == "attention-tail-reduce";
+    if (attention_tail) {
+        const auto semantic_chunk = std::max<std::size_t>(
+            operation.preferred_token_block > 0u ? static_cast<std::size_t>(operation.preferred_token_block) : 256u,
+            reduction_like ? 512u : 256u);
+        return std::min<std::size_t>(std::max<std::size_t>(semantic_chunk, 128u * vector_bonus), std::max(items, std::size_t{1u}));
+    }
     if (reduction_like) {
         if (items >= (1u << 20u)) {
             return 8192u * vector_bonus;
@@ -281,7 +291,13 @@ std::size_t choose_host_linear_chunk(
 }
 
 std::size_t choose_host_row_chunk(const OperationSpec& operation, const std::size_t fallback) {
-    return std::max<std::size_t>(1u, operation.cpu_parallel_chunk == 0u ? fallback : operation.cpu_parallel_chunk);
+    if (operation.cpu_parallel_chunk != 0u) {
+        return std::max<std::size_t>(1u, operation.cpu_parallel_chunk);
+    }
+    if (operation.cpu_tile_m > 0u) {
+        return std::max<std::size_t>(1u, operation.cpu_tile_m);
+    }
+    return std::max<std::size_t>(1u, fallback);
 }
 
 class HostNativeBackend final : public IKernelBackend {
@@ -322,7 +338,7 @@ public:
             const auto chunk = std::max<std::size_t>(
                 1u,
                 operation.cpu_parallel_chunk == 0u
-                    ? choose_host_linear_chunk(graph, lhs.size(), false)
+                    ? choose_host_linear_chunk(operation, graph, lhs.size(), false)
                     : operation.cpu_parallel_chunk);
             HostThreadPool::instance().parallel_for(lhs.size(), chunk, [&](const std::size_t begin, const std::size_t end) {
                 for (std::size_t index = begin; index < end; ++index) {
@@ -362,7 +378,7 @@ public:
             const auto chunk = std::max<std::size_t>(
                 1u,
                 operation.cpu_parallel_chunk == 0u
-                    ? choose_host_linear_chunk(graph, input.size(), true)
+                    ? choose_host_linear_chunk(operation, graph, input.size(), true)
                     : operation.cpu_parallel_chunk);
             const std::size_t concurrency =
                 std::max<std::size_t>(1u, HostThreadPool::instance().worker_count() + 1u);

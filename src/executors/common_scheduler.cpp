@@ -18,12 +18,14 @@ std::size_t semantic_item_quantum(
     const OperationOptimizationResult& operation,
     const std::size_t total_items) {
     std::size_t quantum = 1u;
-    if (operation.operation.preferred_token_block > 0u) {
+    if (operation.config.semantic_token_partitioning &&
+        operation.operation.preferred_token_block > 0u) {
         quantum = std::max<std::size_t>(
             quantum,
             static_cast<std::size_t>(operation.operation.preferred_token_block));
     }
-    if (operation.operation.attention_head_count > 0u) {
+    if (operation.config.semantic_head_partitioning &&
+        operation.operation.attention_head_count > 0u) {
         const auto groups = std::max<std::uint32_t>(1u, head_group_count(operation));
         const auto head_group_span = std::max<std::size_t>(1u, total_items / static_cast<std::size_t>(groups));
         if (head_group_span > 1u && head_group_span < total_items) {
@@ -78,6 +80,32 @@ double inference_bias(const OperationOptimizationResult& operation, const Hardwa
 
     if (summary.supports_asynchronous_dispatch && operation.config.overlap_transfers) {
         bias += 0.08;
+    }
+    if (operation.config.telemetry_staging_hit_rate > 0.0) {
+        const double staging = std::clamp(operation.config.telemetry_staging_hit_rate, 0.0, 1.0);
+        if (graph.probe == "host") {
+            bias += (1.0 - staging) * 0.12;
+        } else {
+            bias += staging * 0.10;
+        }
+    }
+    if (operation.config.telemetry_cross_device_sync_cost_us > 0.0 &&
+        operation.config.participating_devices.size() > 1u) {
+        const double sync_penalty =
+            std::clamp(operation.config.telemetry_cross_device_sync_cost_us / 200.0, 0.0, 1.0);
+        if (graph.probe == "host") {
+            bias += sync_penalty * 0.10;
+        } else {
+            bias -= sync_penalty * 0.12;
+        }
+    }
+    if (operation.config.telemetry_residency_pressure > 0.0) {
+        const double pressure = std::clamp(operation.config.telemetry_residency_pressure, 0.0, 1.5);
+        if (graph.probe == "host" && summary.coherent_with_host) {
+            bias += pressure * 0.05;
+        } else if (graph.probe != "host") {
+            bias -= pressure * 0.08;
+        }
     }
     bias += std::min(std::log2(static_cast<double>(std::max(operation.config.queue_depth, 1u))) * 0.035, 0.10);
     bias += std::min(std::log2(static_cast<double>(std::max(operation.config.stages, 1u))) * 0.030, 0.08);
@@ -260,13 +288,13 @@ std::vector<DeviceAssignment> DefaultIntraDeviceScheduler::make_assignments(
                 {consumed + local_consumed, partition_count},
                 partition,
                 partitions,
-                semantic_head_groups == 0u
+                !operation.config.semantic_head_partitioning || semantic_head_groups == 0u
                     ? 0u
                     : static_cast<std::uint32_t>(
                           ((consumed + local_consumed) / std::max<std::size_t>(semantic_quantum, 1u)) %
                           semantic_head_groups),
                 semantic_head_groups,
-                operation.operation.preferred_token_block == 0u
+                !operation.config.semantic_token_partitioning || operation.operation.preferred_token_block == 0u
                     ? 0u
                     : static_cast<std::uint32_t>(
                           (consumed + local_consumed) /

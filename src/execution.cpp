@@ -190,6 +190,7 @@ std::string shape_bucket_for(const OperationSpec& operation) {
            << "|cpu.avx512:" << operation.cpu_use_avx512
            << "|cpu.packb:" << std::max<std::uint64_t>(operation.cpu_pack_budget_bytes, 1ull)
            << "|cpu.st:" << std::max(operation.cpu_single_thread_cutoff, 1u)
+           << "|cpu.kf:" << operation.cpu_kernel_family
            << "|cpu.lowp:" << operation.cpu_low_precision_kernel_family
            << "|heads:" << std::max(operation.attention_head_count, 1u)
            << "|headg:" << std::max(operation.attention_head_group_size, 1u)
@@ -225,7 +226,8 @@ std::string cpu_runtime_hint_bucket_for(const OperationSpec& operation) {
            << "|cpu.in:" << operation.cpu_input_layout
            << "|cpu.w:" << operation.cpu_weight_layout
            << "|cpu.out:" << operation.cpu_output_layout
-           << "|cpu.u" << std::max(operation.cpu_micro_kernel_unroll, 1u);
+           << "|cpu.u" << std::max(operation.cpu_micro_kernel_unroll, 1u)
+           << "|cpu.kf:" << operation.cpu_kernel_family;
     for (const auto& fused : operation.fused_operation_names) {
         stream << "|f:" << fused;
     }
@@ -233,7 +235,9 @@ std::string cpu_runtime_hint_bucket_for(const OperationSpec& operation) {
 }
 
 bool supports_feedback_tuned_cpu_tiles(const OperationSpec& operation) {
-    return operation.op_class == OperationClass::matmul;
+    return operation.op_class == OperationClass::matmul ||
+           operation.op_class == OperationClass::convolution_2d ||
+           operation.op_class == OperationClass::resample_2d;
 }
 
 bool supports_feedback_tuned_cpu_avx512(const OperationSpec& operation) {
@@ -251,6 +255,13 @@ std::uint32_t clamp_cpu_parallel_chunk_hint(
     const OperationSpec& operation,
     const std::uint32_t chunk) {
     return std::clamp(chunk, 1u, std::max(operation_linear_items(operation), 1u));
+}
+
+std::uint32_t clamp_cpu_single_thread_cutoff_hint(
+    const OperationSpec& operation,
+    const std::uint32_t cutoff) {
+    const auto items = std::max(operation_linear_items(operation), 1u);
+    return std::clamp(cutoff, 1u, std::max(items, cutoff));
 }
 
 std::uint32_t host_parallelism_hint(const std::vector<HardwareGraph>& graphs) {
@@ -374,6 +385,43 @@ void feedback_adjusted_cpu_tiles(
     std::uint32_t& tile_m,
     std::uint32_t& tile_n,
     std::uint32_t& tile_k) {
+    if (operation.op_class == OperationClass::convolution_2d ||
+        operation.op_class == OperationClass::resample_2d) {
+        const auto summary = strongest_host_summary(graphs);
+        const bool wide_vectors = summary.native_vector_bits >= 512u;
+        const bool latency_regressed =
+            predicted_latency_us > 0.0 && effective_latency_us > (predicted_latency_us * 1.08);
+        const bool latency_improved =
+            predicted_latency_us > 0.0 && effective_latency_us < (predicted_latency_us * 0.92);
+        const auto rows = static_cast<std::uint32_t>(
+            operation.extents.size() > (operation.op_class == OperationClass::resample_2d ? 2u : 0u)
+                ? operation.extents[operation.op_class == OperationClass::resample_2d ? 2u : 0u]
+                : 1u);
+        const auto columns = static_cast<std::uint32_t>(
+            operation.extents.size() > (operation.op_class == OperationClass::resample_2d ? 3u : 1u)
+                ? operation.extents[operation.op_class == OperationClass::resample_2d ? 3u : 1u]
+                : 1u);
+        tile_m = std::max(tile_m, 2u);
+        tile_n = std::max(tile_n, 4u);
+        tile_k = std::max(tile_k, operation.op_class == OperationClass::convolution_2d ? 9u : 6u);
+        if (latency_regressed) {
+            tile_m += wide_vectors ? 4u : 2u;
+            if (columns >= 64u) {
+                tile_n += wide_vectors ? 8u : 4u;
+            }
+        } else if (latency_improved) {
+            if (rows < 32u) {
+                tile_m = std::max<std::uint32_t>(2u, tile_m - 2u);
+            }
+            if (columns < 64u) {
+                tile_n = std::max<std::uint32_t>(4u, tile_n - 4u);
+            }
+        }
+        tile_m = clamp_tile_feedback_hint(tile_m, rows, 1u, 2u);
+        tile_n = clamp_tile_feedback_hint(tile_n, columns, 1u, 4u);
+        tile_k = operation.op_class == OperationClass::convolution_2d ? 9u : 6u;
+        return;
+    }
     const auto summary = strongest_host_summary(graphs);
     const bool wide_vectors = summary.native_vector_bits >= 512u;
     const bool large_cache = summary.cache_bytes >= (2ull * kMiB);
@@ -1151,8 +1199,62 @@ void apply_cpu_runtime_tuning_hints(
     operation.cpu_parallel_chunk = choose_cpu_parallel_chunk_hint(operation, host_summary);
     operation.cpu_pack_budget_bytes = 0u;
     operation.cpu_single_thread_cutoff = 0u;
+    operation.cpu_kernel_family = "auto";
     operation.cpu_use_avx512 = false;
     operation.cpu_low_precision_kernel_family = "auto";
+    if (operation.op_class == OperationClass::convolution_2d) {
+        const auto height = static_cast<std::uint32_t>(operation.extents.size() > 0u ? operation.extents[0] : 1u);
+        const auto width = static_cast<std::uint32_t>(operation.extents.size() > 1u ? operation.extents[1] : 1u);
+        const auto out_height = height > 2u ? height - 2u : 1u;
+        const auto out_width = width > 2u ? width - 2u : 1u;
+        const auto vector_scale = host_summary.native_vector_bits >= 512u ? 2u : 1u;
+        operation.cpu_tile_m = clamp_cpu_tile_hint(std::max<std::uint32_t>(8u, 16u * vector_scale), out_height, 1u, 2u);
+        operation.cpu_tile_n = clamp_cpu_tile_hint(std::max<std::uint32_t>(16u, 32u * vector_scale), out_width, 1u, 4u);
+        operation.cpu_tile_k = 9u;
+        operation.cpu_parallel_chunk =
+            clamp_cpu_parallel_chunk_hint(operation, std::max(operation.cpu_parallel_chunk, operation.cpu_tile_m));
+        const std::uint64_t work_items = static_cast<std::uint64_t>(out_height) * out_width * 9ull;
+        operation.cpu_single_thread_cutoff =
+            work_items >= (1ull << 20u) ? (1u << 16u) : (work_items >= (1ull << 17u) ? (1u << 14u) : (1u << 12u));
+        operation.cpu_kernel_family =
+            operation.cpu_input_layout.find("patch9") != std::string::npos ? "conv-avx2-patch9" : "conv-avx2-dense";
+        return;
+    }
+    if (operation.op_class == OperationClass::resample_2d) {
+        const auto dst_h = static_cast<std::uint32_t>(operation.extents.size() > 2u ? operation.extents[2] : 1u);
+        const auto dst_w = static_cast<std::uint32_t>(operation.extents.size() > 3u ? operation.extents[3] : 1u);
+        const auto vector_scale = host_summary.native_vector_bits >= 512u ? 2u : 1u;
+        operation.cpu_tile_m = clamp_cpu_tile_hint(std::max<std::uint32_t>(8u, 12u * vector_scale), dst_h, 1u, 2u);
+        operation.cpu_tile_n = clamp_cpu_tile_hint(std::max<std::uint32_t>(16u, 24u * vector_scale), dst_w, 1u, 4u);
+        operation.cpu_tile_k = 6u;
+        operation.cpu_parallel_chunk =
+            clamp_cpu_parallel_chunk_hint(operation, std::max(operation.cpu_parallel_chunk, operation.cpu_tile_m));
+        const std::uint64_t work_items = static_cast<std::uint64_t>(dst_h) * dst_w * 4ull;
+        operation.cpu_single_thread_cutoff =
+            work_items >= (1ull << 20u) ? (1u << 16u) : (work_items >= (1ull << 17u) ? (1u << 14u) : (1u << 12u));
+        operation.cpu_kernel_family =
+            operation.cpu_input_layout.find("packed6") != std::string::npos ? "resample-avx2-packed6" : "resample-avx2-dense";
+        return;
+    }
+    if (operation.op_class == OperationClass::elementwise_map || operation.op_class == OperationClass::reduction) {
+        const bool attention_tail =
+            operation.attention_head_count > 0u ||
+            operation.preferred_kv_residency == "host" ||
+            operation.preferred_kv_residency == "shared" ||
+            operation.residency_sensitive_fusion;
+        if (attention_tail) {
+            operation.cpu_kernel_family =
+                operation.op_class == OperationClass::reduction ? "attention-tail-reduce" : "attention-tail-simd";
+            operation.cpu_single_thread_cutoff =
+                operation.op_class == OperationClass::reduction ? (1u << 13u) : (1u << 12u);
+            operation.cpu_parallel_chunk = clamp_cpu_parallel_chunk_hint(
+                operation,
+                std::max<std::uint32_t>(
+                    operation.cpu_parallel_chunk,
+                    operation.preferred_token_block > 0u ? operation.preferred_token_block : 256u));
+        }
+        return;
+    }
     if (operation.op_class != OperationClass::matmul) {
         return;
     }
@@ -1222,6 +1324,7 @@ void apply_cpu_runtime_tuning_hints(
     operation.cpu_single_thread_cutoff = work_items >= (1ull << 22u)
         ? 1u << 18u
         : (work_items >= (1ull << 18u) ? 1u << 16u : 1u << 14u);
+    operation.cpu_kernel_family = operation.attention_head_count > 0u ? "matmul-attention-blocked" : "matmul-blocked";
     operation.cpu_use_avx512 =
         executors::host_native_kernels_compiled_with_avx512() &&
         wide_vectors &&
@@ -1271,6 +1374,7 @@ void apply_operation_lowering_hints(
         operation.cpu_use_avx512 = false;
         operation.cpu_pack_budget_bytes = 0u;
         operation.cpu_single_thread_cutoff = 0u;
+        operation.cpu_kernel_family = "auto";
         operation.cpu_low_precision_kernel_family = "auto";
         operation.attention_head_count = 0u;
         operation.attention_head_group_size = 0u;
@@ -1716,7 +1820,9 @@ std::string performance_key(
            << config.tile_scale << '|'
            << config.overlap_ratio << '|'
            << config.partition_intensity << '|'
-           << config.precision_mix;
+           << config.precision_mix << '|'
+           << (config.semantic_head_partitioning ? 1 : 0) << '|'
+           << (config.semantic_token_partitioning ? 1 : 0);
     return stream.str();
 }
 
@@ -4715,15 +4821,32 @@ std::vector<ExecutionConfig> build_candidate_configs(
                 config.stages = 1u;
             }
             if (operation.attention_head_count > 0u) {
+                const auto phase = canonical_workload_phase(workload);
+                config.semantic_head_partitioning =
+                    config.participating_devices.size() > 1u &&
+                    (phase == WorkloadPhase::decode ||
+                     attention_head_group_count(operation) >=
+                         static_cast<std::uint32_t>(config.participating_devices.size()));
+                config.semantic_token_partitioning =
+                    config.participating_devices.size() > 1u &&
+                    operation.preferred_token_block > 0u &&
+                    phase == WorkloadPhase::prefill;
                 config.logical_partitions = std::max(
                     config.logical_partitions,
                     desired_semantic_partition_count(workload, operation, config));
                 if (operation.preferred_token_block > 0u &&
-                    canonical_workload_phase(workload) == WorkloadPhase::prefill &&
+                    phase == WorkloadPhase::prefill &&
                     config.participating_devices.size() > 1u) {
                     config.strategy =
                         config.strategy == ExecutionStrategy::single_device ? ExecutionStrategy::sharded : config.strategy;
                     config.overlap_transfers = config.overlap_transfers || operation.preferred_kv_residency == "shared";
+                }
+                if (phase == WorkloadPhase::decode &&
+                    config.participating_devices.size() > 1u &&
+                    config.strategy == ExecutionStrategy::single_device) {
+                    config.strategy = ExecutionStrategy::sharded;
+                    config.overlap_transfers =
+                        config.overlap_transfers || operation.preferred_kv_residency == "shared";
                 }
             }
             if (is_host_graph(resolved_primary_graph) && cpu_materialized_lowering_active(operation)) {
@@ -6703,6 +6826,9 @@ OperationOptimizationResult optimize_operation(
         double calibration_ratio = 1.0;
         double validation_spread_us = 0.0;
         double overlap_penalty_us = 0.0;
+        double telemetry_staging_hit_rate = 0.0;
+        double telemetry_cross_device_sync_cost_us = 0.0;
+        double telemetry_residency_pressure = graph.predicted_memory_pressure;
         const auto candidate_performance_key =
             performance_key(report_signature, graph_set_signature, workload, system, shape_bucket, candidate);
         if (const auto it = performance_cache.find(candidate_performance_key); it != performance_cache.end()) {
@@ -6710,6 +6836,11 @@ OperationOptimizationResult optimize_operation(
             historical_latency_us = it->second.average_effective_latency_us;
             average_reward = it->second.average_reward;
             average_relative_error = it->second.average_relative_error;
+            telemetry_staging_hit_rate = it->second.average_staging_hit_rate;
+            telemetry_cross_device_sync_cost_us = it->second.average_cross_device_sync_cost_us;
+            telemetry_residency_pressure = std::max(
+                telemetry_residency_pressure,
+                it->second.average_residency_pressure);
             learning_scale = std::clamp(it->second.average_prediction_scale, 0.50, 2.50);
             calibration_ratio = std::clamp(it->second.average_calibration_ratio, 0.50, 2.50);
             validation_spread_us = it->second.average_validation_spread_us;
@@ -6734,6 +6865,11 @@ OperationOptimizationResult optimize_operation(
             historical_latency_us = family_it->second.average_effective_latency_us;
             average_reward = family_it->second.average_reward * 0.85;
             average_relative_error = family_it->second.average_relative_error;
+            telemetry_staging_hit_rate = family_it->second.average_staging_hit_rate;
+            telemetry_cross_device_sync_cost_us = family_it->second.average_cross_device_sync_cost_us;
+            telemetry_residency_pressure = std::max(
+                telemetry_residency_pressure,
+                family_it->second.average_residency_pressure);
             learning_scale = std::clamp(family_it->second.average_prediction_scale, 0.60, 2.25);
             calibration_ratio = std::clamp(family_it->second.average_calibration_ratio, 0.60, 2.25);
             validation_spread_us = family_it->second.average_validation_spread_us;
@@ -6755,6 +6891,11 @@ OperationOptimizationResult optimize_operation(
             historical_latency_us = family_summary->average_effective_latency_us;
             average_reward = family_summary->average_reward * 0.82;
             average_relative_error = family_summary->average_relative_error;
+            telemetry_staging_hit_rate = family_summary->average_staging_hit_rate;
+            telemetry_cross_device_sync_cost_us = family_summary->average_cross_device_sync_cost_us;
+            telemetry_residency_pressure = std::max(
+                telemetry_residency_pressure,
+                family_summary->average_residency_pressure);
             learning_scale = std::clamp(family_summary->average_prediction_scale, 0.65, 2.10);
             calibration_ratio = std::clamp(family_summary->average_calibration_ratio, 0.65, 2.10);
             validation_spread_us = family_summary->average_validation_spread_us;
@@ -6772,6 +6913,9 @@ OperationOptimizationResult optimize_operation(
             penalty_it != backend_penalty_cache.end()) {
             backend_penalty_us = penalty_it->second;
         }
+        candidate.telemetry_staging_hit_rate = telemetry_staging_hit_rate;
+        candidate.telemetry_cross_device_sync_cost_us = telemetry_cross_device_sync_cost_us;
+        candidate.telemetry_residency_pressure = telemetry_residency_pressure;
 
         const double placement_bias_us =
             placement.strategy_source == PlanStrategySource::explicit_request
@@ -7781,14 +7925,32 @@ void AdaptiveExecutionOptimizer::load_cache() {
             continue;
         }
         const auto fields = split_tab(hint_line);
-        if (fields.size() != 5u && fields.size() != 8u && fields.size() != 9u) {
+        if (fields.size() != 5u && fields.size() != 8u && fields.size() != 9u &&
+            fields.size() != 10u && fields.size() != 11u) {
             continue;
         }
         try {
             CpuRuntimeHintSummary summary;
             summary.shape_bucket = fields[1];
             summary.preferred_parallel_chunk = static_cast<std::uint32_t>(std::stoul(fields[2]));
-            if (fields.size() == 9u) {
+            if (fields.size() == 11u) {
+                summary.preferred_tile_m = static_cast<std::uint32_t>(std::stoul(fields[3]));
+                summary.preferred_tile_n = static_cast<std::uint32_t>(std::stoul(fields[4]));
+                summary.preferred_tile_k = static_cast<std::uint32_t>(std::stoul(fields[5]));
+                summary.preferred_single_thread_cutoff = static_cast<std::uint32_t>(std::stoul(fields[6]));
+                summary.preferred_kernel_family = fields[7];
+                summary.preferred_use_avx512 = std::stoi(fields[8]) != 0;
+                summary.observations = static_cast<std::uint32_t>(std::stoul(fields[9]));
+                summary.average_effective_latency_us = std::stod(fields[10]);
+            } else if (fields.size() == 10u) {
+                summary.preferred_tile_m = static_cast<std::uint32_t>(std::stoul(fields[3]));
+                summary.preferred_tile_n = static_cast<std::uint32_t>(std::stoul(fields[4]));
+                summary.preferred_tile_k = static_cast<std::uint32_t>(std::stoul(fields[5]));
+                summary.preferred_single_thread_cutoff = static_cast<std::uint32_t>(std::stoul(fields[6]));
+                summary.preferred_kernel_family = fields[7];
+                summary.observations = static_cast<std::uint32_t>(std::stoul(fields[8]));
+                summary.average_effective_latency_us = std::stod(fields[9]);
+            } else if (fields.size() == 9u) {
                 summary.preferred_tile_m = static_cast<std::uint32_t>(std::stoul(fields[3]));
                 summary.preferred_tile_n = static_cast<std::uint32_t>(std::stoul(fields[4]));
                 summary.preferred_tile_k = static_cast<std::uint32_t>(std::stoul(fields[5]));
@@ -7894,6 +8056,14 @@ void AdaptiveExecutionOptimizer::apply_feedback_tuning_hints(WorkloadGraph& grap
         if (it->second.preferred_parallel_chunk > 0u) {
             operation.cpu_parallel_chunk =
                 clamp_cpu_parallel_chunk_hint(operation, it->second.preferred_parallel_chunk);
+        }
+        if (it->second.preferred_single_thread_cutoff > 0u) {
+            operation.cpu_single_thread_cutoff =
+                clamp_cpu_single_thread_cutoff_hint(operation, it->second.preferred_single_thread_cutoff);
+        }
+        if (!it->second.preferred_kernel_family.empty() &&
+            it->second.preferred_kernel_family != "auto") {
+            operation.cpu_kernel_family = it->second.preferred_kernel_family;
         }
         if (supports_feedback_tuned_cpu_tiles(operation)) {
             if (it->second.preferred_tile_m > 0u) {
@@ -8056,6 +8226,11 @@ void AdaptiveExecutionOptimizer::ingest_execution_feedback(
                 graphs,
                 effective_latency_us,
                 optimized.graph.predicted_latency_us);
+            const auto tuned_single_thread_cutoff = clamp_cpu_single_thread_cutoff_hint(
+                optimized.operation,
+                std::max(
+                    optimized.operation.cpu_single_thread_cutoff,
+                    tuned_chunk * std::max<std::uint32_t>(1u, std::min<std::uint32_t>(8u, host_parallelism_hint(graphs)))));
             auto& hint_summary = cpu_runtime_hint_cache_[hint_key];
             hint_summary.shape_bucket = hint_key;
             const double observation_count = static_cast<double>(hint_summary.observations);
@@ -8066,6 +8241,13 @@ void AdaptiveExecutionOptimizer::ingest_execution_feedback(
             hint_summary.preferred_parallel_chunk = clamp_cpu_parallel_chunk_hint(
                 optimized.operation,
                 static_cast<std::uint32_t>(std::lround(blended_chunk)));
+            hint_summary.preferred_single_thread_cutoff = clamp_cpu_single_thread_cutoff_hint(
+                optimized.operation,
+                static_cast<std::uint32_t>(std::lround(
+                    ((static_cast<double>(std::max(hint_summary.preferred_single_thread_cutoff, 1u)) * observation_count) +
+                     static_cast<double>(tuned_single_thread_cutoff)) /
+                    (observation_count + 1.0))));
+            hint_summary.preferred_kernel_family = optimized.operation.cpu_kernel_family;
             if (supports_feedback_tuned_cpu_tiles(optimized.operation)) {
                 std::uint32_t tuned_tile_m =
                     std::max(optimized.operation.cpu_tile_m, std::uint32_t{4u});
@@ -8272,7 +8454,7 @@ void AdaptiveExecutionOptimizer::persist_cache() const {
     if (!hint_output.is_open()) {
         return;
     }
-    hint_output << "# key\tshape_bucket\tpreferred_parallel_chunk\tpreferred_tile_m\tpreferred_tile_n\tpreferred_tile_k\tpreferred_use_avx512\tobservations\tavg_latency\n";
+    hint_output << "# key\tshape_bucket\tpreferred_parallel_chunk\tpreferred_tile_m\tpreferred_tile_n\tpreferred_tile_k\tpreferred_single_thread_cutoff\tpreferred_kernel_family\tpreferred_use_avx512\tobservations\tavg_latency\n";
     for (const auto& [key, summary] : cpu_runtime_hint_cache_) {
         hint_output << key << '\t'
                     << summary.shape_bucket << '\t'
@@ -8280,6 +8462,8 @@ void AdaptiveExecutionOptimizer::persist_cache() const {
                     << summary.preferred_tile_m << '\t'
                     << summary.preferred_tile_n << '\t'
                     << summary.preferred_tile_k << '\t'
+                    << summary.preferred_single_thread_cutoff << '\t'
+                    << summary.preferred_kernel_family << '\t'
                     << (summary.preferred_use_avx512 ? 1 : 0) << '\t'
                     << summary.observations << '\t'
                     << summary.average_effective_latency_us << '\n';
