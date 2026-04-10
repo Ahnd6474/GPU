@@ -1,8 +1,0 @@
-D:/GitHub/Jakal-Core/build_ninja/dist-brand-check/_CPack_Packages/win64/NSIS/Jakal-Core-0.1.0-Windows-AMD64/maintenance/share/jakal-core/install/install-jakal-core.ps1
-D:/GitHub/Jakal-Core/build_ninja/dist-brand-check/_CPack_Packages/win64/NSIS/Jakal-Core-0.1.0-Windows-AMD64/maintenance/share/jakal-core/install/build-nsis-package.ps1
-D:/GitHub/Jakal-Core/build_ninja/dist-brand-check/_CPack_Packages/win64/NSIS/Jakal-Core-0.1.0-Windows-AMD64/maintenance/share/jakal-core/install/jakal-prerequisites.json
-D:/GitHub/Jakal-Core/build_ninja/dist-brand-check/_CPack_Packages/win64/NSIS/Jakal-Core-0.1.0-Windows-AMD64/maintenance/share/jakal-core/install/prereqs/intel-level-zero-runtime/README.txt
-D:/GitHub/Jakal-Core/build_ninja/dist-brand-check/_CPack_Packages/win64/NSIS/Jakal-Core-0.1.0-Windows-AMD64/maintenance/share/jakal-core/install/prereqs/opencl-runtime/README.txt
-D:/GitHub/Jakal-Core/build_ninja/dist-brand-check/_CPack_Packages/win64/NSIS/Jakal-Core-0.1.0-Windows-AMD64/maintenance/share/jakal-core/install/prereqs/vulkan-support/README.txt
-D:/GitHub/Jakal-Core/build_ninja/dist-brand-check/_CPack_Packages/win64/NSIS/Jakal-Core-0.1.0-Windows-AMD64/maintenance/share/jakal-core/update/update-jakal-core.ps1
-D:/GitHub/Jakal-Core/build_ninja/dist-brand-check/_CPack_Packages/win64/NSIS/Jakal-Core-0.1.0-Windows-AMD64/maintenance/share/jakal-core/remove/remove-jakal-core.ps1

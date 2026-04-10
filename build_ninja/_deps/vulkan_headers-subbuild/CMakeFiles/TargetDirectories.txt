@@ -1,3 +1,0 @@
-D:/GitHub/Jakal-Core/build_ninja/_deps/vulkan_headers-subbuild/CMakeFiles/vulkan_headers-populate.dir
-D:/GitHub/Jakal-Core/build_ninja/_deps/vulkan_headers-subbuild/CMakeFiles/edit_cache.dir
-D:/GitHub/Jakal-Core/build_ninja/_deps/vulkan_headers-subbuild/CMakeFiles/rebuild_cache.dir

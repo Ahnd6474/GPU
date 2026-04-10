@@ -1,13 +1,32 @@
 .idea/
+.vscode/
+.vs/
 .venv/
 __pycache__/
+
+# Local build trees and generated packaging output
 build/
+build*/
+build_ninja/
+cmake-build-*/
 out/
+dist/
+dist-*/
+Testing/
+_CPack_Packages/
+
+# Local temp and scratch files
 %TEMP%/
 .codex-temp/
+.codex-*
+*.tmp
+*.log
+*.err.log
+*.out.log
+*.bak
+*.bak*
 
-
-
+# Binary and object outputs
 *.obj
 *.o
 *.pyc
@@ -19,6 +38,16 @@ out/
 *.a
 *.so
 *.dylib
+*.sha256
 
+# Local runtime/debug artifacts
+dump/
 gpu_runtime_plan_cache.tsv
 qwen2.5-0.5b.ollama.gguf
+
+# Tool download caches
+tools/nsis/pkg/
+tools/nsis/*.zip
+
+# User-specific local configuration
+CMakeUserPresets.json

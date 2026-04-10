@@ -70,6 +70,16 @@ cmake -S . -B build -DJAKAL_CORE_BUILD_TESTS=OFF
 cmake --build build --config Release --target package
 ```
 
+For a signed Windows installer with checksum sidecar generation, use:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\packaging\build-nsis-package.ps1 `
+  -CodeSignCertSha1 "<thumbprint>" `
+  -SignToolPath "C:\Program Files (x86)\Windows Kits\10\App Certification Kit\signtool.exe"
+```
+
+For GitHub release automation and tag-based draft release publishing, see `docs/release.md`.
+
 If you are using a multi-config generator such as Visual Studio, CTest also needs a configuration name:
 
 ```powershell

@@ -1,3 +1,0 @@
-D:/GitHub/Jakal-Core/build_ninja/dist-brand-check/_CPack_Packages/win64/NSIS/Jakal-Core-0.1.0-Windows-AMD64/docs/share/doc/JakalCore/README.md
-D:/GitHub/Jakal-Core/build_ninja/dist-brand-check/_CPack_Packages/win64/NSIS/Jakal-Core-0.1.0-Windows-AMD64/docs/share/doc/JakalCore/LICENSE
-D:/GitHub/Jakal-Core/build_ninja/dist-brand-check/_CPack_Packages/win64/NSIS/Jakal-Core-0.1.0-Windows-AMD64/docs/share/doc/JakalCore/distribution.md

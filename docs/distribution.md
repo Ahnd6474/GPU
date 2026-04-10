@@ -55,6 +55,14 @@ For NSIS package generation with a portable `makensis.exe`:
 powershell -ExecutionPolicy Bypass -File .\packaging\build-nsis-package.ps1
 ```
 
+If you pass a certificate thumbprint, the script also signs the generated installer and emits a `.sha256` sidecar for checksum verification:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\packaging\build-nsis-package.ps1 `
+  -CodeSignCertSha1 "<thumbprint>" `
+  -SignToolPath "C:\Program Files (x86)\Windows Kits\10\App Certification Kit\signtool.exe"
+```
+
 ## Package generation
 
 Typical flow:
@@ -72,9 +80,9 @@ When `Jakal_core_logo.png` is present at the repository root, the Windows config
 - `jakal-core-logo-header.bmp` for the NSIS header image
 - `jakal-core-logo-wizard.bmp` for the NSIS welcome and finish pages
 
-## Code signing
+## Code signing and verification
 
-Code signing is opt-in and currently targets Windows executables. Configure these cache variables:
+Binary signing is opt-in. Configure these cache variables when you want build outputs such as `jakal_core_cli.exe` or `jakal_bootstrap.exe` signed during compilation:
 
 - `JAKAL_CORE_ENABLE_CODE_SIGNING=ON`
 - `JAKAL_CORE_SIGNTOOL_PATH=...`
@@ -82,3 +90,12 @@ Code signing is opt-in and currently targets Windows executables. Configure thes
 - `JAKAL_CORE_CODESIGN_TIMESTAMP_URL=...`
 
 The build will then sign installable executables after each successful build. A valid certificate is still required; the repository does not include one.
+
+To sign the NSIS installer itself, use `packaging/build-nsis-package.ps1` with `-CodeSignCertSha1`. That wrapper will:
+
+- pass the signing settings through to CMake so packaged executables are signed
+- Authenticode-sign the generated `.exe` installer
+- verify the installer signature with `signtool verify /pa`
+- write an adjacent `<installer>.sha256` file and verify the checksum immediately
+
+`packaging/update-jakal-core.ps1` now verifies `.exe` and `.msi` installers before launching them, and it will also validate a `.sha256` sidecar when one is present. Pass `-RequireChecksum` if your automation must fail when the checksum file is missing.
