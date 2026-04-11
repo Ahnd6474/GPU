@@ -1,15 +1,16 @@
 # Jakal-Core
 
-Graph-first heterogeneous compute runtime skeleton for C++20.
+Graph-first heterogeneous compute runtime skeleton for C++20, with a shared C API, a diagnostic CLI, and install/package tooling.
 
-This repository builds the `jakal_core` library target, publishes headers under `include/jakal`, and includes runnable examples and tests around the runtime skeleton.
+This repository builds the `jakal_core` library target, the `jakal_runtime` shared library, and a set of build-tree tools around hardware discovery, workload planning, execution tuning, and packaged runtime diagnostics.
 
-Jakal-Core is not a production runtime yet. It is a small CMake library with examples and tests that:
+Jakal-Core is not a production runtime yet. It is a runtime skeleton that:
 
 - discovers host and accelerator hardware
 - turns that hardware into structural graphs
 - builds placement and execution plans from those graphs
-- runs a compact set of direct kernels to check whether those plans make sense on a real machine
+- runs a compact direct kernel set to check whether those plans make sense on a real machine
+- exposes the same runtime through C++, C, CLI, and small Python helpers
 
 ## Table of contents
 
@@ -20,26 +21,33 @@ Jakal-Core is not a production runtime yet. It is a small CMake library with exa
 - [Current scope](#current-scope)
 - [API](#api)
   - [C++ entry points](#c-entry-points)
-  - [Workload helpers](#workload-helpers)
-  - [Managed execution and manifests](#managed-execution-and-manifests)
-  - [C API](#c-api)
-  - [Cache files](#cache-files)
+  - [Runtime options and install paths](#runtime-options-and-install-paths)
+  - [Workload helpers and imported sources](#workload-helpers-and-imported-sources)
+  - [C API and shared runtime](#c-api-and-shared-runtime)
+  - [CLI](#cli)
+  - [Python helpers](#python-helpers)
+  - [Cache files and installed layout](#cache-files-and-installed-layout)
 - [Examples](#examples)
 - [Further reading](#further-reading)
 - [License](#license)
 
 ## Installation
 
-Jakal-Core is still source-first, but the tree now also exposes local install rules, exported CMake package files, and CPack package generation for downstream use.
+Jakal-Core is still source-first, but the tree now supports local installs, exported CMake package files, and CPack package generation for downstream use.
 
 ### Requirements
 
 - CMake 3.20 or newer
 - A C++20 compiler
-- An OpenCL runtime or driver if you want OpenCL discovery and direct OpenCL execution
-- Optional runtime libraries for Level Zero, CUDA, or ROCm if you want those probes and native backends to activate automatically
+- Internet access on the first configure unless `FetchContent` already has `Vulkan-Headers` cached. The top-level `CMakeLists.txt` downloads `v1.4.321` during configure.
+- Vendor runtimes or drivers for the backends you want to exercise:
+  - OpenCL for OpenCL discovery and direct OpenCL execution
+  - Intel Level Zero for Level Zero discovery and native Intel GPU paths
+  - Vulkan loader plus shader compiler tools if you want the Vulkan direct backend to become fully ready
+  - CUDA or ROCm runtime libraries if you want those probes and modeled/native paths to activate
+- Windows plus DirectML libraries if you want to build `jakal_directml_manifest_bench`
 
-The project loads accelerator runtimes dynamically. If a given runtime library is not present, the corresponding probe simply stays inactive.
+The project loads accelerator runtimes dynamically. If a given runtime library is missing, the corresponding probe stays inactive or modeled-only.
 
 ### Build the project
 
@@ -48,29 +56,73 @@ From the repository root:
 ```powershell
 cmake -S . -B build
 cmake --build build
-cmake --install build --config Release
 ```
 
-The default build produces the `jakal_core` library plus these executables when product tools, examples, and tests are enabled:
+The default build produces:
 
-- tools: `jakal_bootstrap`
-- examples: `jakal_inspect`, `jakal_profile_workloads`, `jakal_explore_cpu_dl`, `jakal_partition_roles`
-- test binaries: `jakal_smoke`, `jakal_optimization`, `jakal_planner_learning`, `jakal_partition_strategies`, `jakal_runtime_product`, `jakal_workload_import_adapters`, `jakal_backend_contracts`, `jakal_live_backend_smoke`, `jakal_preset_execution_diag`
+- libraries: `jakal_core`, `jakal_runtime`
+- install and package tools: `jakal_core_cli`, `jakal_bootstrap`
+- examples: `jakal_inspect`, `jakal_profile_workloads`, `jakal_explore_cpu_dl`, `jakal_partition_roles`, `jakal_profile_manifest`
+- Windows-only example: `jakal_directml_manifest_bench`
+- tests: `jakal_smoke`, `jakal_optimization`, `jakal_planner_learning`, `jakal_partition_strategies`, `jakal_runtime_product`, `jakal_workload_import_adapters`, `jakal_backend_contracts`, `jakal_live_backend_smoke`, `jakal_preset_execution_diag`, `jakal_runtime_install_smoke`, `jakal_workload_bench`
 
 Useful CMake switches:
 
 ```powershell
-cmake -S . -B build -DJAKAL_CORE_BUILD_EXAMPLES=OFF -DJAKAL_CORE_BUILD_TESTS=OFF
+cmake -S . -B build `
+  -DJAKAL_CORE_BUILD_EXAMPLES=OFF `
+  -DJAKAL_CORE_BUILD_TESTS=OFF `
+  -DJAKAL_CORE_BUILD_PRODUCT_TOOLS=OFF
 ```
 
-To generate a distributable package:
+### Install locally
+
+To create a local install tree:
+
+```powershell
+cmake --install build --config Release --prefix .\out\jakal-core
+```
+
+The install tree is smaller than the full development build. It installs:
+
+- `jakal_core`
+- `jakal_runtime`
+- `jakal_core_cli`
+- `jakal_bootstrap` when product tools are enabled
+- `jakal_inspect` when examples are enabled
+- public headers, exported CMake package files, docs, install/update/remove helpers, and Python helper scripts
+
+Typical installed layout:
+
+- `bin/`: `jakal_core_cli`, `jakal_bootstrap`, `jakal_inspect`, `launch-jakal-hardware-setup.cmd`
+- `lib/`: `jakal_core`, `jakal_runtime`, exported CMake package files
+- `include/`: public headers under `jakal/`
+- `share/jakal-core/`: runtime config, maintenance scripts, bundled prerequisite locations, branding assets, Python helpers
+- `share/doc/JakalCore/`: `README.md`, `LICENSE`, `docs/distribution.md`
+
+### Consume the installed package
+
+Jakal-Core installs exported CMake package files, so an installed copy can be consumed with `find_package`:
+
+```cmake
+find_package(JakalCore CONFIG REQUIRED)
+target_link_libraries(my_app PRIVATE jakal::core)
+```
+
+If you want the shared C runtime surface instead of the C++ library target, link `jakal::runtime`.
+
+### Generate packages
+
+For a ZIP or TGZ package:
 
 ```powershell
 cmake -S . -B build -DJAKAL_CORE_BUILD_TESTS=OFF
 cmake --build build --config Release --target package
 ```
 
-For a signed Windows installer with checksum sidecar generation, use:
+On Windows the default package generator is ZIP. NSIS is added automatically when `makensis` is available.
+
+For a Windows installer with optional signing and checksum generation:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\packaging\build-nsis-package.ps1 `
@@ -78,15 +130,28 @@ powershell -ExecutionPolicy Bypass -File .\packaging\build-nsis-package.ps1 `
   -SignToolPath "C:\Program Files (x86)\Windows Kits\10\App Certification Kit\signtool.exe"
 ```
 
-For GitHub release automation and tag-based draft release publishing, see `docs/release.md`.
+If you want build-time signing for installable Windows executables such as `jakal_core_cli.exe` and `jakal_bootstrap.exe`, configure:
 
-If you are using a multi-config generator such as Visual Studio, CTest also needs a configuration name:
+- `JAKAL_CORE_ENABLE_CODE_SIGNING=ON`
+- `JAKAL_CORE_SIGNTOOL_PATH=...`
+- `JAKAL_CORE_CODESIGN_CERT_SHA1=...`
+- `JAKAL_CORE_CODESIGN_TIMESTAMP_URL=...`
+
+For the packaged runtime flow, including bundled prerequisite directories and the NSIS launcher entry points, see [`docs/distribution.md`](./docs/distribution.md).
+
+### Run the tests
+
+For multi-config generators such as Visual Studio:
 
 ```powershell
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
-On single-config generators such as Ninja or Unix Makefiles, the `-C Debug` part is not needed.
+For single-config generators such as Ninja or Unix Makefiles:
+
+```powershell
+ctest --test-dir build --output-on-failure
+```
 
 ## Quick start
 
@@ -115,25 +180,21 @@ int main() {
 }
 ```
 
-`jakal::Runtime` refreshes hardware during construction, so `devices()` is ready right away unless you explicitly disable every probe.
+`jakal::Runtime` refreshes hardware during construction by default, so `devices()` is ready immediately unless you explicitly disable every probe.
 
-If you just want to see what the repository does without writing code, build the tree and run:
+If you want to inspect the runtime without writing code, start with the build-tree tools:
 
 ```powershell
+.\build\Debug\jakal_core_cli.exe doctor --json --host-only
 .\build\Debug\jakal_inspect.exe
-```
-
-On single-config generators, the executable is typically `./build/jakal_inspect`.
-
-For install and first-run diagnostics, the bootstrap tool is:
-
-```powershell
 .\build\Debug\jakal_bootstrap.exe --status --self-check
 ```
 
+On single-config generators, the executables are typically under `.\build\` instead of `.\build\Debug\`.
+
 ## What is this repository?
 
-Jakal-Core treats hardware as a graph instead of a label. A discovered CPU, OpenCL device, CUDA device, or Level Zero device becomes a set of compute, storage, control, and transfer nodes with weighted edges between them. The planner then works from that structure when it decides where a workload should land.
+Jakal-Core treats hardware as a graph instead of a label. A discovered CPU, OpenCL device, Level Zero device, Vulkan device, CUDA device, or ROCm device becomes a set of compute, storage, control, and transfer nodes with weighted edges between them. The planner then works from that structure when it decides where a workload should land.
 
 There are four main pieces in the tree today:
 
@@ -150,7 +211,14 @@ The built-in direct operation set covers:
 - 3x3 convolution
 - bilinear resample
 
-There are also built-in workload presets for:
+The repository also ships:
+
+- a shared C runtime surface in `jakal_runtime`
+- a packaged-runtime CLI in `jakal_core_cli`
+- install/update/remove scripts and a hardware-setup launcher
+- Python ctypes helpers for simple diagnostics and manifest execution
+
+There are built-in workload presets for:
 
 - gaming-style upscaling and post-processing
 - vision-style inference
@@ -159,7 +227,7 @@ There are also built-in workload presets for:
 
 ## Why graph-first planning?
 
-Flat device labels hide the details that actually drive placement. "GPU" does not tell you whether the device has unified memory, what its host link looks like, how much dispatch latency it carries, or how much structure it exposes for mapping work.
+Flat device labels hide the details that actually drive placement. "GPU" does not tell you whether the device has unified memory, what its host link looks like, how much dispatch latency it carries, or what kind of execution structure it exposes for mapping work.
 
 The planner in this repository scores things like:
 
@@ -170,7 +238,7 @@ The planner in this repository scores things like:
 - dispatch, synchronization, and transfer costs
 - graph shape, not just vendor or backend name
 
-That lets the runtime ask more useful questions:
+That lets the runtime ask more specific questions:
 
 - should a latency-sensitive decode stage stay on the host?
 - is unified memory worth preferring for this workload?
@@ -181,22 +249,22 @@ That is the point of this codebase right now. It is closer to an executable mode
 
 ## Current scope
 
-This is where the repository actually stands today:
+This is where the repository stands today:
 
-- Discovery can use host, OpenCL, Level Zero, CUDA, and ROCm probes when the matching runtime libraries are present.
+- Discovery can use host, OpenCL, Level Zero, Vulkan, CUDA, and ROCm probes when the matching runtime libraries are present.
 - Planning and optimization work across those discovered graphs.
-- The direct executor can run host kernels, OpenCL kernels, and some native Level Zero, CUDA, and ROCm kernels.
+- The direct executor can run host kernels, OpenCL kernels, Vulkan direct kernels, and some native Level Zero, CUDA, and ROCm kernels.
 - The managed execution layer can run native workload manifests, do memory preflight checks, emit residency and asset-prefetch plans, and write TSV telemetry.
 - `load_workload_source(...)` can build workload graphs from native manifests and imported model descriptions such as ONNX and GGUF.
-- Native backend coverage is uneven. Missing native kernels fall back to host execution rather than pretending the backend is complete.
-- The toolkit-ranking layer and planner can reason about more backend variants than the direct executor can run end to end.
+- `jakal_runtime` exposes the runtime through a smaller C ABI, and `jakal_core_cli` exposes install-path and backend-health diagnostics for packaged runtime scenarios.
+- The Python helpers under [`python/`](./python/) wrap the C ABI for lightweight `doctor`, `paths`, `optimize-smoke`, and `run-manifest` flows.
 
 What is still missing:
 
 - real tensor allocators and residency movement beyond the current planning and diagnostics layer
-- framework bridges for PyTorch, TensorFlow, or similar runtimes
+- framework bridges for PyTorch, TensorFlow, or similar runtimes beyond the small export helper in `scripts/`
 - polished production packaging beyond the current local install and CPack flow
-- a stable production execution stack with mature backend coverage
+- a stable production execution stack with mature native backend coverage across every supported accelerator path
 
 ## API
 
@@ -214,12 +282,15 @@ The main public headers are:
 
 | Method | What it does |
 | --- | --- |
-| `refresh_hardware()` | Re-runs device discovery and rebuilds the toolkit index |
+| `refresh_hardware()` | Re-runs device discovery and rebuilds runtime backend status |
+| `options()` | Returns the normalized runtime options in use |
+| `install_paths()` | Returns the resolved install, cache, log, telemetry, and Python helper paths |
+| `backend_statuses()` | Returns per-backend readiness such as `ready_direct` or `ready_modeled` |
 | `devices()` | Returns discovered hardware graphs |
 | `jakal_toolkit_index()` | Returns ranked backend variants per discovered device |
 | `plan(workload)` | Builds or loads a cached placement plan |
-| `optimize(workload)` | Builds workload and execution graphs, then picks execution settings |
-| `optimize(workload, workload_graph)` | Optimizes an explicit workload graph instead of generating the default one |
+| `optimize(workload)` | Builds workload and execution graphs, then chooses execution settings |
+| `optimize(workload, workload_graph)` | Optimizes a caller-supplied workload graph instead of generating the default one |
 | `execute(workload)` | Runs the selected execution path and feeds the results back into the optimizer |
 | `execute_managed(workload)` | Runs placement, optimization, safety gates, and direct execution with extra diagnostics |
 | `execute_managed(workload, workload_graph)` | Managed execution for a caller-supplied workload graph |
@@ -227,11 +298,10 @@ The main public headers are:
 
 `jakal::RuntimeOptions` lets you:
 
-- enable or disable host, OpenCL, Level Zero, CUDA, and ROCm probes
+- enable or disable host, OpenCL, Level Zero, Vulkan, CUDA, and ROCm probes
 - prefer Level Zero over OpenCL when both match the same hardware
-- override the plan cache path
-- override the execution cache path
-- tune memory, safety, and observability policy through `RuntimeProductPolicy`
+- override the install root, planner cache path, and execution cache path
+- tune memory, safety, observability, and execution optimization policy
 
 `jakal::WorkloadSpec` is the main planning input.
 
@@ -251,62 +321,50 @@ The main public headers are:
 | `phase` | `jakal::WorkloadPhase` | Phase hint such as `prefill`, `decode`, or `training_step` |
 | `shape_bucket` | `std::string` | Optional bucket used for cache reuse and planning families |
 
-### Workload helpers
+### Runtime options and install paths
 
-If you do not want to invent workloads by hand, [`include/jakal/workloads.hpp`](./include/jakal/workloads.hpp) exposes two helper sets:
+`runtime.hpp` also exposes install-aware helpers:
+
+- `resolve_runtime_install_paths(...)`
+- `make_runtime_options_for_install(...)`
+
+Those helpers are what the CLI, the install smoke tests, and the packaged-runtime scripts use. They resolve the writable and config locations first, then point planner cache, execution cache, and telemetry output at those paths.
+
+`RuntimeInstallPaths` contains:
+
+| Field | Meaning |
+| --- | --- |
+| `install_root` | Explicit runtime install root or `JAKAL_INSTALL_ROOT` |
+| `writable_root` | Writable runtime root chosen for caches and logs |
+| `config_dir` | Directory that holds `jakal-runtime-config.ini` |
+| `cache_dir` | Directory for planner and execution caches |
+| `logs_dir` | Directory for runtime logs and telemetry |
+| `telemetry_path` | Path to `runtime-telemetry.tsv` |
+| `planner_cache_path` | Path to the planner cache TSV |
+| `execution_cache_path` | Path to the execution cache TSV |
+| `python_dir` | Runtime install-root Python helper directory, or a writable fallback when no install root is set |
+
+### Workload helpers and imported sources
+
+If you do not want to invent workloads by hand, [`include/jakal/workloads.hpp`](./include/jakal/workloads.hpp) exposes:
 
 - `canonical_workload_presets()` for gaming, vision inference, and compact training-step surrogates
 - `cpu_deep_learning_exploration_presets()` for host-heavy inference cases such as decode, KV-cache maintenance, and dequant pipelines
-
-`default_workload_graph(workload)` expands a `WorkloadSpec` into a `WorkloadGraph` with tensors, lifetimes, dependencies, and operation metadata.
-
-The same header also exposes:
-
-- `load_workload_source(path)` to load a native manifest or an imported source file
+- `load_workload_source(path)` to load a native manifest or imported source file
 - `load_workload_manifest(path)` as the explicit manifest entry point
+- `compile_workload_graph(graph)` to index tensors and operations for downstream execution logic
 - `normalize_workload_graph(graph)` to rebuild tensor lifetimes and dependency bookkeeping after manual edits
 
-The adapter tests currently cover:
+`default_workload_graph(workload)` in [`include/jakal/execution.hpp`](./include/jakal/execution.hpp) expands a `WorkloadSpec` into a `WorkloadGraph` with tensors, lifetimes, dependencies, and operation metadata.
+
+The adapter and import coverage in the tree includes:
 
 - native `.workload` manifests with optional `[asset]`, `[tensor]`, `[operation]`, and `[dependency]` sections
 - `.onnx` graphs, including external data blobs
 - `.gguf` weights, including shard discovery
 - text-based imported descriptions used for PyTorch-export and GGML-style inputs
 
-There is also a small PyTorch bridge in [`scripts/export_torch_workload.py`](./scripts/export_torch_workload.py).
-It emits `pytorch_export` `.workload` files for built-in tensor-model presets such as:
-
-- `finance-factor-risk-lite`
-- `signal-filterbank-lite`
-- `graph-ranking-lite`
-- `scientific-solver-step-lite`
-
-Example:
-
-```powershell
-python .\scripts\export_torch_workload.py --preset finance-factor-risk-lite --output .\finance-factor-risk-lite.workload
-.\build\Debug\jakal_profile_manifest.exe .\finance-factor-risk-lite.workload --passes 3 --level-zero-only
-.\build\Debug\jakal_directml_manifest_bench.exe .\finance-factor-risk-lite.workload --passes 3
-```
-
-### Managed execution and manifests
-
-`jakal::RuntimeProductPolicy` is the part of `RuntimeOptions` that controls:
-
-- memory reserve ratios and preflight blocking
-- planner confidence and rollback gates
-- telemetry persistence
-
-`ManagedExecutionReport` adds these diagnostics on top of the direct execution report:
-
-- resolved placement plan and planner confidence
-- memory preflight and spill predictions
-- kernel coverage checks
-- asset prefetch entries
-- residency sequence actions
-- telemetry output path
-
-If you want to run a manifest directly, `execute_manifest(...)` accepts both a spec-only manifest and a graph-backed manifest. A minimal graph-backed example looks like this:
+If you want to call `execute_manifest(...)` directly, a minimal graph-backed `.workload` file looks like this:
 
 ```ini
 [workload]
@@ -321,14 +379,6 @@ batch_size=1
 latency_sensitive=true
 prefer_unified_memory=true
 
-[asset]
-id=weights-shard
-path=weights.bin
-tensor_ids=weights
-preload_required=true
-persistent=true
-host_visible=true
-
 [tensor]
 id=input
 bytes=16384
@@ -336,57 +386,53 @@ consumers=normalize
 host_visible=true
 
 [tensor]
-id=weights
-bytes=16384
-consumers=normalize
-persistent=true
-host_visible=true
-
-[tensor]
 id=hidden
 bytes=16384
 producer=normalize
-consumers=score
 
 [operation]
 name=normalize
 class=elementwise_map
 extents=4096
-input_bytes=32768
+input_bytes=16384
 output_bytes=16384
 estimated_flops=8192
 parallelizable=true
 streaming_friendly=true
-inputs=input,weights
+inputs=input
 outputs=hidden
 ```
 
-If `weights.bin` is required and missing, `execute_manifest(...)` returns a managed report with `asset_prefetch.missing_required_assets=true`, marks the run as not executed, and still writes telemetry.
+If a manifest references required assets that are missing on disk, the managed path reports the failure, marks the run as not executed, and still writes telemetry.
 
-For repeated comparisons across backends, [`scripts/run_manifest_benchmarks.py`](./scripts/run_manifest_benchmarks.py) wraps:
+There is also a small PyTorch bridge in [`scripts/export_torch_workload.py`](./scripts/export_torch_workload.py). It emits `pytorch_export` `.workload` files for built-in tensor-model presets such as:
 
-- `jakal_profile_manifest` in `host` and `level-zero` modes
-- optional `opencl` mode
-- `jakal_directml_manifest_bench` when the executable is available
+- `finance-factor-risk-lite`
+- `signal-filterbank-lite`
+- `graph-ranking-lite`
+- `scientific-solver-step-lite`
 
-`jakal_directml_manifest_bench` is a standalone DirectML operator baseline. It is useful for backend-to-backend kernel checks, but it is not the same thing as the managed runtime total reported by `jakal_profile_manifest`.
-
-Examples:
+Example:
 
 ```powershell
-python .\scripts\run_manifest_benchmarks.py --all-torch-presets --passes 3
-python .\scripts\run_manifest_benchmarks.py --manifest .\qwen2.5-0.5b.ollama.gguf --passes 3
+python .\scripts\export_torch_workload.py --preset finance-factor-risk-lite --output .\finance-factor-risk-lite.workload
+.\build\Debug\jakal_profile_manifest.exe .\finance-factor-risk-lite.workload --passes 3 --level-zero-only
+.\build\Debug\jakal_directml_manifest_bench.exe .\finance-factor-risk-lite.workload --passes 3
 ```
 
-### C API
+### C API and shared runtime
 
-The C API in [`include/jakal/c_api.h`](./include/jakal/c_api.h) mirrors the same runtime in a smaller surface.
+The shared runtime target is `jakal_runtime`. Its C API lives in [`include/jakal/c_api.h`](./include/jakal/c_api.h) and mirrors the same runtime through a smaller, install-friendly ABI.
 
 Core lifecycle and inspection:
 
 - `jakal_core_runtime_create`
+- `jakal_core_runtime_create_with_options`
 - `jakal_core_runtime_destroy`
 - `jakal_core_runtime_refresh`
+- `jakal_core_runtime_get_install_paths`
+- `jakal_core_runtime_backend_status_count`
+- `jakal_core_runtime_get_backend_status`
 - `jakal_core_runtime_device_count`
 - `jakal_core_runtime_get_device`
 - `jakal_core_runtime_graph_node_count`
@@ -399,30 +445,69 @@ Planning, optimization, and execution:
 - `jakal_core_runtime_plan`
 - `jakal_core_runtime_optimize`
 - `jakal_core_runtime_execute`
+- `jakal_core_runtime_execute_manifest`
 
-The C API currently stops at the direct execution layer. Managed execution, manifest loading, asset-prefetch planning, and telemetry controls are C++-only for now.
+The C API exposes install paths and backend readiness in addition to devices and execution reports. That is what `jakal_runtime_install_smoke` validates in the test suite.
 
-Accepted `jakal_core_workload_spec.kind` strings are:
+### CLI
 
-- `custom`
-- `inference`
-- `image`
-- `tensor`
-- `gaming`
-- `training`
+`src/jakal_core_cli.cpp` builds the packaged-runtime CLI.
 
-The array-returning functions follow the usual "capacity plus out-count" pattern. Pass a buffer and its capacity, and the function writes the number of required entries to `out_count`. If the buffer is missing or too small, the function returns an error code after telling you how many entries were needed.
+| Command | What it does |
+| --- | --- |
+| `doctor [--host-only] [--json] [--runtime-root PATH]` | Prints or emits JSON for backend readiness, install paths, device summary, and recommended runtime setup |
+| `devices [--host-only] [--runtime-root PATH]` | Prints discovered devices with a compact graph summary |
+| `paths [--runtime-root PATH]` | Prints resolved install, config, cache, log, telemetry, and Python helper paths |
+| `smoke [--host-only] [--runtime-root PATH]` | Runs a small built-in workload and reports success or failure |
+| `run-manifest <path> [--host-only] [--runtime-root PATH]` | Loads a manifest or imported workload source and runs the managed execution path |
 
-### Cache files
+Examples:
 
-By default the runtime writes lightweight TSV caches to the system temp directory:
+```powershell
+.\build\Debug\jakal_core_cli.exe doctor --json
+.\build\Debug\jakal_core_cli.exe devices --host-only
+.\build\Debug\jakal_core_cli.exe run-manifest .\finance-factor-risk-lite.workload --host-only
+```
 
-- `jakal_core_plan_cache.tsv`
-- `jakal_core_execution_cache.tsv`
-- `jakal_core_execution_cache.tsv.perf`
-- `jakal_core_runtime_telemetry.tsv`
+### Python helpers
 
-You can redirect those files through `jakal::RuntimeOptions`.
+The repository also ships lightweight Python wrappers in [`python/jakal_runtime.py`](./python/jakal_runtime.py) and [`python/jakal_app_adapter.py`](./python/jakal_app_adapter.py).
+
+`jakal_runtime.py` loads `jakal_runtime.dll` or `libjakal_runtime.so` with `ctypes` and exposes:
+
+- runtime creation with optional host-only defaults
+- install-path queries
+- backend status queries
+- `optimize(...)`
+- `execute_manifest(...)`
+
+`jakal_app_adapter.py` is a small CLI on top of that wrapper:
+
+```powershell
+python .\python\jakal_app_adapter.py doctor --host-only
+python .\python\jakal_app_adapter.py paths
+python .\python\jakal_app_adapter.py optimize-smoke --host-only
+python .\python\jakal_app_adapter.py run-manifest .\finance-factor-risk-lite.workload
+```
+
+### Cache files and installed layout
+
+When you use `make_runtime_options_for_install(...)`, the runtime points its writable files at the resolved runtime directories instead of the old ad hoc temp-file naming scheme.
+
+The important defaults are:
+
+- `cache/planner-cache.tsv`
+- `cache/execution-cache.tsv`
+- `logs/runtime-telemetry.tsv`
+
+If a runtime install root is available, `python_dir` resolves to `<install_root>/python`. Otherwise it falls back to `<writable_root>/python`.
+
+The packaged runtime layout described in [`docs/distribution.md`](./docs/distribution.md) adds:
+
+- `share/jakal-core/config/jakal-runtime-config.ini`
+- `share/jakal-core/install/` and `share/jakal-core/install/prereqs/`
+- `share/jakal-core/update/`
+- `share/jakal-core/remove/`
 
 ## Examples
 
@@ -440,6 +525,18 @@ This prints:
 - a sample placement plan
 - optimization summaries
 - direct execution results
+
+### Inspect packaged-runtime health
+
+```powershell
+.\build\Debug\jakal_core_cli.exe doctor --json
+```
+
+This is the easiest way to inspect:
+
+- resolved runtime paths
+- backend readiness such as `ready-direct` or `ready-modeled`
+- recommended setup presets such as `cpu-only`, `intel-level-zero`, `vulkan-runtime`, `opencl-fallback`, or `auto`
 
 ### Bootstrap install and self-check
 
@@ -461,6 +558,46 @@ This prints:
 ```
 
 This runs the built-in gaming, inference, and training-style presets twice so you can compare cold and warm behavior and see what the learning cache changes.
+
+### Profile imported manifests and model files
+
+```powershell
+.\build\Debug\jakal_profile_manifest.exe .\finance-factor-risk-lite.workload --passes 3 --host-only
+```
+
+You can also point it at imported model sources:
+
+```powershell
+.\build\Debug\jakal_profile_manifest.exe .\qwen2.5-0.5b.ollama.gguf --passes 3
+.\build\Debug\jakal_profile_manifest.exe --ollama-model qwen2.5:0.5b --passes 3
+```
+
+Useful options include:
+
+- `--host-only`
+- `--level-zero-only`
+- `--opencl-only`
+- `--show-ops`
+- `--partition-strategy auto_balanced|blind_sharded|role_split|reduce_on_gpu|projection_sharded|tpu_like`
+- `--tuning-profile default|host-latency|hybrid-balanced|accelerator-throughput|cooperative-split`
+- `--graph-rewrite-level N`
+- `--graph-passes N`
+- `--state key=value`
+
+For repeated comparisons across backends, [`scripts/run_manifest_benchmarks.py`](./scripts/run_manifest_benchmarks.py) wraps:
+
+- `jakal_profile_manifest` in `host` and `level-zero` modes
+- optional `opencl` mode
+- `jakal_directml_manifest_bench` when the executable is available
+
+`jakal_directml_manifest_bench` is a standalone DirectML operator baseline. It is useful for backend-to-backend kernel checks, but it is not the same thing as the managed runtime total reported by `jakal_profile_manifest`.
+
+Examples:
+
+```powershell
+python .\scripts\run_manifest_benchmarks.py --all-torch-presets --passes 3
+python .\scripts\run_manifest_benchmarks.py --manifest .\qwen2.5-0.5b.ollama.gguf --passes 3
+```
 
 ### Explore CPU-heavy deep-learning placement
 
@@ -511,32 +648,22 @@ You can also pass a CPU-deep-learning preset name or dataset tag:
 
 It replays the same workload through several hand-picked strategies such as `role-split`, `reduce-on-gpu`, and `projection-sharded-4`, then prints per-operation device placement, partition counts, backend choices, and runtime comparisons.
 
-### Run the tests
+### Run the standalone tests directly
 
-For multi-config generators such as Visual Studio:
-
-```powershell
-ctest --test-dir build -C Debug --output-on-failure
-```
-
-For single-config generators:
-
-```powershell
-ctest --test-dir build --output-on-failure
-```
-
-You can also run the binaries directly:
+You can run the binaries directly when you want something narrower than full `ctest`:
 
 ```powershell
 .\build\Debug\jakal_smoke.exe
-.\build\Debug\jakal_optimization.exe
+.\build\Debug\jakal_optimization.exe --fast
+.\build\Debug\jakal_runtime_install_smoke.exe
+.\build\Debug\jakal_workload_bench.exe --smoke --host-only
 ```
 
 Other useful standalone test binaries include:
 
 - `jakal_planner_learning` for strategy-learning cache behavior
 - `jakal_partition_strategies` for explicit partition strategy coverage
-- `jakal_runtime_product` for managed execution, memory gates, manifests, and telemetry
+- `jakal_runtime_product` for managed execution, memory gates, manifests, and telemetry behavior
 - `jakal_workload_import_adapters` for ONNX, GGUF, GGML-style, and PyTorch-export import coverage
 - `jakal_backend_contracts` and `jakal_live_backend_smoke` for backend probing and execution checks
 
@@ -544,17 +671,18 @@ Other useful standalone test binaries include:
 
 ## Further reading
 
+- [`docs/distribution.md`](./docs/distribution.md) for install tree and package layout details
+- [`docs/release.md`](./docs/release.md) for release automation and tag-based publishing
 - [`examples/inspect_runtime.cpp`](./examples/inspect_runtime.cpp) for a fuller C++ walkthrough
 - [`examples/profile_workloads.cpp`](./examples/profile_workloads.cpp) for preset profiling
+- [`examples/profile_manifest.cpp`](./examples/profile_manifest.cpp) for manifest and imported-model profiling
 - [`examples/explore_cpu_dl.cpp`](./examples/explore_cpu_dl.cpp) for host-versus-accelerator experiments
 - [`examples/partition_roles.cpp`](./examples/partition_roles.cpp) for role-aware host/GPU partition experiments
-- [`examples/compare_host_workloads.cpp`](./examples/compare_host_workloads.cpp) for an extra profiling utility that is present in the source tree but not wired into the default CMake targets
-- [`tests/smoke.cpp`](./tests/smoke.cpp) for the smallest end-to-end path
-- [`tests/optimization.cpp`](./tests/optimization.cpp) for graph, cache, and backend coverage checks
 - [`tests/runtime_product.cpp`](./tests/runtime_product.cpp) for managed execution, manifest parsing, asset prefetch, and telemetry behavior
+- [`tests/runtime_install_smoke.cpp`](./tests/runtime_install_smoke.cpp) for the shared-runtime install-path and backend-status smoke test
 - [`tests/workload_import_adapters.cpp`](./tests/workload_import_adapters.cpp) for imported workload-source coverage
+- [`python/jakal_runtime.py`](./python/jakal_runtime.py) and [`python/jakal_app_adapter.py`](./python/jakal_app_adapter.py) for the lightweight Python surface
 
 ## License
 
 MIT. See [`LICENSE`](./LICENSE).
-
