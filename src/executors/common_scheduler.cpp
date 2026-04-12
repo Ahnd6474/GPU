@@ -40,8 +40,11 @@ std::size_t align_semantic_count(
     const std::size_t quantum,
     const std::size_t remaining,
     const bool final_device) {
-    if (final_device || quantum <= 1u || remaining <= quantum) {
+    if (final_device || remaining <= quantum) {
         return remaining;
+    }
+    if (quantum <= 1u) {
+        return std::min(candidate, remaining);
     }
     std::size_t aligned = (candidate / quantum) * quantum;
     if (aligned == 0u && remaining >= quantum) {

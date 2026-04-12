@@ -296,6 +296,9 @@ HardwareGraphSummary summarize_graph(const HardwareGraph& graph) {
     }
 
     std::uint32_t fallback_compute_nodes = 0;
+    std::uint32_t fallback_lanes_per_object = 0;
+    std::uint32_t fallback_resident_contexts = 0;
+    std::uint32_t fallback_matrix_units = 0;
     double transfer_cost_total = 0.0;
     double dispatch_cost_total = 0.0;
     double feed_cost_total = 0.0;
@@ -324,6 +327,9 @@ HardwareGraphSummary summarize_graph(const HardwareGraph& graph) {
                     std::max(lanes_per_parent[node.id], node.compute.execution_width));
             } else if (node.role == HardwareObjectRole::cluster) {
                 ++fallback_compute_nodes;
+                fallback_resident_contexts += std::max(node.compute.resident_contexts, 1u);
+                fallback_lanes_per_object = std::max(fallback_lanes_per_object, node.compute.execution_width);
+                fallback_matrix_units += node.compute.matrix_engines;
             } else if (is_pipeline_node(node) && node.compute.matrix_engines > 0) {
                 summary.matrix_units += node.compute.matrix_engines;
             }
@@ -421,6 +427,9 @@ HardwareGraphSummary summarize_graph(const HardwareGraph& graph) {
 
     if (summary.execution_objects == 0 && fallback_compute_nodes > 0) {
         summary.execution_objects = fallback_compute_nodes;
+        summary.resident_contexts = std::max(summary.resident_contexts, fallback_resident_contexts);
+        summary.lanes_per_object = std::max(summary.lanes_per_object, fallback_lanes_per_object);
+        summary.matrix_units = std::max(summary.matrix_units, fallback_matrix_units);
     }
 
     if (summary.lanes_per_object == 0 && summary.native_vector_bits > 0) {
