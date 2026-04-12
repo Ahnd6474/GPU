@@ -8276,16 +8276,20 @@ void AdaptiveExecutionOptimizer::ingest_execution_feedback(
                     static_cast<std::uint32_t>(optimized.operation.extents[0]),
                     4u,
                     4u);
-                hint_summary.preferred_tile_n = clamp_cpu_tile_hint(
-                    blend_tile(hint_summary.preferred_tile_n, tuned_tile_n),
-                    static_cast<std::uint32_t>(optimized.operation.extents[1]),
-                    8u,
-                    8u);
-                hint_summary.preferred_tile_k = clamp_cpu_tile_hint(
-                    blend_tile(hint_summary.preferred_tile_k, tuned_tile_k),
-                    static_cast<std::uint32_t>(optimized.operation.extents[2]),
-                    8u,
-                    8u);
+                if (optimized.operation.extents.size() > 1u) {
+                    hint_summary.preferred_tile_n = clamp_cpu_tile_hint(
+                        blend_tile(hint_summary.preferred_tile_n, tuned_tile_n),
+                        static_cast<std::uint32_t>(optimized.operation.extents[1]),
+                        8u,
+                        8u);
+                }
+                if (optimized.operation.extents.size() > 2u) {
+                    hint_summary.preferred_tile_k = clamp_cpu_tile_hint(
+                        blend_tile(hint_summary.preferred_tile_k, tuned_tile_k),
+                        static_cast<std::uint32_t>(optimized.operation.extents[2]),
+                        8u,
+                        8u);
+                }
             }
             if (supports_feedback_tuned_cpu_avx512(optimized.operation) &&
                 !optimized.config.use_low_precision) {

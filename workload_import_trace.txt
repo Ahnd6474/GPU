@@ -1,0 +1,12 @@
+checkpoint: runtime-created
+checkpoint: imported-manifest-loaded
+checkpoint: imported-plan
+checkpoint: imported-optimize
+exec:start op=stem_conv class=convolution_2d primary=vulkan:Intel_R__Iris_R__Xe_Graphics:0 parts=1
+exec:done op=stem_conv backend=host-native+verification-fallback runtime_us=2296.700000 relerr=0.000000 tol=0.001500 lowp=1 verified=1 error=verification-fallback output=size=49284 nan=0 inf=0 maxabs=4.15106e+07 first=1.66043e+07,2.76738e+07,3.32085e+07
+exec:start op=patch_proj class=matmul primary=vulkan:Intel_R__Iris_R__Xe_Graphics:0 parts=1
+exec:done op=patch_proj backend=intel:vulkan-compute-direct+gpu-lowered runtime_us=123384.600000 relerr=0.000000 tol=0.001500 lowp=1 verified=1 error= output=size=37632 nan=0 inf=0 maxabs=1.96054e+17 first=1.86252e+17,1.86252e+17,1.92133e+17
+exec:start op=token_pool class=reduction primary=host:0 parts=1
+exec:done op=token_pool backend=host-native runtime_us=455.100000 relerr=0.000000 tol=0.001500 lowp=1 verified=1 error= scalar=inf
+runtime-checkpoint: direct-execute-returned
+runtime-checkpoint: initial-feedback-built

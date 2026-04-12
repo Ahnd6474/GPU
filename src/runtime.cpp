@@ -2564,9 +2564,10 @@ DirectExecutionReport Runtime::execute_with_feedback(
     const OptimizationReport& optimization,
     const WorkloadGraph* workload_graph_override) {
     auto initial_report = direct_executor_.execute(optimization, devices_, jakal_toolkit_index_);
+    auto initial_feedback = make_feedback_records(initial_report);
     execution_optimizer_.ingest_execution_feedback(
         initial_report.optimization,
-        make_feedback_records(initial_report),
+        initial_feedback,
         devices_);
 
     if (!should_retry_execution(initial_report)) {
@@ -2580,9 +2581,10 @@ DirectExecutionReport Runtime::execute_with_feedback(
     }
 
     auto refined_report = direct_executor_.execute(refined_optimization, devices_, jakal_toolkit_index_);
+    auto refined_feedback = make_feedback_records(refined_report);
     execution_optimizer_.ingest_execution_feedback(
         refined_report.optimization,
-        make_feedback_records(refined_report),
+        refined_feedback,
         devices_);
 
     if (!refined_report.all_succeeded) {
@@ -3284,7 +3286,27 @@ AssetPrefetchReport Runtime::build_asset_prefetch(
         return report;
     }
 
+    std::unordered_set<std::string> seen_prefetch_entries;
     const auto append_prefetch_entry = [&](AssetPrefetchEntry entry) {
+        std::ostringstream key;
+        const bool collapse_host_resident_raw_asset =
+            !entry.derived_cache && entry.target_residency == "host";
+        key << entry.asset_id << '\n'
+            << entry.source_asset_id << '\n'
+            << entry.path.string() << '\n'
+            << entry.tensor_id << '\n'
+            << (collapse_host_resident_raw_asset ? std::string("host-resident") : entry.device_uid) << '\n'
+            << entry.file_offset << '\n'
+            << entry.bytes << '\n'
+            << entry.queue_hint << '\n'
+            << entry.target_residency << '\n'
+            << entry.materialization_kind << '\n'
+            << entry.backend_hint << '\n'
+            << entry.backend_cache_tag << '\n'
+            << entry.derived_cache;
+        if (!seen_prefetch_entries.insert(key.str()).second) {
+            return;
+        }
         report.total_prefetch_bytes += entry.bytes;
         if (entry.derived_cache) {
             report.total_layout_cache_bytes += entry.bytes;
@@ -3357,6 +3379,29 @@ AssetPrefetchReport Runtime::build_asset_prefetch(
                                                 1u,
                                                 asset.bytes / static_cast<std::uint64_t>(asset.tensor_ids.size()));
         for (const auto& tensor_id : asset.tensor_ids) {
+            if (asset.preferred_residency == "host") {
+                const auto queue_hint = queue_hint_for_asset(asset, canonical_host_uid);
+                append_prefetch_entry(AssetPrefetchEntry{
+                    asset.id,
+                    asset.id,
+                    asset.path,
+                    tensor_id,
+                    canonical_host_uid,
+                    asset.file_offset,
+                    per_tensor_bytes,
+                    queue_hint,
+                    asset.preferred_residency,
+                    "raw",
+                    "any",
+                    "raw",
+                    exists,
+                    asset.preload_required,
+                    asset.persistent,
+                    asset.host_visible,
+                    !asset.host_visible || queue_hint != "host_io",
+                    false});
+                continue;
+            }
             const auto devices_it = tensor_devices.find(tensor_id);
             if (devices_it == tensor_devices.end() || devices_it->second.empty()) {
                 const auto queue_hint = queue_hint_for_asset(asset, std::string());
@@ -3405,6 +3450,20 @@ AssetPrefetchReport Runtime::build_asset_prefetch(
                     false});
             }
         }
+    }
+
+    // Imported model sources currently report raw external blobs only.
+    // Native manifest assets still surface derived layout-cache materializations.
+    if (manifest.imported) {
+        if (!report.missing_required_assets) {
+            summary << (summary.tellp() > 0 ? "; " : "")
+                    << "prefetch=" << report.total_prefetch_bytes
+                    << " host_io=" << report.total_host_io_bytes
+                    << " h2d=" << report.total_host_to_device_bytes
+                    << " layout_cache=" << report.total_layout_cache_bytes;
+        }
+        report.summary = summary.str();
+        return report;
     }
 
     std::unordered_set<std::string> seen_layout_caches;

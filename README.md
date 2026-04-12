@@ -64,7 +64,8 @@ The default build produces:
 - install and package tools: `jakal_core_cli`, `jakal_bootstrap`
 - examples: `jakal_inspect`, `jakal_profile_workloads`, `jakal_explore_cpu_dl`, `jakal_partition_roles`, `jakal_profile_manifest`
 - Windows-only example: `jakal_directml_manifest_bench`
-- tests: `jakal_smoke`, `jakal_optimization`, `jakal_planner_learning`, `jakal_partition_strategies`, `jakal_runtime_product`, `jakal_workload_import_adapters`, `jakal_backend_contracts`, `jakal_live_backend_smoke`, `jakal_preset_execution_diag`, `jakal_runtime_install_smoke`, `jakal_workload_bench`
+- standalone test binaries: `jakal_smoke`, `jakal_optimization`, `jakal_planner_learning`, `jakal_partition_strategies`, `jakal_runtime_product`, `jakal_workload_import_adapters`, `jakal_backend_contracts`, `jakal_live_backend_smoke`, `jakal_preset_execution_diag`, `jakal_runtime_install_smoke`, `jakal_workload_bench`
+- `ctest` entries: `jakal_bootstrap_status` when product tools are enabled, every standalone test above except `jakal_preset_execution_diag`, and `jakal_core_cli_doctor_json`
 
 Useful CMake switches:
 
@@ -94,11 +95,11 @@ The install tree is smaller than the full development build. It installs:
 
 Typical installed layout:
 
-- `bin/`: `jakal_core_cli`, `jakal_bootstrap`, `jakal_inspect`, `launch-jakal-hardware-setup.cmd`
-- `lib/`: `jakal_core`, `jakal_runtime`, exported CMake package files
+- `bin/`: `jakal_core_cli`, `jakal_bootstrap`, `jakal_inspect`, `jakal_runtime` shared library, `launch-jakal-hardware-setup.cmd`
+- `lib/`: `jakal_core`, `jakal_runtime` import/static libraries, exported CMake package files
 - `include/`: public headers under `jakal/`
 - `share/jakal-core/`: runtime config, maintenance scripts, bundled prerequisite locations, branding assets, Python helpers
-- `share/doc/JakalCore/`: `README.md`, `LICENSE`, `docs/distribution.md`
+- `share/doc/JakalCore/`: `README.md`, `LICENSE`, `distribution.md`
 
 ### Consume the installed package
 
@@ -259,11 +260,16 @@ This is where the repository stands today:
 - `jakal_runtime` exposes the runtime through a smaller C ABI, and `jakal_core_cli` exposes install-path and backend-health diagnostics for packaged runtime scenarios.
 - The Python helpers under [`python/`](./python/) wrap the C ABI for lightweight `doctor`, `paths`, `optimize-smoke`, and `run-manifest` flows.
 
+Known gaps in the current tree:
+
+- `jakal_workload_import_adapters` is currently failing on the ONNX external-data asset-prefetch path, so imported ONNX coverage is broad but not fully regression-free yet.
+- The repository contains packaging and installer flows, but they are still documented and tested as source-first/developer flows rather than a finished production runtime release train.
+
 What is still missing:
 
 - real tensor allocators and residency movement beyond the current planning and diagnostics layer
 - framework bridges for PyTorch, TensorFlow, or similar runtimes beyond the small export helper in `scripts/`
-- polished production packaging beyond the current local install and CPack flow
+- fully validated production packaging, update, and silent-install flows across clean machines
 - a stable production execution stack with mature native backend coverage across every supported accelerator path
 
 ## API
