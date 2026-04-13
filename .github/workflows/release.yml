@@ -5,6 +5,16 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag to publish, for example v0.1.0 or v0.1.1-beta.1"
+        required: true
+        type: string
+      draft:
+        description: "Publish the GitHub release as a draft"
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: write
@@ -20,6 +30,45 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
+      - name: Resolve release metadata
+        id: release_meta
+        run: |
+          $eventName = "${{ github.event_name }}"
+          $tagName = if ($eventName -eq "workflow_dispatch") { "${{ inputs.tag_name }}" } else { "${{ github.ref_name }}" }
+          if ([string]::IsNullOrWhiteSpace($tagName)) {
+              throw "Missing release tag name."
+          }
+          if ($tagName -notmatch '^v(?<core>\d+\.\d+\.\d+)(?<suffix>-[0-9A-Za-z][0-9A-Za-z.-]*)?$') {
+              throw "Release tag '$tagName' must look like v0.1.0 or v0.1.1-beta.1."
+          }
+
+          $cmakeText = Get-Content .\CMakeLists.txt -Raw
+          $cmakeVersionMatch = [regex]::Match(
+              $cmakeText,
+              'project\(JakalCore\s+VERSION\s+(?<version>\d+\.\d+\.\d+)',
+              [System.Text.RegularExpressions.RegexOptions]::Singleline)
+          if (-not $cmakeVersionMatch.Success) {
+              throw "Could not read project VERSION from CMakeLists.txt."
+          }
+
+          $coreVersion = $Matches['core']
+          $suffix = $Matches['suffix']
+          $projectVersion = $cmakeVersionMatch.Groups['version'].Value
+          if ($coreVersion -ne $projectVersion) {
+              throw "Tag core version '$coreVersion' does not match CMake project version '$projectVersion'."
+          }
+
+          $isPrerelease = if ([string]::IsNullOrEmpty($suffix)) { "false" } else { "true" }
+          $draft = if ($eventName -eq "workflow_dispatch") { "${{ inputs.draft }}".ToLowerInvariant() } else { "true" }
+          $releaseName = "Jakal Core $coreVersion$suffix"
+
+          "tag_name=$tagName" >> $env:GITHUB_OUTPUT
+          "core_version=$coreVersion" >> $env:GITHUB_OUTPUT
+          "version_suffix=$suffix" >> $env:GITHUB_OUTPUT
+          "is_prerelease=$isPrerelease" >> $env:GITHUB_OUTPUT
+          "draft=$draft" >> $env:GITHUB_OUTPUT
+          "release_name=$releaseName" >> $env:GITHUB_OUTPUT
+
       - name: Set up MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
 
@@ -27,7 +76,15 @@ jobs:
         run: choco install ninja nsis --no-progress -y
 
       - name: Configure ZIP package build
-        run: cmake -S . -B build_ninja -G Ninja -DJAKAL_CORE_BUILD_TESTS=OFF
+        run: |
+          $cmakeArgs = @(
+            "-S", ".",
+            "-B", "build_ninja",
+            "-G", "Ninja",
+            "-DJAKAL_CORE_BUILD_TESTS=OFF",
+            "-DJAKAL_CORE_VERSION_SUFFIX=${{ steps.release_meta.outputs.version_suffix }}"
+          )
+          cmake @cmakeArgs
 
       - name: Build ZIP package
         run: cmake --build build_ninja --target package
@@ -70,11 +127,15 @@ jobs:
           path: release-assets/*
           if-no-files-found: error
 
-      - name: Publish draft GitHub release
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
-          draft: true
+          tag_name: ${{ steps.release_meta.outputs.tag_name }}
+          name: ${{ steps.release_meta.outputs.release_name }}
+          target_commitish: ${{ github.sha }}
+          draft: ${{ steps.release_meta.outputs.draft == 'true' }}
+          prerelease: ${{ steps.release_meta.outputs.is_prerelease == 'true' }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |

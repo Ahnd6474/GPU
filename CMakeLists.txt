@@ -17,6 +17,13 @@ option(JAKAL_CORE_ENABLE_CODE_SIGNING "Sign installable Windows executables afte
 set(JAKAL_CORE_SIGNTOOL_PATH "" CACHE FILEPATH "Path to signtool.exe")
 set(JAKAL_CORE_CODESIGN_CERT_SHA1 "" CACHE STRING "Certificate thumbprint used for Windows code signing")
 set(JAKAL_CORE_CODESIGN_TIMESTAMP_URL "http://timestamp.digicert.com" CACHE STRING "RFC3161 timestamp URL for Windows code signing")
+set(JAKAL_CORE_VERSION_SUFFIX "" CACHE STRING "Optional prerelease/build suffix appended to packaged artifact versions, for example -beta.1")
+
+if(JAKAL_CORE_VERSION_SUFFIX AND NOT JAKAL_CORE_VERSION_SUFFIX MATCHES "^[-+][0-9A-Za-z.-]+$")
+    message(FATAL_ERROR "JAKAL_CORE_VERSION_SUFFIX must start with '-' or '+' and contain only [0-9A-Za-z.-]")
+endif()
+
+set(JAKAL_CORE_PACKAGE_VERSION "${PROJECT_VERSION}${JAKAL_CORE_VERSION_SUFFIX}")
 
 set(JAKAL_CORE_BRAND_SOURCE_PNG "${CMAKE_CURRENT_SOURCE_DIR}/Jakal_core_logo.png")
 set(JAKAL_CORE_BRAND_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/branding")
@@ -433,7 +440,7 @@ set(CPACK_PACKAGE_NAME "Jakal-Core")
 set(CPACK_PACKAGE_VENDOR "Jakal")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Graph-first heterogeneous compute runtime skeleton")
 set(CPACK_PACKAGE_INSTALL_DIRECTORY "Jakal-Core")
-set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
+set(CPACK_PACKAGE_VERSION ${JAKAL_CORE_PACKAGE_VERSION})
 set(CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
 set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
 set(CPACK_RESOURCE_FILE_README "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
