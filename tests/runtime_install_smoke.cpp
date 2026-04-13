@@ -72,6 +72,14 @@ void write_manifest(const std::filesystem::path& path) {
 }  // namespace
 
 int main() {
+    if (jakal_core_c_api_abi_version() != JAKAL_CORE_C_API_ABI_VERSION ||
+        jakal_core_runtime_telemetry_schema_version() != JAKAL_CORE_RUNTIME_TELEMETRY_SCHEMA_VERSION ||
+        jakal_core_execution_performance_cache_schema_version() !=
+            JAKAL_CORE_EXECUTION_PERFORMANCE_CACHE_SCHEMA_VERSION) {
+        std::cerr << "runtime install smoke: c api version constants drifted\n";
+        return 1;
+    }
+
     jakal_core_runtime_options options{};
     options.enable_host_probe = 1;
     options.enable_opencl_probe = 0;

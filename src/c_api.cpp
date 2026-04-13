@@ -383,6 +383,18 @@ jakal::RuntimeOptions convert_runtime_options(const jakal_core_runtime_options& 
 
 }  // namespace
 
+unsigned int jakal_core_c_api_abi_version(void) {
+    return JAKAL_CORE_C_API_ABI_VERSION;
+}
+
+unsigned int jakal_core_runtime_telemetry_schema_version(void) {
+    return JAKAL_CORE_RUNTIME_TELEMETRY_SCHEMA_VERSION;
+}
+
+unsigned int jakal_core_execution_performance_cache_schema_version(void) {
+    return JAKAL_CORE_EXECUTION_PERFORMANCE_CACHE_SCHEMA_VERSION;
+}
+
 jakal_core_runtime_t* jakal_core_runtime_create(void) {
     try {
         return new jakal_core_runtime_t{jakal::Runtime{}};

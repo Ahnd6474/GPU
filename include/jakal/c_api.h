@@ -14,6 +14,10 @@
 #  define JAKAL_CORE_C_API
 #endif
 
+#define JAKAL_CORE_C_API_ABI_VERSION 1u
+#define JAKAL_CORE_RUNTIME_TELEMETRY_SCHEMA_VERSION 2u
+#define JAKAL_CORE_EXECUTION_PERFORMANCE_CACHE_SCHEMA_VERSION 2u
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -242,6 +246,9 @@ typedef struct jakal_core_residency_movement_info {
     int from_spill_artifact;
 } jakal_core_residency_movement_info;
 
+JAKAL_CORE_C_API unsigned int jakal_core_c_api_abi_version(void);
+JAKAL_CORE_C_API unsigned int jakal_core_runtime_telemetry_schema_version(void);
+JAKAL_CORE_C_API unsigned int jakal_core_execution_performance_cache_schema_version(void);
 JAKAL_CORE_C_API jakal_core_runtime_t* jakal_core_runtime_create(void);
 JAKAL_CORE_C_API jakal_core_runtime_t* jakal_core_runtime_create_with_options(
     const jakal_core_runtime_options* options);

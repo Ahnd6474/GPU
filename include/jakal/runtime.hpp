@@ -16,6 +16,9 @@
 
 namespace jakal {
 
+constexpr std::uint32_t kRuntimeTelemetrySchemaVersion = 2u;
+constexpr std::uint32_t kRuntimeTelemetryBudgetSchemaVersion = 1u;
+
 struct RuntimeMemoryPolicy {
     double host_reserve_ratio = 0.10;
     double accelerator_reserve_ratio = 0.12;
@@ -28,10 +31,13 @@ struct RuntimeSafetyPolicy {
     bool enable_canary = true;
     bool enable_strategy_rollback = true;
     bool enable_planner_risk_gate = true;
+    bool enable_persisted_regression_gate = true;
     double minimum_planner_confidence = 0.45;
     double planner_risk_gate = 0.50;
     double max_runtime_regression_ratio = 1.10;
+    double persisted_regression_slowdown_ratio = 1.20;
     std::uint32_t blacklist_after_failures = 2;
+    std::uint32_t persisted_regression_gate_after_events = 3;
     std::uint64_t blacklist_cooldown_epochs = 16;
 };
 
@@ -136,9 +142,12 @@ struct StrategySafetyDecision {
     bool blacklisted_before_run = false;
     bool memory_forced_auto = false;
     bool planner_forced_auto = false;
+    bool regression_gate_forced_auto = false;
     bool rolled_back_to_auto = false;
     bool blocked_by_memory = false;
     bool canary_triggered = false;
+    std::uint32_t persisted_regression_events = 0;
+    double persisted_worst_slowdown = 1.0;
     std::string summary;
 };
 

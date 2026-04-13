@@ -609,6 +609,73 @@ void write_graph_family_cache_seed(
     }
 }
 
+void write_regression_perf_cache_seed(
+    const std::filesystem::path& execution_cache_path,
+    const std::string& report_signature,
+    const jakal::WorkloadGraph& graph,
+    const std::uint32_t regression_events,
+    const double worst_slowdown_vs_reference,
+    const bool append = false) {
+    auto path = execution_cache_path;
+    path += ".perf";
+    std::ofstream output(path, append ? std::ios::app : std::ios::trunc);
+    if (!append) {
+        output << "# schema_version\t" << jakal::kExecutionPerformanceCacheSchemaVersion << '\n';
+        output << "# key\tshape_bucket\tdevice_family_signature\toperation\tvariant\tstrategy\tprimary_device\tparticipating_devices\tqueue_depth\tstages\ttile_x\ttile_y\ttile_k\tlogical_partitions\toverlap\tlow_precision\tqueue_scale\tstage_scale\ttile_scale\toverlap_ratio\tpartition_intensity\tprecision_mix\tobservations\tavg_latency\tavg_error\tavg_scale\tavg_calibration_ratio\tavg_system_penalty\tavg_validation_spread\tavg_reward\tavg_copy_share\tavg_transfer_overlap_ratio\tavg_budget_pressure\tavg_queue_separation_ratio\tavg_staging_hit_rate\tavg_cross_device_sync_cost_us\tavg_residency_pressure\tavg_kv_host_residency_ratio\tregression_events\tworst_slowdown_vs_reference\n";
+    }
+    std::size_t row = 0u;
+    const auto write_row = [&](const jakal::OperationSpec& operation) {
+        output << report_signature << "|seeded-regression-" << row << '\t'
+               << runtime_shape_bucket_for(operation) << '\t'
+               << "seed-family" << '\t'
+               << operation.name << '\t'
+               << "seeded" << '\t'
+               << "single_device" << '\t'
+               << "host:test:0" << '\t'
+               << "host:test:0" << '\t'
+               << 1u << '\t'
+               << 1u << '\t'
+               << 1u << '\t'
+               << 1u << '\t'
+               << 1u << '\t'
+               << 1u << '\t'
+               << 0 << '\t'
+               << 0 << '\t'
+               << 1.0 << '\t'
+               << 1.0 << '\t'
+               << 1.0 << '\t'
+               << 0.05 << '\t'
+               << 1.0 << '\t'
+               << 0.0 << '\t'
+               << 8u << '\t'
+               << 150.0 << '\t'
+               << 0.0 << '\t'
+               << 1.0 << '\t'
+               << 1.0 << '\t'
+               << 0.0 << '\t'
+               << 0.0 << '\t'
+               << std::log(0.82) << '\t'
+               << 0.38 << '\t'
+               << 0.08 << '\t'
+               << 0.84 << '\t'
+               << 0.12 << '\t'
+               << 0.0 << '\t'
+               << 0.0 << '\t'
+               << 0.10 << '\t'
+               << 0.05 << '\t'
+               << regression_events << '\t'
+               << worst_slowdown_vs_reference << '\n';
+        ++row;
+    };
+    if (graph.operations.empty()) {
+        write_row(jakal::OperationSpec{"seed-op", jakal::OperationClass::elementwise_map, {1024u}, 4096u, 4096u});
+        return;
+    }
+    for (const auto& operation : graph.operations) {
+        write_row(operation);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -626,6 +693,9 @@ int main() {
         const auto cache_path = unique_temp_file("runtime-product-cache", ".tsv");
         const auto execution_cache_path = unique_temp_file("runtime-product-exec-cache", ".tsv");
         const auto adaptive_telemetry_path = unique_temp_file("runtime-product-adaptive", ".telemetry.tsv");
+        const auto regression_gate_cache_path = unique_temp_file("runtime-product-regression-gate", ".tsv");
+        const auto regression_gate_telemetry_path =
+            unique_temp_file("runtime-product-regression-gate", ".telemetry.tsv");
 
         {
             std::ofstream weights(weight_asset_path, std::ios::binary | std::ios::trunc);
@@ -1040,6 +1110,7 @@ int main() {
         std::filesystem::remove(tier1_cache_path.string() + ".perf", tier1_ec);
         std::filesystem::remove(tier1_cache_path.string() + ".perf.family", tier1_ec);
 
+        double repeated_managed_runtime_us = 0.0;
         std::ifstream telemetry(manifest_managed.telemetry_path);
         std::string telemetry_header;
         std::string telemetry_row;
@@ -1047,11 +1118,15 @@ int main() {
         std::getline(telemetry, telemetry_row);
         const auto manifest_budget_sidecar = telemetry_budget_cache_path(manifest_managed.telemetry_path);
         const auto manifest_budget_delta = telemetry_budget_delta_path(manifest_managed.telemetry_path);
-        if (telemetry_header.find("transfer_us") == std::string::npos ||
+        if (telemetry_header.find("telemetry_schema_version") == std::string::npos ||
+            telemetry_header.find("transfer_us") == std::string::npos ||
             telemetry_header.find("copy_runtime_us") == std::string::npos ||
             telemetry_header.find("compute_runtime_us") == std::string::npos ||
             telemetry_header.find("overlapped_transfer_us") == std::string::npos ||
             telemetry_header.find("transfer_overlap_ratio") == std::string::npos ||
+            telemetry_header.find("regression_gate_forced_auto") == std::string::npos ||
+            telemetry_header.find("persisted_regression_events") == std::string::npos ||
+            telemetry_header.find("persisted_worst_slowdown") == std::string::npos ||
             telemetry_header.find("optimizer_budget_ms") == std::string::npos ||
             telemetry_header.find("allocator_peak_live_bytes") == std::string::npos ||
             telemetry_header.find("allocator_peak_reserved_bytes") == std::string::npos ||
@@ -1070,6 +1145,22 @@ int main() {
             std::cerr << "runtime telemetry missing transfer overlap columns\n";
             return 1;
         }
+        const auto perf_cache_path = std::filesystem::path(execution_cache_path.string() + ".perf");
+        if (!std::filesystem::exists(perf_cache_path)) {
+            std::cerr << "runtime performance cache was not persisted\n";
+            return 1;
+        }
+        std::ifstream perf_cache(perf_cache_path);
+        std::string perf_schema;
+        std::string perf_header;
+        std::getline(perf_cache, perf_schema);
+        std::getline(perf_cache, perf_header);
+        if (perf_schema.find("schema_version") == std::string::npos ||
+            perf_header.find("regression_events") == std::string::npos ||
+            perf_header.find("worst_slowdown_vs_reference") == std::string::npos) {
+            std::cerr << "runtime performance cache missing schema or regression markers\n";
+            return 1;
+        }
         if (!std::filesystem::exists(manifest_budget_sidecar) &&
             !std::filesystem::exists(manifest_budget_delta)) {
             std::cerr << "runtime telemetry sidecar or delta was not generated\n";
@@ -1078,6 +1169,105 @@ int main() {
         const auto second_blob_time = std::filesystem::last_write_time(second_blob_it->path);
         if (second_blob_time != first_blob_time) {
             std::cerr << "matmul manifest rewrote packed rhs blob instead of reusing it\n";
+            return 1;
+        }
+        for (std::uint32_t run = 0u; run < 4u; ++run) {
+            const auto repeated = runtime.execute_manifest(matmul_manifest_path);
+            if (!repeated.executed || !repeated.execution.all_succeeded) {
+                std::cerr << "managed matmul path was not stable across repeated runs\n";
+                return 1;
+            }
+            if (repeated.execution.total_runtime_us <= 0.0) {
+                std::cerr << "managed matmul path did not report runtime during soak loop\n";
+                return 1;
+            }
+            if (run == 0u) {
+                repeated_managed_runtime_us = repeated.execution.total_runtime_us;
+            }
+        }
+        if (repeated_managed_runtime_us <= 0.0) {
+            std::cerr << "managed matmul soak loop did not capture a baseline runtime\n";
+            return 1;
+        }
+
+        jakal::RuntimeOptions regression_gate_options = options;
+        regression_gate_options.execution_cache_path = regression_gate_cache_path;
+        regression_gate_options.product.observability.telemetry_path = regression_gate_telemetry_path;
+        regression_gate_options.product.safety.enable_planner_risk_gate = false;
+        regression_gate_options.product.safety.enable_canary = false;
+        regression_gate_options.optimization.forced_partition_strategy = jakal::PartitionStrategy::blind_sharded;
+        {
+            jakal::Runtime regression_seed_runtime(regression_gate_options);
+            const auto regression_warm = regression_seed_runtime.execute_manifest(matmul_manifest_path);
+            if (!regression_warm.executed || !regression_warm.execution.all_succeeded ||
+                regression_warm.safety.selected_strategy != jakal::PartitionStrategy::blind_sharded ||
+                regression_warm.safety.final_strategy != jakal::PartitionStrategy::blind_sharded) {
+                std::cerr << "regression warm path did not preserve explicit strategy\n";
+                return 1;
+            }
+            write_regression_perf_cache_seed(
+                regression_gate_cache_path,
+                regression_warm.execution.optimization.signature,
+                regression_warm.execution.optimization.workload_graph,
+                regression_gate_options.product.safety.persisted_regression_gate_after_events + 1u,
+                regression_gate_options.product.safety.persisted_regression_slowdown_ratio + 0.15);
+            jakal::Runtime regression_signature_runtime(regression_gate_options);
+            const auto regression_probe = regression_signature_runtime.optimize(tier1_manifest.workload, tier1_manifest.graph);
+            if (regression_probe.signature != regression_warm.execution.optimization.signature) {
+                write_regression_perf_cache_seed(
+                    regression_gate_cache_path,
+                    regression_probe.signature,
+                    regression_probe.workload_graph,
+                    regression_gate_options.product.safety.persisted_regression_gate_after_events + 1u,
+                    regression_gate_options.product.safety.persisted_regression_slowdown_ratio + 0.15,
+                    true);
+            }
+            jakal::ExecutionOptimizer regression_reader(regression_gate_cache_path);
+            const auto regression_seeded_summary =
+                regression_reader.persisted_regression_summary(regression_warm.execution.optimization.signature);
+            if (regression_seeded_summary.max_regression_events <
+                    regression_gate_options.product.safety.persisted_regression_gate_after_events ||
+                regression_seeded_summary.worst_slowdown_vs_reference <
+                    regression_gate_options.product.safety.persisted_regression_slowdown_ratio) {
+                std::cerr << "persisted regression seed was not readable from cache"
+                          << " events=" << regression_seeded_summary.max_regression_events
+                          << " worst=" << regression_seeded_summary.worst_slowdown_vs_reference << '\n';
+                return 1;
+            }
+        }
+        jakal::Runtime regression_gate_runtime(regression_gate_options);
+        const auto regression_gated = regression_gate_runtime.execute_manifest(matmul_manifest_path);
+        if (!regression_gated.executed || !regression_gated.execution.all_succeeded) {
+            std::cerr << "persisted regression gate path did not execute successfully\n";
+            return 1;
+        }
+        if (regression_gated.safety.requested_strategy != jakal::PartitionStrategy::blind_sharded ||
+            !regression_gated.safety.regression_gate_forced_auto ||
+            regression_gated.safety.selected_strategy != jakal::PartitionStrategy::auto_balanced ||
+            regression_gated.safety.final_strategy != jakal::PartitionStrategy::auto_balanced ||
+            regression_gated.safety.persisted_regression_events <
+                regression_gate_options.product.safety.persisted_regression_gate_after_events ||
+            regression_gated.safety.persisted_worst_slowdown <
+                regression_gate_options.product.safety.persisted_regression_slowdown_ratio ||
+            regression_gated.safety.summary.find("persisted regression gate forced auto") == std::string::npos) {
+            std::cerr << "persisted regression gate did not force auto strategy with seeded cache"
+                      << " requested=" << jakal::to_string(regression_gated.safety.requested_strategy)
+                      << " selected=" << jakal::to_string(regression_gated.safety.selected_strategy)
+                      << " final=" << jakal::to_string(regression_gated.safety.final_strategy)
+                      << " forced=" << regression_gated.safety.regression_gate_forced_auto
+                      << " events=" << regression_gated.safety.persisted_regression_events
+                      << " worst=" << regression_gated.safety.persisted_worst_slowdown
+                      << " summary=" << regression_gated.safety.summary << '\n';
+            return 1;
+        }
+        jakal::Runtime regression_restart_runtime(regression_gate_options);
+        const auto regression_restart = regression_restart_runtime.execute_manifest(matmul_manifest_path);
+        if (!regression_restart.executed || !regression_restart.execution.all_succeeded) {
+            std::cerr << "managed runtime did not survive restart on seeded regression cache\n";
+            return 1;
+        }
+        if (!std::filesystem::exists(regression_gated.telemetry_path)) {
+            std::cerr << "persisted regression gate path did not emit telemetry\n";
             return 1;
         }
 
@@ -1146,6 +1336,9 @@ int main() {
         std::filesystem::remove(execution_cache_path, ec);
         std::filesystem::remove(execution_cache_path.string() + ".perf", ec);
         std::filesystem::remove(execution_cache_path.string() + ".perf.family", ec);
+        std::filesystem::remove(regression_gate_cache_path, ec);
+        std::filesystem::remove(regression_gate_cache_path.string() + ".perf", ec);
+        std::filesystem::remove(regression_gate_cache_path.string() + ".perf.family", ec);
         const auto packed_root = cache_path.parent_path() / (cache_path.stem().string() + "-packed-layouts");
         const auto spill_root = runtime.install_paths().cache_dir / "spill-artifacts";
         std::filesystem::remove_all(packed_root, ec);
@@ -1165,6 +1358,12 @@ int main() {
         std::filesystem::remove(adaptive_telemetry_path, ec);
         std::filesystem::remove(telemetry_budget_cache_path(adaptive_telemetry_path), ec);
         std::filesystem::remove(telemetry_budget_delta_path(adaptive_telemetry_path), ec);
+        std::filesystem::remove(regression_gated.telemetry_path, ec);
+        std::filesystem::remove(telemetry_budget_cache_path(regression_gated.telemetry_path), ec);
+        std::filesystem::remove(telemetry_budget_delta_path(regression_gated.telemetry_path), ec);
+        std::filesystem::remove(regression_restart.telemetry_path, ec);
+        std::filesystem::remove(telemetry_budget_cache_path(regression_restart.telemetry_path), ec);
+        std::filesystem::remove(telemetry_budget_delta_path(regression_restart.telemetry_path), ec);
         std::filesystem::remove(family_only_telemetry_path, ec);
         std::filesystem::remove(telemetry_budget_cache_path(family_only_telemetry_path), ec);
         std::filesystem::remove(telemetry_budget_delta_path(family_only_telemetry_path), ec);

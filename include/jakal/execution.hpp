@@ -12,6 +12,8 @@
 namespace jakal {
 
 constexpr std::uint32_t kInvalidExecutionIndex = 0xffffffffu;
+constexpr std::uint32_t kExecutionPerformanceCacheSchemaVersion = 2u;
+constexpr std::uint32_t kExecutionCpuHintCacheSchemaVersion = 2u;
 
 enum class OperationClass {
     elementwise_map,
@@ -363,6 +365,13 @@ struct PerformanceSummary {
     double average_cross_device_sync_cost_us = 0.0;
     double average_residency_pressure = 0.0;
     double average_kv_host_residency_ratio = 0.0;
+    std::uint32_t regression_events = 0;
+    double worst_slowdown_vs_reference = 1.0;
+};
+
+struct PersistedRegressionSummary {
+    std::uint32_t max_regression_events = 0;
+    double worst_slowdown_vs_reference = 1.0;
 };
 
 struct CpuRuntimeHintSummary {
@@ -476,6 +485,7 @@ public:
     [[nodiscard]] const std::unordered_map<std::string, CpuRuntimeHintSummary>& cpu_runtime_hint_cache() const;
     [[nodiscard]] const std::unordered_map<std::string, double>& backend_penalty_cache() const;
     [[nodiscard]] const std::unordered_map<std::string, bool>& warmed_devices() const;
+    [[nodiscard]] PersistedRegressionSummary persisted_regression_summary(const std::string& report_signature);
     void apply_feedback_tuning_hints(WorkloadGraph& graph) const;
     void ingest_execution_feedback(
         const OptimizationReport& report,
@@ -513,6 +523,7 @@ public:
         const OptimizationReport& report,
         const std::vector<ExecutionFeedbackRecord>& feedback,
         const std::vector<HardwareGraph>& graphs);
+    [[nodiscard]] PersistedRegressionSummary persisted_regression_summary(const std::string& report_signature);
 
 private:
     BootstrapExecutionOptimizer bootstrap_optimizer_;

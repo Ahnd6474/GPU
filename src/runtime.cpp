@@ -443,6 +443,23 @@ std::unordered_map<std::string, std::size_t> build_header_index(const std::strin
     return header_index;
 }
 
+bool read_tsv_header_line(std::ifstream& input, std::string& header_line) {
+    while (std::getline(input, header_line)) {
+        std::string normalized = header_line;
+        if (!normalized.empty() && normalized.front() == '#') {
+            normalized.erase(normalized.begin());
+            if (!normalized.empty() && normalized.front() == ' ') {
+                normalized.erase(normalized.begin());
+            }
+        }
+        if (normalized.empty() || normalized.rfind("schema_version", 0u) == 0u) {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
 std::string field_or_empty(const std::vector<std::string>& fields, const std::size_t index) {
     return index < fields.size() ? fields[index] : std::string();
 }
@@ -462,7 +479,7 @@ void load_budget_snapshot_entries(
     }
     std::ifstream input(path);
     std::string header_line;
-    if (!input.is_open() || !std::getline(input, header_line)) {
+    if (!input.is_open() || !read_tsv_header_line(input, header_line)) {
         return;
     }
     const auto header_index = build_header_index(header_line);
@@ -506,7 +523,7 @@ std::uint32_t load_budget_delta_entries(
     }
     std::ifstream input(path);
     std::string header_line;
-    if (!input.is_open() || !std::getline(input, header_line)) {
+    if (!input.is_open() || !read_tsv_header_line(input, header_line)) {
         return 0u;
     }
     const auto header_index = build_header_index(header_line);
@@ -578,6 +595,7 @@ void persist_budget_cache_snapshot(
     if (!output.is_open()) {
         return;
     }
+    output << "# schema_version\t" << kRuntimeTelemetryBudgetSchemaVersion << '\n';
     output << "# kind\tphase\tshape_bucket\tsamples\taverage_speedup_vs_reference\taverage_transfer_overlap_ratio\taverage_copy_share\tbudget_exhaustion_ratio\taverage_queue_separation_ratio\tlast_optimizer_budget_ms\tlast_epoch\n";
     for (const auto& [key, entry] : state.entries) {
         (void)key;
@@ -719,7 +737,7 @@ TelemetryBudgetSignal load_graph_family_budget_signal(
     }
 
     std::string header_line;
-    if (!std::getline(input, header_line)) {
+    if (!read_tsv_header_line(input, header_line)) {
         return signal;
     }
     const auto header_index = build_header_index(header_line);
@@ -870,7 +888,7 @@ TelemetryBudgetSignal load_runtime_budget_signal(
     }
 
     std::string header_line;
-    if (!std::getline(input, header_line)) {
+    if (!read_tsv_header_line(input, header_line)) {
         return signal;
     }
     if (!header_line.empty() && header_line.front() == '#') {
@@ -999,6 +1017,7 @@ void update_runtime_budget_cache(
     }
 
     const std::string delta_header =
+        "# schema_version\t" + std::to_string(kRuntimeTelemetryBudgetSchemaVersion) + "\n"
         "# epoch\tkind\tphase\tshape_bucket\tspeedup_vs_reference\ttransfer_overlap_ratio\tcopy_share\tbudget_pressure\tqueue_separation_ratio\toptimizer_budget_ms\n";
     std::ostringstream delta_line;
     delta_line << epoch << '\t'
@@ -2725,9 +2744,17 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
         managed.memory_preflight.requires_spill =
             managed.memory_preflight.requires_spill || managed.residency_sequence.spill_bytes > 0u;
     };
+    auto refresh_regression_summary = [&]() {
+        const auto summary = execution_optimizer_.persisted_regression_summary(optimization.signature);
+        managed.safety.persisted_regression_events =
+            std::max(managed.safety.persisted_regression_events, summary.max_regression_events);
+        managed.safety.persisted_worst_slowdown =
+            std::max(managed.safety.persisted_worst_slowdown, summary.worst_slowdown_vs_reference);
+    };
     managed.safety.selected_strategy = optimization.partition_strategy;
     managed.memory_preflight = build_memory_preflight(optimization);
     refresh_execution_reports(nullptr);
+    refresh_regression_summary();
     managed.safety.planner_risk_score = planner_risk_score(
         effective_workload,
         managed.planning,
@@ -2763,6 +2790,7 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
             optimization = std::move(fallback_optimization);
             managed.memory_preflight = std::move(fallback_memory);
             refresh_execution_reports(nullptr);
+            refresh_regression_summary();
             managed.safety.planner_risk_score = planner_risk_score(
                 effective_workload,
                 managed.planning,
@@ -2797,6 +2825,21 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
         force_auto_if_needed("planner risk gate forced auto");
         managed.safety.planner_forced_auto = true;
     }
+    if (options_.product.safety.enable_persisted_regression_gate &&
+        optimization.partition_strategy != PartitionStrategy::auto_balanced &&
+        managed.safety.persisted_regression_events >=
+            options_.product.safety.persisted_regression_gate_after_events &&
+        managed.safety.persisted_worst_slowdown >=
+            options_.product.safety.persisted_regression_slowdown_ratio) {
+        const auto regression_gate_events = managed.safety.persisted_regression_events;
+        const auto regression_gate_worst = managed.safety.persisted_worst_slowdown;
+        force_auto_if_needed("persisted regression gate forced auto");
+        managed.safety.regression_gate_forced_auto = true;
+        managed.safety.persisted_regression_events =
+            std::max(managed.safety.persisted_regression_events, regression_gate_events);
+        managed.safety.persisted_worst_slowdown =
+            std::max(managed.safety.persisted_worst_slowdown, regression_gate_worst);
+    }
 
     managed.safety.selected_strategy = optimization.partition_strategy;
     if (!managed.memory_preflight.safe_to_run && options_.product.memory.enforce_preflight) {
@@ -2814,6 +2857,7 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
     managed.execution = execute_with_feedback(effective_workload, optimization, &workload_graph);
     managed.executed = true;
     refresh_execution_reports(&managed.execution);
+    refresh_regression_summary();
     managed.safety.final_strategy = managed.execution.optimization.partition_strategy;
     auto planner_feedback = make_strategy_feedback_sample(
         effective_workload,
@@ -2863,6 +2907,7 @@ ManagedExecutionReport Runtime::execute_managed(const WorkloadSpec& workload, co
                     managed.memory_preflight = std::move(fallback_memory);
                     optimization = std::move(fallback_optimization);
                     refresh_execution_reports(&managed.execution);
+                    refresh_regression_summary();
                     managed.safety.planner_risk_score = planner_risk_score(
                         fallback_workload,
                         managed.planning,
@@ -4153,10 +4198,11 @@ void Runtime::persist_telemetry(
 
     const auto path = telemetry_path();
     const std::string header =
-        "# epoch\tworkload\tkind\tphase\tshape_bucket\trequested_strategy\tselected_strategy\tfinal_strategy\tplanner_source\tplanner_confidence\tplanner_risk\texecuted\tall_succeeded\tblocked_by_memory\trolled_back_to_auto\tblacklisted_before_run\tpeak_pressure_ratio\tspill_bytes\treload_bytes\tforced_spills\tprefetch_bytes\thost_io_bytes\th2d_bytes\ttotal_runtime_us\tspeedup_vs_reference\tcopy_runtime_us\tcompute_runtime_us\tcopy_overlap_ratio\ttransfer_us\toverlapped_transfer_us\ttransfer_overlap_gain_us\ttransfer_overlap_ratio\toptimizer_budget_ms\tbudget_exhausted\tallocator_peak_live_bytes\tallocator_peak_reserved_bytes\tallocator_reuse_count\tspill_artifact_bytes\treload_artifact_bytes\tbackend_owned_peak_bytes\tbackend_resource_reuse_hits\texecuted_h2d_bytes\texecuted_d2h_bytes\texecuted_spill_bytes\texecuted_reload_bytes\texecuted_transfer_us\tsummary\n";
+        "# telemetry_schema_version\tepoch\tworkload\tkind\tphase\tshape_bucket\trequested_strategy\tselected_strategy\tfinal_strategy\tplanner_source\tplanner_confidence\tplanner_risk\texecuted\tall_succeeded\tblocked_by_memory\trolled_back_to_auto\tblacklisted_before_run\tregression_gate_forced_auto\tpersisted_regression_events\tpersisted_worst_slowdown\tpeak_pressure_ratio\tspill_bytes\treload_bytes\tforced_spills\tprefetch_bytes\thost_io_bytes\th2d_bytes\ttotal_runtime_us\tspeedup_vs_reference\tcopy_runtime_us\tcompute_runtime_us\tcopy_overlap_ratio\ttransfer_us\toverlapped_transfer_us\ttransfer_overlap_gain_us\ttransfer_overlap_ratio\toptimizer_budget_ms\tbudget_exhausted\tallocator_peak_live_bytes\tallocator_peak_reserved_bytes\tallocator_reuse_count\tspill_artifact_bytes\treload_artifact_bytes\tbackend_owned_peak_bytes\tbackend_resource_reuse_hits\texecuted_h2d_bytes\texecuted_d2h_bytes\texecuted_spill_bytes\texecuted_reload_bytes\texecuted_transfer_us\tsummary\n";
 
     std::ostringstream line;
-    line << execution_epoch_ << '\t'
+    line << kRuntimeTelemetrySchemaVersion << '\t'
+         << execution_epoch_ << '\t'
          << workload.name << '\t'
          << to_string(workload.kind) << '\t'
          << to_string(canonical_workload_phase(workload)) << '\t'
@@ -4172,6 +4218,9 @@ void Runtime::persist_telemetry(
          << (report.safety.blocked_by_memory ? 1 : 0) << '\t'
          << (report.safety.rolled_back_to_auto ? 1 : 0) << '\t'
          << (report.safety.blacklisted_before_run ? 1 : 0) << '\t'
+         << (report.safety.regression_gate_forced_auto ? 1 : 0) << '\t'
+         << report.safety.persisted_regression_events << '\t'
+         << report.safety.persisted_worst_slowdown << '\t'
          << report.memory_preflight.peak_pressure_ratio << '\t'
          << report.residency_sequence.spill_bytes << '\t'
          << report.residency_sequence.reload_bytes << '\t'

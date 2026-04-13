@@ -255,9 +255,9 @@ This is where the repository stands today:
 - Discovery can use host, OpenCL, Level Zero, Vulkan, CUDA, and ROCm probes when the matching runtime libraries are present.
 - Planning and optimization work across those discovered graphs.
 - The direct executor can run host kernels, OpenCL kernels, Vulkan direct kernels, and some native Level Zero, CUDA, and ROCm kernels.
-- The managed execution layer can run native workload manifests, do memory preflight checks, materialize residency and tensor-allocation traces, summarize backend buffer ownership and persistent resource reuse, correlate executed residency movement with direct-execution transfers, emit asset-prefetch plans, and write TSV telemetry.
+- The managed execution layer can run native workload manifests, do memory preflight checks, materialize residency and tensor-allocation traces, summarize backend buffer ownership and persistent resource reuse, correlate executed residency movement with direct-execution transfers, apply persisted-regression safety gates for explicit strategies, emit asset-prefetch plans, and write schema-versioned TSV telemetry.
 - `load_workload_source(...)` can build workload graphs from native manifests and imported model descriptions such as ONNX and GGUF.
-- `jakal_runtime` exposes the runtime through a smaller C ABI, including managed-execution buffer-binding and residency-movement summaries after manifest execution, and `jakal_core_cli` exposes install-path and backend-health diagnostics for packaged runtime scenarios.
+- `jakal_runtime` exposes the runtime through a smaller C ABI, including ABI/schema version queries plus managed-execution buffer-binding and residency-movement summaries after manifest execution, and `jakal_core_cli` exposes install-path and backend-health diagnostics for packaged runtime scenarios.
 - The Python helpers under [`python/`](./python/) wrap the C ABI for lightweight `doctor`, `paths`, `optimize-smoke`, and `run-manifest` flows.
 
 Known gaps in the current tree:
@@ -504,6 +504,8 @@ The important defaults are:
 - `cache/planner-cache.tsv`
 - `cache/execution-cache.tsv`
 - `logs/runtime-telemetry.tsv`
+
+The telemetry file now self-describes its schema in the header row, and the execution feedback caches (`.perf`, `.perf.family`) persist schema markers plus regression metadata so warm-state tuning and persisted-regression safety gates can survive process restarts.
 
 If a runtime install root is available, `python_dir` resolves to `<install_root>/python`. Otherwise it falls back to `<writable_root>/python`.
 

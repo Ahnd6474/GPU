@@ -1864,6 +1864,29 @@ std::string performance_family_key(
     return stream.str();
 }
 
+std::string regression_signature_anchor(const std::string& report_signature) {
+    const auto graph_pos = report_signature.find("|graph=");
+    if (graph_pos == std::string::npos) {
+        return report_signature;
+    }
+    const auto tuning_pos = report_signature.rfind("|tuning:");
+    if (tuning_pos != std::string::npos && tuning_pos > graph_pos) {
+        return report_signature.substr(graph_pos, tuning_pos - graph_pos);
+    }
+    return report_signature.substr(graph_pos);
+}
+
+bool performance_entry_matches_report_signature(
+    const std::string& key,
+    const std::string& report_signature) {
+    const std::string exact_prefix = report_signature + "|";
+    if (key.rfind(exact_prefix, 0u) == 0u) {
+        return true;
+    }
+    const auto anchor = regression_signature_anchor(report_signature);
+    return !anchor.empty() && key.find(anchor + "|") != std::string::npos;
+}
+
 using OptimizationDeadline = std::optional<std::chrono::steady_clock::time_point>;
 
 OptimizationDeadline make_optimizer_deadline(const ExecutionTuningOverrides* tuning_overrides) {
@@ -7125,7 +7148,9 @@ void update_performance_summary(
     const double staging_hit_rate,
     const double cross_device_sync_cost_us,
     const double residency_pressure,
-    const double kv_host_residency_ratio) {
+    const double kv_host_residency_ratio,
+    const bool regression_event,
+    const double slowdown_vs_reference) {
     auto& summary = performance_cache[key];
     summary.shape_bucket = shape_bucket;
     summary.device_family_signature = device_family_signature;
@@ -7164,6 +7189,13 @@ void update_performance_summary(
         (residency_pressure - summary.average_residency_pressure) / sample_count;
     summary.average_kv_host_residency_ratio +=
         (kv_host_residency_ratio - summary.average_kv_host_residency_ratio) / sample_count;
+    summary.worst_slowdown_vs_reference =
+        std::max(summary.worst_slowdown_vs_reference, slowdown_vs_reference);
+    if (regression_event) {
+        summary.regression_events = std::min<std::uint32_t>(summary.regression_events + 1u, 255u);
+    } else if (summary.regression_events > 0u) {
+        summary.regression_events -= 1u;
+    }
 }
 
 void update_device_learning_state(
@@ -7713,6 +7745,11 @@ void ExecutionOptimizer::ingest_execution_feedback(
     run_feedback_retuning_pass(adaptive_optimizer_, report, feedback, graphs);
 }
 
+PersistedRegressionSummary ExecutionOptimizer::persisted_regression_summary(
+    const std::string& report_signature) {
+    return adaptive_optimizer_.persisted_regression_summary(report_signature);
+}
+
 void BootstrapExecutionOptimizer::load_cache() {
     if (cache_loaded_) {
         return;
@@ -7838,22 +7875,29 @@ void AdaptiveExecutionOptimizer::load_cache() {
                 const auto fields = split_tab(line);
                 if (fields.size() != 19 && fields.size() != 20 && fields.size() != 26 && fields.size() != 27 &&
                     fields.size() != 28 && fields.size() != 29 && fields.size() != 30 &&
-                    fields.size() != 31 && fields.size() != 34 && fields.size() != 38) {
+                    fields.size() != 31 && fields.size() != 34 && fields.size() != 38 &&
+                    fields.size() != 40) {
                     continue;
                 }
 
                 try {
                     PerformanceSummary summary;
-                    const bool has_variant = fields.size() == 29 || fields.size() == 30 || fields.size() == 31 || fields.size() == 34;
+                    const bool has_variant =
+                        fields.size() == 29 || fields.size() == 30 || fields.size() == 31 || fields.size() == 34 ||
+                        fields.size() == 38 || fields.size() == 40;
                     const bool has_extended =
                         fields.size() == 26 || fields.size() == 27 || fields.size() == 28 ||
-                        fields.size() == 29 || fields.size() == 30 || fields.size() == 31 || fields.size() == 34;
+                        fields.size() == 29 || fields.size() == 30 || fields.size() == 31 || fields.size() == 34 ||
+                        fields.size() == 38 || fields.size() == 40;
                     const bool has_calibration =
-                        fields.size() == 28 || fields.size() == 29 || fields.size() == 30 || fields.size() == 31 || fields.size() == 34;
+                        fields.size() == 28 || fields.size() == 29 || fields.size() == 30 || fields.size() == 31 || fields.size() == 34 ||
+                        fields.size() == 38 || fields.size() == 40;
                     const bool has_family =
-                        fields.size() == 20 || fields.size() == 27 || fields.size() == 30 || fields.size() == 31 || fields.size() == 34;
-                    const bool has_transfer_metrics = fields.size() == 31 || fields.size() == 34 || fields.size() == 38;
-                    const bool has_residency_metrics = fields.size() == 38;
+                        fields.size() == 20 || fields.size() == 27 || fields.size() == 30 || fields.size() == 31 || fields.size() == 34 ||
+                        fields.size() == 38 || fields.size() == 40;
+                    const bool has_transfer_metrics = fields.size() == 31 || fields.size() == 34 || fields.size() == 38 || fields.size() == 40;
+                    const bool has_residency_metrics = fields.size() == 38 || fields.size() == 40;
+                    const bool has_regression_metrics = fields.size() == 40;
                     std::size_t next = 1;
                     summary.shape_bucket = fields[next++];
                     summary.device_family_signature = has_family ? fields[next++] : "";
@@ -7903,6 +7947,10 @@ void AdaptiveExecutionOptimizer::load_cache() {
                         summary.average_cross_device_sync_cost_us = std::stod(fields[next++]);
                         summary.average_residency_pressure = std::stod(fields[next++]);
                         summary.average_kv_host_residency_ratio = std::stod(fields[next++]);
+                    }
+                    if (has_regression_metrics) {
+                        summary.regression_events = static_cast<std::uint32_t>(std::stoul(fields[next++]));
+                        summary.worst_slowdown_vs_reference = std::stod(fields[next++]);
                     }
                     target[fields[0]] = std::move(summary);
                 } catch (const std::exception&) {
@@ -8012,7 +8060,16 @@ bool AdaptiveExecutionOptimizer::should_use_lightweight_path(
 
 bool AdaptiveExecutionOptimizer::should_reoptimize(const std::string& report_signature) const {
     const auto it = reoptimization_pressure_.find(report_signature);
-    return it != reoptimization_pressure_.end() && it->second > 0u;
+    if (it != reoptimization_pressure_.end() && it->second > 0u) {
+        return true;
+    }
+    return std::any_of(
+        performance_cache_.begin(),
+        performance_cache_.end(),
+        [&](const auto& entry) {
+            return performance_entry_matches_report_signature(entry.first, report_signature) &&
+                   entry.second.regression_events >= 2u;
+        });
 }
 
 bool AdaptiveExecutionOptimizer::should_reoptimize_operation(
@@ -8041,6 +8098,26 @@ const std::unordered_map<std::string, double>& AdaptiveExecutionOptimizer::backe
 
 const std::unordered_map<std::string, bool>& AdaptiveExecutionOptimizer::warmed_devices() const {
     return warmed_devices_;
+}
+
+PersistedRegressionSummary AdaptiveExecutionOptimizer::persisted_regression_summary(
+    const std::string& report_signature) {
+    load_cache();
+    PersistedRegressionSummary summary;
+    const auto update_summary = [&](const auto& cache) {
+        for (const auto& entry : cache) {
+            if (!performance_entry_matches_report_signature(entry.first, report_signature)) {
+                continue;
+            }
+            summary.max_regression_events =
+                std::max(summary.max_regression_events, entry.second.regression_events);
+            summary.worst_slowdown_vs_reference =
+                std::max(summary.worst_slowdown_vs_reference, entry.second.worst_slowdown_vs_reference);
+        }
+    };
+    update_summary(performance_cache_);
+    update_summary(graph_family_performance_cache_);
+    return summary;
 }
 
 void AdaptiveExecutionOptimizer::apply_feedback_tuning_hints(WorkloadGraph& graph) const {
@@ -8140,6 +8217,14 @@ void AdaptiveExecutionOptimizer::ingest_execution_feedback(
             report.system_profile,
             optimized.benchmark.shape_bucket,
             optimized.config);
+        const double slowdown_vs_reference =
+            record.reference_runtime_us > 0.0 ? (effective_latency_us / record.reference_runtime_us) : 1.0;
+        const bool regression_event =
+            !record.verified ||
+            record.relative_error > (optimized.config.target_error_tolerance + 1.0e-12) ||
+            slowdown_vs_reference > 1.10 ||
+            (optimized.graph.predicted_latency_us > 0.0 &&
+             effective_latency_us > (optimized.graph.predicted_latency_us * 1.20));
         update_performance_summary(
             performance_cache_,
             perf_key,
@@ -8160,7 +8245,9 @@ void AdaptiveExecutionOptimizer::ingest_execution_feedback(
             record.staging_hit_rate,
             record.cross_device_sync_cost_us,
             record.residency_pressure,
-            record.kv_host_residency_ratio);
+            record.kv_host_residency_ratio,
+            regression_event,
+            slowdown_vs_reference);
         update_performance_summary(
             graph_family_performance_cache_,
             performance_family_key(report.signature, optimized.benchmark.shape_bucket, optimized.config),
@@ -8181,16 +8268,15 @@ void AdaptiveExecutionOptimizer::ingest_execution_feedback(
             record.staging_hit_rate,
             record.cross_device_sync_cost_us,
             record.residency_pressure,
-            record.kv_host_residency_ratio);
+            record.kv_host_residency_ratio,
+            regression_event,
+            slowdown_vs_reference);
         update_device_learning_state(
             warmed_devices_,
             device_sustained_slowdown_,
             optimized.config,
             effective_latency_us,
             optimized.graph.predicted_latency_us);
-
-        const double slowdown_vs_reference =
-            record.reference_runtime_us > 0.0 ? (effective_latency_us / record.reference_runtime_us) : 1.0;
         const auto penalty_key =
             backend_penalty_key(
                 report.signature,
@@ -8408,8 +8494,9 @@ void AdaptiveExecutionOptimizer::persist_cache() const {
                 return;
             }
 
+            output << "# schema_version\t" << kExecutionPerformanceCacheSchemaVersion << '\n';
             output
-                << "# key\tshape_bucket\tdevice_family_signature\toperation\tvariant\tstrategy\tprimary_device\tparticipating_devices\tqueue_depth\tstages\ttile_x\ttile_y\ttile_k\tlogical_partitions\toverlap\tlow_precision\tqueue_scale\tstage_scale\ttile_scale\toverlap_ratio\tpartition_intensity\tprecision_mix\tobservations\tavg_latency\tavg_error\tavg_scale\tavg_calibration_ratio\tavg_system_penalty\tavg_validation_spread\tavg_reward\tavg_copy_share\tavg_transfer_overlap_ratio\tavg_budget_pressure\tavg_queue_separation_ratio\tavg_staging_hit_rate\tavg_cross_device_sync_cost_us\tavg_residency_pressure\tavg_kv_host_residency_ratio\n";
+                << "# key\tshape_bucket\tdevice_family_signature\toperation\tvariant\tstrategy\tprimary_device\tparticipating_devices\tqueue_depth\tstages\ttile_x\ttile_y\ttile_k\tlogical_partitions\toverlap\tlow_precision\tqueue_scale\tstage_scale\ttile_scale\toverlap_ratio\tpartition_intensity\tprecision_mix\tobservations\tavg_latency\tavg_error\tavg_scale\tavg_calibration_ratio\tavg_system_penalty\tavg_validation_spread\tavg_reward\tavg_copy_share\tavg_transfer_overlap_ratio\tavg_budget_pressure\tavg_queue_separation_ratio\tavg_staging_hit_rate\tavg_cross_device_sync_cost_us\tavg_residency_pressure\tavg_kv_host_residency_ratio\tregression_events\tworst_slowdown_vs_reference\n";
             for (const auto& [key, summary] : source) {
                 output << key << '\t'
                        << summary.shape_bucket << '\t'
@@ -8448,7 +8535,9 @@ void AdaptiveExecutionOptimizer::persist_cache() const {
                        << summary.average_staging_hit_rate << '\t'
                        << summary.average_cross_device_sync_cost_us << '\t'
                        << summary.average_residency_pressure << '\t'
-                       << summary.average_kv_host_residency_ratio << '\n';
+                       << summary.average_kv_host_residency_ratio << '\t'
+                       << summary.regression_events << '\t'
+                       << summary.worst_slowdown_vs_reference << '\n';
             }
         };
     persist_summary_map(performance_cache_path_, performance_cache_);
@@ -8458,6 +8547,7 @@ void AdaptiveExecutionOptimizer::persist_cache() const {
     if (!hint_output.is_open()) {
         return;
     }
+    hint_output << "# schema_version\t" << kExecutionCpuHintCacheSchemaVersion << '\n';
     hint_output << "# key\tshape_bucket\tpreferred_parallel_chunk\tpreferred_tile_m\tpreferred_tile_n\tpreferred_tile_k\tpreferred_single_thread_cutoff\tpreferred_kernel_family\tpreferred_use_avx512\tobservations\tavg_latency\n";
     for (const auto& [key, summary] : cpu_runtime_hint_cache_) {
         hint_output << key << '\t'
